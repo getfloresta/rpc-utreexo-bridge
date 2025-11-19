@@ -53,6 +53,7 @@ actix-http = "=3.9.0"
 derive_more = "=0.99.18"
 idna = "=0.5.0"
 url = "=2.5.2"
+rand = "0.9.2"
 
 [features]
 default = ["bitcoin", "node", "api"]

@@ -390,6 +390,10 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         }
 
         let height = self.rpc.get_block_count()? as u32;
+        if height == self.height {
+            self.ibd = false; // we'll flip it once, and keep it false for the rest of the time
+            return Ok(());
+        }
 
         if height > self.height {
             self.prove_range(self.height + 1, height)?;
@@ -398,7 +402,6 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                 .expect("could not save the acc to disk");
             self.storage.update_height(height as usize);
         }
-        self.ibd = false; // we'll flip it once, and keep it false for the rest of the time
         *last_tip_update = std::time::Instant::now();
         Ok(())
     }
