@@ -80,7 +80,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
     // The prover needs some way to pull blocks from a trusted source, we can use anything
     // implementing the [Blockchain] trait, for example a bitcoin core node or an esplora
     // instance.
-    let client = get_chain_provider()?;
+    let client = get_chain_provider(cli_options.bitcoin_datadir.as_deref())?;
 
     // Create a prover, this module will download blocks from the bitcoin core
     // node and save them to disk. It will also create proofs for the blocks

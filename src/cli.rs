@@ -34,4 +34,9 @@ pub struct CliArgs {
     /// The network we are operating on
     #[clap(long, short = 'n', default_value = "bitcoin")]
     pub network: Network,
+
+    /// The Bitcoin data directory path. This is used to locate the Bitcoin Core cookie file
+    /// for RPC authentication.
+    #[clap(long)]
+    pub bitcoin_datadir: Option<String>,
 }
