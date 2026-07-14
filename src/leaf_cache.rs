@@ -61,6 +61,47 @@ impl LeafCache for DiskLeafStorage {
             })
     }
 
+    fn batch_read(&self, outpoints: &[OutPoint]) -> Vec<Option<LeafContext>> {
+        if let Some(transaction) = &self.pending_write {
+            let Ok(table) = transaction.open_table(LEAF_TABLE) else {
+                return vec![None; outpoints.len()];
+            };
+            return outpoints
+                .iter()
+                .map(|outpoint| {
+                    self.cache
+                        .get(outpoint)
+                        .map(|(_, leaf_data)| leaf_data.clone())
+                        .or_else(|| {
+                            let key = serialize(outpoint);
+                            let leaf = table.get(key.as_slice()).ok()??;
+                            Some(Self::deserialize_leaf_data(leaf.value()))
+                        })
+                })
+                .collect();
+        }
+
+        let Ok(transaction) = self.database.begin_read() else {
+            return vec![None; outpoints.len()];
+        };
+        let Ok(table) = transaction.open_table(LEAF_TABLE) else {
+            return vec![None; outpoints.len()];
+        };
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                self.cache
+                    .get(outpoint)
+                    .map(|(_, leaf_data)| leaf_data.clone())
+                    .or_else(|| {
+                        let key = serialize(outpoint);
+                        let leaf = table.get(key.as_slice()).ok()??;
+                        Some(Self::deserialize_leaf_data(leaf.value()))
+                    })
+            })
+            .collect()
+    }
+
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext> {
         self.cache
             .remove(outpoint)
@@ -212,8 +253,14 @@ mod tests {
                 DiskLeafStorage::serialize_leaf_data(&stored),
                 DiskLeafStorage::serialize_leaf_data(&leaf)
             );
+            let missing = OutPoint::new(Txid::all_zeros(), 2);
+            let batch = storage.batch_read(&[outpoint, missing]);
+            assert_eq!(batch.len(), 2);
+            assert!(batch[0].is_some());
+            assert!(batch[1].is_none());
             storage.remove(&outpoint).unwrap();
             assert!(storage.get(&outpoint).is_none());
+            assert!(storage.batch_read(&[outpoint])[0].is_none());
             {
                 let transaction = storage.database.begin_read().unwrap();
                 let table = transaction.open_table(LEAF_TABLE).unwrap();
