@@ -67,6 +67,12 @@ pub type AccumulatorHash = crate::udata::shinigami_udata::PoseidonHash;
 pub trait LeafCache: Sync + Send + Sized + 'static {
     fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
     fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
+    fn batch_read(&self, outpoints: &[OutPoint]) -> Vec<Option<LeafContext>> {
+        outpoints
+            .iter()
+            .map(|outpoint| self.get(outpoint))
+            .collect()
+    }
     fn flush(&mut self) {}
     #[cfg_attr(feature = "shinigami", allow(unused))]
     fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
@@ -509,9 +515,17 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         &mut self,
         input: &TxIn,
     ) -> anyhow::Result<(AccumulatorHash, LeafContext)> {
-        let leaf = self.leaf_data.remove(&input.previous_output);
+        self.get_prefetched_input_leaf_hash(input, None)
+    }
 
-        let leaf = match leaf {
+    fn get_prefetched_input_leaf_hash(
+        &mut self,
+        input: &TxIn,
+        prefetched_leaf: Option<LeafContext>,
+    ) -> anyhow::Result<(AccumulatorHash, LeafContext)> {
+        let removed_leaf = self.leaf_data.remove(&input.previous_output);
+
+        let leaf = match prefetched_leaf.or(removed_leaf) {
             Some(leaf) => leaf,
             None => Self::get_input_leaf_hash_from_rpc(&self.rpc, input)
                 .context("[get_input_leaf_hash] Failure to get leaf hash")?,
@@ -542,12 +556,23 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         let mut inputs = Vec::new();
         let mut utxos = Vec::new();
         let mut compact_leaves = Vec::new();
+        let input_outpoints = block
+            .txdata
+            .iter()
+            .filter(|tx| !tx.is_coinbase())
+            .flat_map(|tx| tx.input.iter().map(|input| input.previous_output))
+            .collect::<Vec<_>>();
+        let mut prefetched_leaves = self.leaf_data.batch_read(&input_outpoints).into_iter();
 
         for tx in block.txdata.iter() {
             let txid = tx.compute_txid();
             for input in tx.input.iter() {
                 if !tx.is_coinbase() {
-                    let (hash, compact_leaf) = self.get_input_leaf_hash(input)?;
+                    let prefetched_leaf = prefetched_leaves
+                        .next()
+                        .expect("prefetched leaf count must match block inputs");
+                    let (hash, compact_leaf) =
+                        self.get_prefetched_input_leaf_hash(input, prefetched_leaf)?;
                     if let Some(idx) = utxos.iter().position(|h| *h == hash) {
                         utxos.remove(idx);
                     } else {
