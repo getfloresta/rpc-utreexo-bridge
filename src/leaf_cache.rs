@@ -1,14 +1,21 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::serialize;
 use bitcoin::OutPoint;
-use kv::Batch;
-use kv::Config;
 use log::info;
+use redb::Database;
+use redb::ReadableDatabase;
+use redb::ReadableTable;
+use redb::TableDefinition;
+use redb::WriteTransaction;
 
 use crate::prover::LeafCache;
 use crate::udata::LeafContext;
+
+const LEAF_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("leaves");
 
 pub struct DiskLeafStorage {
     /// In-memory cache of leaf data
@@ -22,8 +29,10 @@ pub struct DiskLeafStorage {
     /// A disk database of leaf data
     ///
     /// This is used to store leaf data that is not in the cache,
-    /// it's a simple kv bucket with no fancy features.
-    bucket: kv::Bucket<'static, Vec<u8>, Vec<u8>>,
+    /// it's a simple redb table with no fancy features.
+    database: Database,
+    /// A shared transaction for disk deletions, committed by `flush`.
+    pending_write: Option<WriteTransaction>,
 }
 
 impl LeafCache for DiskLeafStorage {
@@ -38,26 +47,17 @@ impl LeafCache for DiskLeafStorage {
             .get(outpoint)
             .map(|(_, leaf_data)| leaf_data.clone())
             .or_else(|| {
-                let leaf = self.bucket.get(&serialize(outpoint)).ok().flatten()?;
-                let block_height = deserialize(&leaf[0..4]).unwrap();
-                let txid = deserialize(&leaf[4..36]).unwrap();
-                let vout = deserialize(&leaf[36..40]).unwrap();
-                let value = deserialize(&leaf[40..48]).unwrap();
-                let block_hash = deserialize(&leaf[48..80]).unwrap();
-                let is_coinbase = deserialize(&leaf[80..81]).unwrap();
-                let median_time_past = deserialize(&leaf[81..85]).unwrap();
-                let pk_script = deserialize(&leaf[85..]).unwrap();
+                let key = serialize(outpoint);
+                if let Some(transaction) = &self.pending_write {
+                    let table = transaction.open_table(LEAF_TABLE).ok()?;
+                    let leaf = table.get(key.as_slice()).ok()??;
+                    return Some(Self::deserialize_leaf_data(leaf.value()));
+                }
 
-                Some(LeafContext {
-                    block_height,
-                    txid,
-                    vout,
-                    value,
-                    pk_script,
-                    block_hash,
-                    is_coinbase,
-                    median_time_past,
-                })
+                let transaction = self.database.begin_read().ok()?;
+                let table = transaction.open_table(LEAF_TABLE).ok()?;
+                let leaf = table.get(key.as_slice()).ok()??;
+                Some(Self::deserialize_leaf_data(leaf.value()))
             })
     }
 
@@ -66,26 +66,20 @@ impl LeafCache for DiskLeafStorage {
             .remove(outpoint)
             .map(|(_, leaf_data)| leaf_data)
             .or_else(|| {
-                let leaf = self.bucket.remove(&serialize(outpoint)).ok().flatten()?;
-                let block_height = deserialize(&leaf[0..4]).unwrap();
-                let txid = deserialize(&leaf[4..36]).unwrap();
-                let vout = deserialize(&leaf[36..40]).unwrap();
-                let value = deserialize(&leaf[40..48]).unwrap();
-                let block_hash = deserialize(&leaf[48..80]).unwrap();
-                let is_coinbase = deserialize(&leaf[80..81]).unwrap();
-                let median_time_past = deserialize(&leaf[81..85]).unwrap();
-                let pk_script = deserialize(&leaf[85..]).unwrap();
-
-                Some(LeafContext {
-                    block_height,
-                    txid,
-                    vout,
-                    value,
-                    pk_script,
-                    block_hash,
-                    is_coinbase,
-                    median_time_past,
-                })
+                if self.pending_write.is_none() {
+                    self.pending_write = Some(self.database.begin_write().ok()?);
+                }
+                let transaction = self.pending_write.as_ref()?;
+                let leaf = {
+                    let mut table = transaction.open_table(LEAF_TABLE).ok()?;
+                    let key = serialize(outpoint);
+                    let leaf = table
+                        .remove(key.as_slice())
+                        .ok()?
+                        .map(|leaf| leaf.value().to_vec());
+                    leaf
+                }?;
+                Some(Self::deserialize_leaf_data(&leaf))
             })
     }
 
@@ -100,18 +94,22 @@ impl LeafCache for DiskLeafStorage {
 
 impl DiskLeafStorage {
     pub fn new(dir: &str) -> Self {
-        let db = kv::Store::new(Config {
-            cache_capacity: Some(1_000_000),
-            path: dir.into(),
-            flush_every_ms: Some(100),
-            segment_size: None,
-            temporary: false,
-            use_compression: false,
-        })
-        .expect("Failed to open leaf cache database");
-        let bucket = db.bucket::<Vec<u8>, Vec<u8>>(None).unwrap();
+        fs::create_dir_all(dir).expect("Failed to create leaf cache directory");
+        let database = Database::create(Path::new(dir).join("leaf_cache.redb"))
+            .expect("Failed to open leaf cache database");
+        let transaction = database
+            .begin_write()
+            .expect("Failed to initialize leaf cache database");
+        transaction
+            .open_table(LEAF_TABLE)
+            .expect("Failed to initialize leaf cache table");
+        transaction
+            .commit()
+            .expect("Failed to initialize leaf cache table");
+
         Self {
-            bucket,
+            database,
+            pending_write: None,
             cache: HashMap::with_capacity(100_000),
         }
     }
@@ -132,26 +130,104 @@ impl DiskLeafStorage {
         serialized
     }
 
+    fn deserialize_leaf_data(leaf: &[u8]) -> LeafContext {
+        LeafContext {
+            block_height: deserialize(&leaf[0..4]).unwrap(),
+            txid: deserialize(&leaf[4..36]).unwrap(),
+            vout: deserialize(&leaf[36..40]).unwrap(),
+            value: deserialize(&leaf[40..48]).unwrap(),
+            block_hash: deserialize(&leaf[48..80]).unwrap(),
+            is_coinbase: deserialize(&leaf[80..81]).unwrap(),
+            median_time_past: deserialize(&leaf[81..85]).unwrap(),
+            pk_script: deserialize(&leaf[85..]).unwrap(),
+        }
+    }
+
     fn flush(&mut self) {
         info!("Flushing leaf cache to disk, this might take a while");
         let mut new_map = HashMap::new();
-        let mut batch = Batch::new();
-        for (outpoint, (height, leaf_data)) in self.cache.iter() {
-            // Don't uncache things that are too recent
-            if *height < 100 {
-                new_map.insert(*outpoint, (*height, leaf_data.clone()));
-            }
-
-            let serialized = Self::serialize_leaf_data(leaf_data);
-            batch
-                .set(&serialize(outpoint), &serialized)
+        let transaction = self.pending_write.take().unwrap_or_else(|| {
+            self.database
+                .begin_write()
+                .expect("Failed to flush leaf cache")
+        });
+        {
+            let mut table = transaction
+                .open_table(LEAF_TABLE)
                 .expect("Failed to flush leaf cache");
+            for (outpoint, (height, leaf_data)) in self.cache.iter() {
+                // Don't uncache things that are too recent
+                if *height < 100 {
+                    new_map.insert(*outpoint, (*height, leaf_data.clone()));
+                }
+
+                let key = serialize(outpoint);
+                let serialized = Self::serialize_leaf_data(leaf_data);
+                table
+                    .insert(key.as_slice(), serialized.as_slice())
+                    .expect("Failed to flush leaf cache");
+            }
         }
         info!("Applying batch to disk, this might take a while");
-        self.bucket
-            .batch(batch)
-            .expect("Failed to flush leaf cache");
+        transaction.commit().expect("Failed to flush leaf cache");
 
         self.cache = new_map;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+    use bitcoin::ScriptBuf;
+    use bitcoin::Txid;
+
+    use super::*;
+
+    #[test]
+    fn persists_and_removes_leaf_data() {
+        let dir = std::env::temp_dir().join(format!("leaf-cache-{}", rand::random::<u64>()));
+        let outpoint = OutPoint::new(Txid::all_zeros(), 1);
+        let leaf = LeafContext {
+            block_hash: BlockHash::all_zeros(),
+            txid: outpoint.txid,
+            vout: outpoint.vout,
+            value: 42,
+            pk_script: ScriptBuf::from_bytes(vec![0x51]),
+            block_height: 100,
+            median_time_past: 123,
+            is_coinbase: false,
+        };
+
+        {
+            let mut storage = DiskLeafStorage::new(dir.to_str().unwrap());
+            storage.insert(outpoint, leaf.clone());
+            storage.flush();
+        }
+
+        {
+            let mut storage = DiskLeafStorage::new(dir.to_str().unwrap());
+            let stored = storage.get(&outpoint).unwrap();
+            assert_eq!(
+                DiskLeafStorage::serialize_leaf_data(&stored),
+                DiskLeafStorage::serialize_leaf_data(&leaf)
+            );
+            storage.remove(&outpoint).unwrap();
+            assert!(storage.get(&outpoint).is_none());
+            {
+                let transaction = storage.database.begin_read().unwrap();
+                let table = transaction.open_table(LEAF_TABLE).unwrap();
+                let key = serialize(&outpoint);
+                assert!(table.get(key.as_slice()).unwrap().is_some());
+            }
+            storage.flush();
+        }
+
+        {
+            let storage = DiskLeafStorage::new(dir.to_str().unwrap());
+            assert!(storage.get(&outpoint).is_none());
+        }
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
