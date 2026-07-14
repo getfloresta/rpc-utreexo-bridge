@@ -45,6 +45,27 @@ use crate::udata::LeafContext;
 use crate::udata::LeafData;
 use crate::udata::UtreexoBlock;
 
+const JEMALLOC_COMPACTION_INTERVAL: u32 = 50_000;
+const JEMALLOC_ALL_ARENAS_PURGE: &[u8] = b"arena.4096.purge\0";
+
+fn compact_jemalloc() -> Result<(), i32> {
+    // MALLCTL_ARENAS_ALL is the fixed arena index 4096 in jemalloc 5.x.
+    let result = unsafe {
+        jemalloc_sys::mallctl(
+            JEMALLOC_ALL_ARENAS_PURGE.as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    match result {
+        0 => Ok(()),
+        error_code => Err(error_code),
+    }
+}
+
 #[cfg(not(feature = "shinigami"))]
 pub type AccumulatorHash = rustreexo::accumulator::node_hash::BitcoinNodeHash;
 
@@ -453,6 +474,15 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                 if height % n == 0 {
                     self.save_to_disk(Some(height))
                         .expect("could not save the acc to disk");
+                }
+            }
+
+            if height > 0 && height % JEMALLOC_COMPACTION_INTERVAL == 0 {
+                match compact_jemalloc() {
+                    Ok(()) => info!("Compacted jemalloc at height {height}"),
+                    Err(error_code) => {
+                        error!("Failed to compact jemalloc at height {height}: {error_code}")
+                    }
                 }
             }
 

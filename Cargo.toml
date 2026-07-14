@@ -42,6 +42,7 @@ serde_json = { version = "1.0.128" }
 actix-cors = { version = "=0.6.5", optional = true }
 mmap = "0.1.1"
 jemallocator = "0.5.4"
+jemalloc-sys = "0.5.4"
 starknet-crypto = { version = "0.7.2", optional = true }
 clap = { version = "4.5.20", features = ["derive"] }
 time = "0.3.36"
