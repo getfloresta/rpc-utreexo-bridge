@@ -123,6 +123,10 @@ pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
     ibd: bool,
 }
 
+pub(crate) fn is_unspendable(script: &Script) -> bool {
+    script.len() > 10_000 || script.as_bytes().first() == Some(&0x6a)
+}
+
 impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage> {
     /// Creates a new prover. It loads the accumulator from disk, if it exists.
     #[allow(clippy::too_many_arguments)]
@@ -520,18 +524,6 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         Ok((LeafData::get_leaf_hashes(&leaf), leaf))
     }
 
-    fn is_unspendable(script: &Script) -> bool {
-        if script.len() > 10_000 {
-            return true;
-        }
-
-        if !script.is_empty() && script.as_bytes()[0] == 0x6a {
-            return true;
-        }
-
-        false
-    }
-
     /// Processes a block and returns the batch proof and the compact leaf data for the block.
     fn process_block(
         &mut self,
@@ -558,7 +550,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
             }
 
             for (idx, output) in tx.output.iter().enumerate() {
-                if !Self::is_unspendable(&output.script_pubkey) {
+                if !is_unspendable(&output.script_pubkey) {
                     let leaf = LeafContext {
                         block_hash: block.block_hash(),
                         median_time_past: mtp,

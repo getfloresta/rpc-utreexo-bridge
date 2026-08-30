@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -9,6 +11,7 @@ use bitcoin::consensus::serialize;
 use bitcoin::constants::genesis_block;
 use clap::Parser;
 use futures::channel::mpsc::channel;
+use hintsfile::Hintsfile;
 use log::info;
 use log::warn;
 
@@ -22,6 +25,8 @@ use crate::init_logger;
 use crate::leaf_cache::DiskLeafStorage;
 use crate::node;
 use crate::node::WorkerContext;
+use crate::parallel_forest::build_parallel_forest;
+use crate::parallel_forest::ParallelForestConfig;
 use crate::prover;
 use crate::subdir;
 
@@ -38,6 +43,38 @@ pub fn run_bridge() -> anyhow::Result<()> {
         simplelog::LevelFilter::Info,
         true,
     );
+
+    if let Some(hints_path) = cli_options.build_forest.as_deref() {
+        let file = File::open(hints_path)?;
+        let hints = Hintsfile::from_reader(&mut BufReader::new(file))?;
+        let forest_path = cli_options
+            .forest_file
+            .clone()
+            .unwrap_or_else(|| subdir("forest.dat").into());
+        let mut config = ParallelForestConfig::new(forest_path);
+        if let Some(workers) = cli_options.forest_leaf_workers {
+            config.leaf_workers = workers;
+        }
+        if let Some(workers) = cli_options.forest_chaser_workers {
+            config.chaser_workers = workers;
+        }
+        if let Some(iterations) = cli_options.forest_spin_iterations {
+            config.spin_iterations = iterations;
+        }
+        config.lock_pages = !cli_options.forest_no_mlock;
+
+        let client: Arc<dyn crate::chaininterface::Blockchain> = Arc::from(get_chain_provider()?);
+        let summary = build_parallel_forest(client, &hints, config)?;
+        info!(
+            "Built flat forest: leaves={} nodes={} bytes={} roots={} pages_locked={}",
+            summary.leaves,
+            summary.initialized_nodes,
+            summary.file_bytes,
+            summary.roots.len(),
+            summary.pages_locked
+        );
+        return Ok(());
+    }
 
     // to keep track of the current chain state and speed up replying to headers requests
     // from peers.

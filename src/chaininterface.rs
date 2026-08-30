@@ -15,7 +15,7 @@ use bitcoin::Txid;
 use bitcoincore_rpc::Client;
 use bitcoincore_rpc::RpcApi;
 
-pub trait Blockchain {
+pub trait Blockchain: Send + Sync {
     /// Returns the entire content of a block, given a block hash.
     fn get_block(&self, block_hash: BlockHash) -> Result<Block>;
     /// Returns the entire content of a transaction, given a transaction id.

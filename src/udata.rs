@@ -308,6 +308,27 @@ pub mod bitcoin_leaf_data {
         pub utxo: TxOut,
     }
 
+    pub(crate) fn get_leaf_hash(
+        block_hash: BlockHash,
+        prevout: OutPoint,
+        header_code: u32,
+        utxo: &TxOut,
+        serialized_utxo: &mut Vec<u8>,
+    ) -> BitcoinNodeHash {
+        serialized_utxo.clear();
+        let _ = utxo.consensus_encode(serialized_utxo);
+        let leaf_hash = Sha512_256::new()
+            .chain_update(UTREEXO_TAG_V1)
+            .chain_update(UTREEXO_TAG_V1)
+            .chain_update(block_hash)
+            .chain_update(prevout.txid)
+            .chain_update(prevout.vout.to_le_bytes())
+            .chain_update(header_code.to_le_bytes())
+            .chain_update(serialized_utxo)
+            .finalize();
+        BitcoinNodeHash::from(leaf_hash.as_slice())
+    }
+
     impl BitcoinLeafData {
         pub fn get_leaf_hashes(leaf: &LeafContext) -> BitcoinNodeHash {
             let leaf_data = BitcoinLeafData::from(leaf.clone());
@@ -315,18 +336,13 @@ pub mod bitcoin_leaf_data {
         }
 
         fn compute_hash(&self) -> BitcoinNodeHash {
-            let mut ser_utxo = vec![];
-            let _ = self.utxo.consensus_encode(&mut ser_utxo);
-            let leaf_hash = Sha512_256::new()
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(self.block_hash)
-                .chain_update(self.prevout.txid)
-                .chain_update(self.prevout.vout.to_le_bytes())
-                .chain_update(self.header_code.to_le_bytes())
-                .chain_update(ser_utxo)
-                .finalize();
-            BitcoinNodeHash::from(leaf_hash.as_slice())
+            get_leaf_hash(
+                self.block_hash,
+                self.prevout,
+                self.header_code,
+                &self.utxo,
+                &mut Vec::new(),
+            )
         }
     }
 

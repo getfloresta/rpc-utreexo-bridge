@@ -13,7 +13,7 @@ It contains multiple components:
 
 ### Requirements
 
-- Rust 1.51.0 or later
+- Rust 1.80.0 or later
 - Linux or MacOS
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
@@ -53,6 +53,72 @@ Assuming you have a Bitcoin node running, just start the bridge as follows:
 ```
 
 The bridge will start listening on port 8333 for incoming connections from other nodes and clients. It will also start a websocket server on port 8334. API runs on port 8335. See [the API docs](docs/API.md) for more information.
+
+### Generating a hintsfile
+
+`bridge-hints` is a standalone scanner that builds the hintsfile directly from an unpruned Bitcoin
+Core RPC:
+
+```bash
+cargo build --release --bin bridge-hints
+./target/release/bridge-hints \
+    --output /path/to/utxo.hints \
+    --stop-height 900000
+```
+
+If `--stop-height` is omitted, the current RPC tip is used. Authentication uses the
+`BITCOIN_CORE_RPC_URL`, `BITCOIN_CORE_RPC_USER`, `BITCOIN_CORE_RPC_PASSWORD`, and
+`BITCOIN_CORE_COOKIE_FILE` environment variables, with matching command-line overrides.
+
+The scanner maintains the target-height UTXO set in memory and assigns per-block indices only to
+outputs that are eligible for the Utreexo accumulator. OP_RETURN scripts, scripts larger than
+10,000 bytes, same-block spends, and the first occurrences of the two historical BIP30-overwritten
+outputs at heights 91,722 and 91,812 are excluded before the index is incremented. The completed
+hintsfile is encoded to a temporary file and atomically moved into place.
+
+### Parallel flat-forest bootstrap
+
+Linux builds can construct the historical forest directly in a preallocated, memory-mapped flat
+file. The hintsfile stop height is the build target:
+
+```bash
+./target/release/bridge \
+    --build-forest /path/to/utxo.hints \
+    --forest-file /path/to/forest.dat
+```
+
+`--forest-leaf-workers` and `--forest-chaser-workers` override the default half-CPU split.
+`--forest-spin-iterations` controls how long chasers spin before sleeping on the publication
+condition variable.
+
+The builder first fetches the blocks once to determine deterministic leaf offsets, then fetches
+them concurrently again while writing leaves. Hints indices are interpreted over Utreexo-eligible
+outputs in block order; provably unspendable outputs and outputs consumed in their creating block
+are excluded. Chasers own deterministic ranges, each covering at least two input pages except
+where an entire upper row is smaller. A deleted child promotes its surviving sibling to the
+parent; two deleted children mark the parent deleted, recursively promoting surviving subtrees
+through roots. Independent ranges apply these rules concurrently with leaf publication.
+
+The output has no header. A node at forest position `N` starts at
+`N * size_of::<ForestNode>()`. Each 33-byte node contains a 32-byte hash and one flags byte:
+bit 0 means initialized and bit 1 means spent. The file is sized for the complete positional space
+at the required forest height; unused positions remain zero.
+
+The builder uses `posix_fallocate`, `MADV_WILLNEED`, and `MADV_HUGEPAGE`. It also requests
+`mlock2(MLOCK_ONFAULT)` so touched pages stay resident. Give the process an unlimited memlock
+limit to make that request effective:
+
+```bash
+ulimit -l unlimited
+./target/release/bridge --build-forest /path/to/utxo.hints
+```
+
+For a systemd service, set `LimitMEMLOCK=infinity`. Without that permission the builder logs a
+warning and continues using the Linux page cache. `--forest-no-mlock` disables the request
+explicitly. No sysctl changes are required; Linux will use otherwise-free RAM for the mapped file.
+Avoid globally raising `vm.dirty_ratio`: it can starve the rest of the system and only postpones,
+rather than removes, the final writeback.
+
 ## Building with esplora backends
 
 You can use esplora backends to grab blocks and transactions. To do so, you'll need to enable the `esplora` feature when building the node:
