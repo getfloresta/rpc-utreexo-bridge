@@ -31,6 +31,31 @@ pub struct CliArgs {
     #[clap(long)]
     pub save_proofs_after: Option<u32>,
 
+    /// Build a flat, memory-mapped forest through the stop height encoded by this hintsfile, then
+    /// exit. This phase currently supports Linux only.
+    #[clap(long, value_name = "HINTS_FILE")]
+    pub build_forest: Option<std::path::PathBuf>,
+
+    /// Output path for `--build-forest`. Defaults to `$DATA_DIR/forest.dat`.
+    #[clap(long, requires = "build_forest", value_name = "FOREST_FILE")]
+    pub forest_file: Option<std::path::PathBuf>,
+
+    /// Number of concurrent block-fetching leaf workers.
+    #[clap(long, requires = "build_forest")]
+    pub forest_leaf_workers: Option<usize>,
+
+    /// Number of concurrent parent-hashing chaser workers.
+    #[clap(long, requires = "build_forest")]
+    pub forest_chaser_workers: Option<usize>,
+
+    /// Number of readiness checks a chaser spins through before sleeping.
+    #[clap(long, requires = "build_forest")]
+    pub forest_spin_iterations: Option<usize>,
+
+    /// Do not attempt to lock touched forest pages in RAM.
+    #[clap(long, requires = "build_forest")]
+    pub forest_no_mlock: bool,
+
     /// The network we are operating on
     #[clap(long, short = 'n', default_value = "bitcoin")]
     pub network: Network,
