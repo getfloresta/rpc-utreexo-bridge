@@ -15,6 +15,7 @@ It contains multiple components:
 
 - Rust 1.80.0 or later
 - Linux or MacOS
+- A C++ toolchain, CMake, and Boost to compile `rust-bitcoinkernel`
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
@@ -56,19 +57,20 @@ The bridge will start listening on port 8333 for incoming connections from other
 
 ### Generating a hintsfile
 
-`bridge-hints` is a standalone scanner that builds the hintsfile directly from an unpruned Bitcoin
-Core RPC:
+`bridge-hints` is a standalone scanner that reads an unpruned Bitcoin Core datadir directly
+through `rust-bitcoinkernel`; no RPC connection or credentials are used:
 
 ```bash
 cargo build --release --bin bridge-hints
 ./target/release/bridge-hints \
-    --output /path/to/utxo.hints \
-    --stop-height 900000
+    --network signet \
+    --output /path/to/utxo.hints
 ```
 
-If `--stop-height` is omitted, the current RPC tip is used. Authentication uses the
-`BITCOIN_CORE_RPC_URL`, `BITCOIN_CORE_RPC_USER`, `BITCOIN_CORE_RPC_PASSWORD`, and
-`BITCOIN_CORE_COOKIE_FILE` environment variables, with matching command-line overrides.
+If `--stop-height` is omitted, the existing Core active-chain tip is used. Standard Bitcoin Core
+network paths are used (`$HOME/.bitcoin/signet` for Signet). Both tools open the already-synced
+Core chainstate with `rust-bitcoinkernel::ChainstateManager` and read blocks through its active
+chain entries; they do not run a second sync or reindex.
 
 The scanner maintains the target-height UTXO set in memory and assigns per-block indices only to
 outputs that are eligible for the Utreexo accumulator. OP_RETURN scripts, scripts larger than
@@ -83,16 +85,18 @@ file. The hintsfile stop height is the build target:
 
 ```bash
 ./target/release/bridge \
+    --network signet \
     --build-forest /path/to/utxo.hints \
     --forest-file /path/to/forest.dat
 ```
+The forest builder automatically reuses the kernel database created by `bridge-hints`.
 
 `--forest-leaf-workers` and `--forest-chaser-workers` override the default half-CPU split.
 `--forest-spin-iterations` controls how long chasers spin before sleeping on the publication
 condition variable.
 
-The builder first fetches the blocks once to determine deterministic leaf offsets, then fetches
-them concurrently again while writing leaves. Hints indices are interpreted over Utreexo-eligible
+The builder first reads blocks once to determine deterministic leaf offsets, then reads them
+concurrently again from Core's block files while writing leaves. Hints indices are interpreted over Utreexo-eligible
 outputs in block order; provably unspendable outputs and outputs consumed in their creating block
 are excluded. Chasers own deterministic ranges, each covering at least two input pages except
 where an entire upper row is smaller. A deleted child promotes its surviving sibling to the

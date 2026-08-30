@@ -4,6 +4,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
+use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::mem::size_of;
@@ -20,13 +21,26 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use bitcoin::Block;
-use bitcoin::OutPoint;
+use bitcoin::hashes::Hash;
+use bitcoin::Network;
 use bitcoin::Txid;
+use bitcoinkernel::prelude::BlockHashExt;
+use bitcoinkernel::prelude::ScriptPubkeyExt;
+use bitcoinkernel::prelude::TransactionExt;
+use bitcoinkernel::prelude::TxInExt;
+use bitcoinkernel::prelude::TxOutExt;
+use bitcoinkernel::prelude::TxOutPointExt;
+use bitcoinkernel::prelude::TxidExt;
+use bitcoinkernel::Block as KernelBlock;
+use bitcoinkernel::ChainType;
+use bitcoinkernel::ChainstateManager;
+use bitcoinkernel::Context as KernelContext;
+use bitcoinkernel::ContextBuilder;
 use hintsfile::Hintsfile;
 use log::info;
 use log::warn;
@@ -36,10 +50,6 @@ use memmap2::MmapOptions;
 use rustreexo::accumulator::node_hash::AccumulatorHash;
 use rustreexo::accumulator::node_hash::BitcoinNodeHash;
 
-use crate::chaininterface::Blockchain;
-use crate::prover::is_unspendable;
-use crate::udata::bitcoin_leaf_data::get_leaf_hash;
-
 const READY: u8 = 1 << 0;
 const SPENT: u8 = 1 << 1;
 const WRITING: u8 = 1 << 2;
@@ -48,6 +58,22 @@ const BIP30_FIRST_TXID_91722: &str =
     "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468";
 const BIP30_FIRST_TXID_91812: &str =
     "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct KernelOutPoint {
+    txid: [u8; 32],
+    vout: u32,
+}
+
+#[derive(Clone, Copy)]
+struct LeafOutput<'a> {
+    block_hash: [u8; 32],
+    txid: [u8; 32],
+    vout: u32,
+    is_coinbase: bool,
+    value: u64,
+    script_pubkey: &'a [u8],
+}
 
 /// The stable representation of one position in the flat forest file.
 ///
@@ -387,22 +413,103 @@ impl Availability {
 }
 
 trait BlockSource: Sync {
-    fn block_at_height(&self, height: u32) -> Result<Block>;
+    fn visit_leaf_outputs(
+        &self,
+        height: u32,
+        visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
+    ) -> Result<u64>;
 }
 
-struct RpcBlockSource {
-    rpc: Arc<dyn Blockchain>,
+pub struct KernelBlockSource {
+    // Fields drop in declaration order; the manager must be destroyed before its context.
+    manager: ChainstateManager,
+    _context: KernelContext,
+    tip_height: u32,
 }
 
-impl BlockSource for RpcBlockSource {
-    fn block_at_height(&self, height: u32) -> Result<Block> {
-        let hash = self
-            .rpc
-            .get_block_hash(height as u64)
-            .with_context(|| format!("failed to fetch block hash at height {height}"))?;
-        self.rpc
-            .get_block(hash)
-            .with_context(|| format!("failed to fetch block at height {height}"))
+impl KernelBlockSource {
+    pub fn open(network: Network) -> Result<Self> {
+        let home = env::var("HOME").context("HOME is required to locate Bitcoin Core data")?;
+        let bitcoin_data_dir = PathBuf::from(home).join(".bitcoin");
+        let network_data_dir = match network {
+            Network::Bitcoin => bitcoin_data_dir,
+            Network::Testnet => bitcoin_data_dir.join("testnet3"),
+            Network::Testnet4 => bitcoin_data_dir.join("testnet4"),
+            Network::Signet => bitcoin_data_dir.join("signet"),
+            Network::Regtest => bitcoin_data_dir.join("regtest"),
+            _ => bail!("unsupported Bitcoin network {network}"),
+        };
+        let blocks_dir = network_data_dir.join("blocks");
+        if !blocks_dir.is_dir() {
+            bail!(
+                "Bitcoin Core blocks directory {} does not exist",
+                blocks_dir.display()
+            );
+        }
+        let chain_type = match network {
+            Network::Bitcoin => ChainType::Mainnet,
+            Network::Testnet => ChainType::Testnet,
+            Network::Testnet4 => ChainType::Testnet4,
+            Network::Signet => ChainType::Signet,
+            Network::Regtest => ChainType::Regtest,
+            _ => bail!("unsupported Bitcoin network {network}"),
+        };
+        let context = ContextBuilder::new()
+            .chain_type(chain_type)
+            .build()
+            .context("failed to create Bitcoin kernel context")?;
+        let data_dir = network_data_dir
+            .to_str()
+            .context("Bitcoin Core network directory is not valid UTF-8")?;
+        let blocks_dir = blocks_dir
+            .to_str()
+            .context("Bitcoin Core blocks directory is not valid UTF-8")?;
+        let manager = ChainstateManager::new(&context, data_dir, blocks_dir)
+            .context("failed to open Bitcoin Core through the kernel chainstate manager")?;
+        let chain = manager.active_chain();
+        let tip_height =
+            u32::try_from(chain.height()).context("kernel chain tip is outside u32 range")?;
+        info!(
+            "Opened Bitcoin Core kernel chain at height={} hash={}",
+            tip_height,
+            chain.tip().block_hash()
+        );
+        Ok(Self {
+            manager,
+            _context: context,
+            tip_height,
+        })
+    }
+
+    pub fn tip_height(&self) -> u32 {
+        self.tip_height
+    }
+
+    fn block_at_height(&self, height: u32) -> Result<KernelBlock> {
+        if height > self.tip_height {
+            bail!(
+                "requested height {height} exceeds kernel tip {}",
+                self.tip_height
+            );
+        }
+        let chain = self.manager.active_chain();
+        let entry = chain
+            .at_height(height as usize)
+            .ok_or_else(|| anyhow!("kernel active chain has no block at height {height}"))?;
+        self.manager
+            .read_block_data(&entry)
+            .with_context(|| format!("failed to read block data at height {height}"))
+    }
+}
+
+impl BlockSource for KernelBlockSource {
+    fn visit_leaf_outputs(
+        &self,
+        height: u32,
+        visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
+    ) -> Result<u64> {
+        let block = self.block_at_height(height)?;
+        visit_kernel_leaf_outputs(height, &block, visitor)
     }
 }
 
@@ -423,11 +530,18 @@ impl Hints for Hintsfile {
 
 /// Build and persist a complete flat forest through the hintsfile's stop height.
 pub fn build_parallel_forest(
-    rpc: Arc<dyn Blockchain>,
+    source: &KernelBlockSource,
     hints: &Hintsfile,
     config: ParallelForestConfig,
 ) -> Result<ForestBuildSummary> {
-    build_with_source(&RpcBlockSource { rpc }, hints, config)
+    if hints.stop_height() > source.tip_height() {
+        bail!(
+            "hints stop height {} exceeds kernel tip {}",
+            hints.stop_height(),
+            source.tip_height()
+        );
+    }
+    build_with_source(source, hints, config)
 }
 
 fn build_with_source<S: BlockSource, H: Hints>(
@@ -519,8 +633,8 @@ fn index_leaf_counts<S: BlockSource>(
             handles.push(scope.spawn(move || -> Result<Vec<(u32, u64)>> {
                 let mut counts = Vec::with_capacity(range.len());
                 for height in range {
-                    let block = source.block_at_height(height)?;
-                    counts.push((height, count_block_leaves(height, &block)?));
+                    let count = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
+                    counts.push((height, count));
                 }
                 Ok(counts)
             }));
@@ -639,9 +753,7 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
     availability: &Availability,
 ) -> Result<()> {
     let publish_nodes = nodes_per_two_pages();
-    let mut serialized_utxo = Vec::new();
     for height in heights {
-        let block = source.block_at_height(height)?;
         let expected_count = leaf_counts[(height - 1) as usize];
         let block_offset = leaf_offsets[(height - 1) as usize];
         let unspent = hints
@@ -651,63 +763,48 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             bail!("hints at height {height} are not strictly increasing");
         }
 
-        let spent_in_block = same_block_spends(&block)?;
-        let bip30_exclusion = bip30_excluded_outpoint(height);
-        let block_hash = block.block_hash();
         let mut local_position = 0u64;
         let mut hint_position = 0usize;
         let mut unpublished = 0usize;
-        for tx in &block.txdata {
-            let txid = tx.compute_txid();
-            let is_coinbase = tx.is_coinbase();
-            for (vout, output) in tx.output.iter().enumerate() {
-                let outpoint = OutPoint {
-                    txid,
-                    vout: u32::try_from(vout).context("transaction output index overflow")?,
-                };
-                if is_unspendable(&output.script_pubkey)
-                    || spent_in_block.contains(&outpoint)
-                    || bip30_exclusion == Some(outpoint)
-                {
-                    continue;
-                }
-                let local_hint = u32::try_from(local_position)
-                    .context("one block contains more than u32::MAX leaves")?;
-                if unspent
-                    .get(hint_position)
-                    .copied()
-                    .is_some_and(|hint| hint < local_hint)
-                {
-                    bail!("hint index is duplicated or out of order at height {height}");
-                }
-                let spent = if unspent.get(hint_position) == Some(&local_hint) {
-                    hint_position += 1;
-                    false
-                } else {
-                    true
-                };
-                let hash = get_leaf_hash(
-                    block_hash,
-                    outpoint,
-                    (height << 1) | u32::from(is_coinbase),
-                    output,
-                    &mut serialized_utxo,
-                );
-                forest.write(
-                    block_offset + local_position,
-                    ForestNodeData { hash: *hash, spent },
-                )?;
-                local_position += 1;
-                unpublished += 1;
-                if unpublished >= publish_nodes {
-                    availability.publish()?;
-                    unpublished = 0;
-                }
+        let visited = source.visit_leaf_outputs(height, &mut |leaf| {
+            let local_hint = u32::try_from(local_position)
+                .context("one block contains more than u32::MAX leaves")?;
+            if unspent
+                .get(hint_position)
+                .copied()
+                .is_some_and(|hint| hint < local_hint)
+            {
+                bail!("hint index is duplicated or out of order at height {height}");
             }
-        }
-        if local_position != expected_count {
+            let spent = if unspent.get(hint_position) == Some(&local_hint) {
+                hint_position += 1;
+                false
+            } else {
+                true
+            };
+            let hash = get_leaf_hash_from_parts(
+                leaf.block_hash,
+                leaf.txid,
+                leaf.vout,
+                (height << 1) | u32::from(leaf.is_coinbase),
+                leaf.value,
+                leaf.script_pubkey,
+            );
+            forest.write(
+                block_offset + local_position,
+                ForestNodeData { hash: *hash, spent },
+            )?;
+            local_position += 1;
+            unpublished += 1;
+            if unpublished >= publish_nodes {
+                availability.publish()?;
+                unpublished = 0;
+            }
+            Ok(())
+        })?;
+        if visited != expected_count || local_position != expected_count {
             bail!(
-                "leaf count changed at height {height}: indexed {expected_count}, built {local_position}"
+                "leaf count changed at height {height}: indexed {expected_count}, visited {visited}, built {local_position}"
             );
         }
         if hint_position != unspent.len() {
@@ -817,43 +914,64 @@ fn validate_forest(
     Ok((initialized, roots))
 }
 
-fn count_block_leaves(height: u32, block: &Block) -> Result<u64> {
-    let spent_in_block = same_block_spends(block)?;
+fn visit_kernel_leaf_outputs(
+    height: u32,
+    block: &KernelBlock,
+    visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
+) -> Result<u64> {
+    let spent_in_block = kernel_same_block_spends(block)?;
     let bip30_exclusion = bip30_excluded_outpoint(height);
+    let block_hash = block.hash().to_bytes();
     let mut count = 0u64;
-    for tx in &block.txdata {
-        let txid = tx.compute_txid();
-        for (vout, output) in tx.output.iter().enumerate() {
-            let outpoint = OutPoint {
+    for tx in block.transactions() {
+        let txid = tx.txid().to_bytes();
+        let is_coinbase = tx.input_count() == 1 && tx.input(0)?.outpoint().is_null();
+        for (vout, output) in tx.outputs().enumerate() {
+            let outpoint = KernelOutPoint {
                 txid,
                 vout: u32::try_from(vout).context("transaction output index overflow")?,
             };
-            if is_unspendable(&output.script_pubkey)
+            let script_pubkey = output.script_pubkey().to_bytes();
+            if script_pubkey.len() > 10_000
+                || script_pubkey.first() == Some(&0x6a)
                 || spent_in_block.contains(&outpoint)
                 || bip30_exclusion == Some(outpoint)
             {
                 continue;
             }
+            let value =
+                u64::try_from(output.value()).context("transaction output value is negative")?;
+            visitor(LeafOutput {
+                block_hash,
+                txid,
+                vout: outpoint.vout,
+                is_coinbase,
+                value,
+                script_pubkey: &script_pubkey,
+            })?;
             count = count.checked_add(1).context("block leaf count overflow")?;
         }
     }
     Ok(count)
 }
 
-fn same_block_spends(block: &Block) -> Result<HashSet<OutPoint>> {
+fn kernel_same_block_spends(block: &KernelBlock) -> Result<HashSet<KernelOutPoint>> {
     let mut created = HashSet::new();
     let mut spent = HashSet::new();
-    for tx in &block.txdata {
-        if !tx.is_coinbase() {
-            for input in &tx.input {
-                if created.contains(&input.previous_output) {
-                    spent.insert(input.previous_output);
-                }
+    for tx in block.transactions() {
+        for input in tx.inputs() {
+            let outpoint = input.outpoint();
+            let outpoint = KernelOutPoint {
+                txid: outpoint.txid().to_bytes(),
+                vout: outpoint.index(),
+            };
+            if created.contains(&outpoint) {
+                spent.insert(outpoint);
             }
         }
-        let txid = tx.compute_txid();
-        for vout in 0..tx.output.len() {
-            created.insert(OutPoint {
+        let txid = tx.txid().to_bytes();
+        for vout in 0..tx.output_count() {
+            created.insert(KernelOutPoint {
                 txid,
                 vout: u32::try_from(vout).context("transaction output index overflow")?,
             });
@@ -862,14 +980,16 @@ fn same_block_spends(block: &Block) -> Result<HashSet<OutPoint>> {
     Ok(spent)
 }
 
-fn bip30_excluded_outpoint(height: u32) -> Option<OutPoint> {
+fn bip30_excluded_outpoint(height: u32) -> Option<KernelOutPoint> {
     let txid = match height {
         91_722 => BIP30_FIRST_TXID_91722,
         91_812 => BIP30_FIRST_TXID_91812,
         _ => return None,
     };
-    Some(OutPoint {
-        txid: Txid::from_str(txid).expect("hardcoded BIP30 txid must be valid"),
+    Some(KernelOutPoint {
+        txid: Txid::from_str(txid)
+            .expect("hardcoded BIP30 txid must be valid")
+            .to_byte_array(),
         vout: 0,
     })
 }
@@ -949,8 +1069,10 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::transaction;
     use bitcoin::Amount;
+    use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::CompactTarget;
+    use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
     use bitcoin::Sequence;
     use bitcoin::Transaction;
@@ -968,11 +1090,65 @@ mod tests {
     }
 
     impl BlockSource for MockSource {
-        fn block_at_height(&self, height: u32) -> Result<Block> {
-            self.blocks
+        fn visit_leaf_outputs(
+            &self,
+            height: u32,
+            visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
+        ) -> Result<u64> {
+            let block = self
+                .blocks
                 .get((height - 1) as usize)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing mock block {height}"))
+                .ok_or_else(|| anyhow!("missing mock block {height}"))?;
+            let mut created = HashSet::new();
+            let mut spent_in_block = HashSet::new();
+            for tx in &block.txdata {
+                for input in &tx.input {
+                    let outpoint = KernelOutPoint {
+                        txid: input.previous_output.txid.to_byte_array(),
+                        vout: input.previous_output.vout,
+                    };
+                    if created.contains(&outpoint) {
+                        spent_in_block.insert(outpoint);
+                    }
+                }
+                let txid = tx.compute_txid().to_byte_array();
+                for vout in 0..tx.output.len() {
+                    created.insert(KernelOutPoint {
+                        txid,
+                        vout: u32::try_from(vout)?,
+                    });
+                }
+            }
+
+            let block_hash = block.block_hash().to_byte_array();
+            let bip30_exclusion = bip30_excluded_outpoint(height);
+            let mut count = 0u64;
+            for tx in &block.txdata {
+                let txid = tx.compute_txid().to_byte_array();
+                for (vout, output) in tx.output.iter().enumerate() {
+                    let outpoint = KernelOutPoint {
+                        txid,
+                        vout: u32::try_from(vout)?,
+                    };
+                    if output.script_pubkey.len() > 10_000
+                        || output.script_pubkey.as_bytes().first() == Some(&0x6a)
+                        || spent_in_block.contains(&outpoint)
+                        || bip30_exclusion == Some(outpoint)
+                    {
+                        continue;
+                    }
+                    visitor(LeafOutput {
+                        block_hash,
+                        txid,
+                        vout: outpoint.vout,
+                        is_coinbase: tx.is_coinbase(),
+                        value: output.value.to_sat(),
+                        script_pubkey: output.script_pubkey.as_bytes(),
+                    })?;
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
     }
 

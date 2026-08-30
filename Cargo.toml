@@ -14,6 +14,7 @@ keywords = ["utreexo", "bitcoin", "blockchain", "rust"]
 categories = ["bitcoin", "tools"]
 
 [dependencies]
+bitcoinkernel = "0.3.0"
 bitcoin = { version = "0.32.4", features = ["serde"] }
 bitcoincore-rpc = "0.19"
 bitcoin_hashes = "0.11"

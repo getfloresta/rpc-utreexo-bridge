@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Build a SwiftSync hintsfile from an unpruned Bitcoin Core RPC.
+//! Build a SwiftSync hintsfile from Bitcoin Core block files through `libbitcoinkernel`.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -16,13 +16,20 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use bitcoin::Block;
-use bitcoin::OutPoint;
-use bitcoin::Script;
+use bitcoin::hashes::Hash;
+use bitcoin::Network;
 use bitcoin::Txid;
-use bitcoincore_rpc::Auth;
-use bitcoincore_rpc::Client;
-use bitcoincore_rpc::RpcApi;
+use bitcoinkernel::prelude::ScriptPubkeyExt;
+use bitcoinkernel::prelude::TransactionExt;
+use bitcoinkernel::prelude::TxInExt;
+use bitcoinkernel::prelude::TxOutExt;
+use bitcoinkernel::prelude::TxOutPointExt;
+use bitcoinkernel::prelude::TxidExt;
+use bitcoinkernel::Block as KernelBlock;
+use bitcoinkernel::ChainType;
+use bitcoinkernel::ChainstateManager;
+use bitcoinkernel::Context as KernelContext;
+use bitcoinkernel::ContextBuilder;
 use clap::Parser;
 use hintsfile::EliasFano;
 use hintsfile::HintsfileBuilder;
@@ -35,32 +42,20 @@ const BIP30_FIRST_TXID_91812: &str =
 #[derive(Debug, Parser)]
 #[command(
     name = "bridge-hints",
-    about = "Build a hintsfile by scanning blocks from an unpruned Bitcoin Core RPC"
+    about = "Build a hintsfile by reading an unpruned Bitcoin Core datadir with libbitcoinkernel"
 )]
 struct Cli {
     /// Destination hintsfile. Written atomically after the complete scan.
     #[arg(long, short)]
     output: PathBuf,
 
-    /// Last block height to include. Defaults to the RPC node's current tip.
+    /// Last block height to include. Defaults to Bitcoin Core's active-chain tip.
     #[arg(long)]
     stop_height: Option<u32>,
 
-    /// Bitcoin Core RPC endpoint. Defaults to BITCOIN_CORE_RPC_URL or localhost:8332.
-    #[arg(long)]
-    rpc_url: Option<String>,
-
-    /// RPC username. Defaults to BITCOIN_CORE_RPC_USER.
-    #[arg(long)]
-    rpc_user: Option<String>,
-
-    /// RPC password. Defaults to BITCOIN_CORE_RPC_PASSWORD.
-    #[arg(long)]
-    rpc_password: Option<String>,
-
-    /// Cookie file. Defaults to BITCOIN_CORE_COOKIE_FILE or ~/.bitcoin/.cookie.
-    #[arg(long)]
-    rpc_cookie_file: Option<PathBuf>,
+    /// Bitcoin network represented by the Core datadir.
+    #[arg(long, short = 'n', default_value = "bitcoin")]
+    network: Network,
 
     /// Initial capacity for the in-memory UTXO map.
     #[arg(long)]
@@ -81,28 +76,36 @@ struct LeafPosition {
     index: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct KernelOutPoint {
+    txid: [u8; 32],
+    vout: u32,
+}
+
+struct KernelChain {
+    // Fields drop in declaration order; the manager must be destroyed before its context.
+    manager: ChainstateManager,
+    _context: KernelContext,
+    tip_height: u32,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let rpc = rpc_client(&cli)?;
-    let tip = rpc.get_block_count().context("failed to query RPC tip")?;
-    let stop_height = match cli.stop_height {
-        Some(height) => {
-            if u64::from(height) > tip {
-                bail!("requested stop height {height} is above RPC tip {tip}");
-            }
-            height
-        }
-        None => u32::try_from(tip).context("RPC tip exceeds u32::MAX")?,
-    };
+    let kernel = KernelChain::open(&cli)?;
+    let stop_height = cli.stop_height.unwrap_or(kernel.tip_height);
     if stop_height == 0 {
         bail!("stop height must be greater than zero");
     }
+    if stop_height > kernel.tip_height {
+        bail!(
+            "requested stop height {stop_height} is above Core tip {}",
+            kernel.tip_height
+        );
+    }
 
-    let stop_hash = rpc
-        .get_block_hash(u64::from(stop_height))
-        .with_context(|| format!("failed to fetch stop block hash at height {stop_height}"))?;
+    let stop_hash = kernel.block_hash_at_height(stop_height)?;
     eprintln!(
-        "Scanning heights 1..={stop_height} through block {stop_hash}; this requires an unpruned RPC node"
+        "Scanning heights 1..={stop_height} through block {stop_hash} via Bitcoin Core's kernel chainstate"
     );
 
     let mut utxos = match cli.utxo_capacity {
@@ -110,12 +113,7 @@ fn main() -> Result<()> {
         None => AHashMap::new(),
     };
     for height in 1..=stop_height {
-        let block_hash = rpc
-            .get_block_hash(u64::from(height))
-            .with_context(|| format!("failed to fetch block hash at height {height}"))?;
-        let block = rpc
-            .get_block(&block_hash)
-            .with_context(|| format!("failed to fetch block {block_hash} at height {height}"))?;
+        let block = kernel.block_at_height(height)?;
         let eligible_outputs = apply_block(height, &block, &mut utxos)?;
 
         if cli.progress_every != 0 && (height % cli.progress_every == 0 || height == stop_height) {
@@ -136,64 +134,108 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn rpc_client(cli: &Cli) -> Result<Client> {
-    let url = cli
-        .rpc_url
-        .clone()
-        .or_else(|| env::var("BITCOIN_CORE_RPC_URL").ok())
-        .unwrap_or_else(|| "localhost:8332".to_owned());
-    let username = cli
-        .rpc_user
-        .clone()
-        .or_else(|| env::var("BITCOIN_CORE_RPC_USER").ok());
-    let password = cli
-        .rpc_password
-        .clone()
-        .or_else(|| env::var("BITCOIN_CORE_RPC_PASSWORD").ok());
-    let auth = match username {
-        Some(username) => Auth::UserPass(
-            username,
-            password.context("RPC password is required when an RPC username is set")?,
-        ),
-        None => {
-            if password.is_some() {
-                bail!("RPC username is required when an RPC password is set");
-            }
-            let cookie = cli
-                .rpc_cookie_file
-                .clone()
-                .or_else(|| env::var("BITCOIN_CORE_COOKIE_FILE").ok().map(Into::into))
-                .or_else(|| {
-                    env::var("HOME")
-                        .ok()
-                        .map(|home| PathBuf::from(home).join(".bitcoin/.cookie"))
-                })
-                .context("no RPC credentials or Bitcoin Core cookie path available")?;
-            Auth::CookieFile(cookie)
+impl KernelChain {
+    fn open(cli: &Cli) -> Result<Self> {
+        let home = env::var("HOME").context("HOME is required to locate Bitcoin Core data")?;
+        let bitcoin_data_dir = PathBuf::from(home).join(".bitcoin");
+        let network_data_dir = network_data_dir(&bitcoin_data_dir, cli.network);
+        let blocks_dir = network_data_dir.join("blocks");
+        if !blocks_dir.is_dir() {
+            bail!(
+                "Bitcoin Core blocks directory {} does not exist",
+                blocks_dir.display()
+            );
         }
-    };
-    Client::new(&url, auth).context("failed to create Bitcoin Core RPC client")
+        let context = ContextBuilder::new()
+            .chain_type(kernel_chain_type(cli.network)?)
+            .build()
+            .context("failed to create Bitcoin kernel context")?;
+        let data_dir = network_data_dir
+            .to_str()
+            .context("Bitcoin Core network directory is not valid UTF-8")?;
+        let blocks_dir = blocks_dir
+            .to_str()
+            .context("Bitcoin Core blocks directory is not valid UTF-8")?;
+        let manager = ChainstateManager::new(&context, data_dir, blocks_dir)
+            .context("failed to open Bitcoin Core through the kernel chainstate manager")?;
+        let chain = manager.active_chain();
+        let tip_height =
+            u32::try_from(chain.height()).context("kernel chain tip is outside u32 range")?;
+        eprintln!(
+            "Opened Bitcoin Core kernel chain height={tip_height} hash={}",
+            chain.tip().block_hash()
+        );
+        Ok(Self {
+            manager,
+            _context: context,
+            tip_height,
+        })
+    }
+
+    fn block_at_height(&self, height: u32) -> Result<KernelBlock> {
+        let chain = self.manager.active_chain();
+        let entry = chain
+            .at_height(height as usize)
+            .ok_or_else(|| anyhow!("kernel active chain has no block at height {height}"))?;
+        self.manager
+            .read_block_data(&entry)
+            .with_context(|| format!("failed to read block data at height {height}"))
+    }
+
+    fn block_hash_at_height(&self, height: u32) -> Result<String> {
+        self.manager
+            .active_chain()
+            .at_height(height as usize)
+            .map(|entry| entry.block_hash().to_string())
+            .ok_or_else(|| anyhow!("kernel active chain has no block at height {height}"))
+    }
+}
+
+fn kernel_chain_type(network: Network) -> Result<ChainType> {
+    match network {
+        Network::Bitcoin => Ok(ChainType::Mainnet),
+        Network::Testnet => Ok(ChainType::Testnet),
+        Network::Testnet4 => Ok(ChainType::Testnet4),
+        Network::Signet => Ok(ChainType::Signet),
+        Network::Regtest => Ok(ChainType::Regtest),
+        _ => bail!("unsupported Bitcoin network {network}"),
+    }
+}
+
+fn network_data_dir(bitcoin_data_dir: &Path, network: Network) -> PathBuf {
+    match network {
+        Network::Bitcoin => bitcoin_data_dir.to_owned(),
+        Network::Testnet => bitcoin_data_dir.join("testnet3"),
+        Network::Testnet4 => bitcoin_data_dir.join("testnet4"),
+        Network::Signet => bitcoin_data_dir.join("signet"),
+        Network::Regtest => bitcoin_data_dir.join("regtest"),
+        _ => bitcoin_data_dir.join(network.to_string()),
+    }
 }
 
 fn apply_block(
     height: u32,
-    block: &Block,
-    utxos: &mut AHashMap<OutPoint, LeafPosition>,
+    block: &KernelBlock,
+    utxos: &mut AHashMap<KernelOutPoint, LeafPosition>,
 ) -> Result<u32> {
     let same_block_spends = same_block_spends(block)?;
 
-    for tx in &block.txdata {
-        if tx.is_coinbase() {
-            continue;
-        }
-        for input in &tx.input {
-            if same_block_spends.contains(&input.previous_output) {
+    for tx in block.transactions() {
+        for input in tx.inputs() {
+            let previous_output = input.outpoint();
+            if previous_output.is_null() {
                 continue;
             }
-            utxos.remove(&input.previous_output).ok_or_else(|| {
+            let previous_output = KernelOutPoint {
+                txid: previous_output.txid().to_bytes(),
+                vout: previous_output.index(),
+            };
+            if same_block_spends.contains(&previous_output) {
+                continue;
+            }
+            utxos.remove(&previous_output).ok_or_else(|| {
                 anyhow!(
-                    "input {} at height {height} does not reference an indexed UTXO",
-                    input.previous_output
+                    "input {previous_output:?} at height {height} does not reference an indexed UTXO"
                 )
             })?;
         }
@@ -201,14 +243,16 @@ fn apply_block(
 
     let bip30_exclusion = bip30_excluded_outpoint(height);
     let mut eligible_outputs = 0u32;
-    for tx in &block.txdata {
-        let txid = tx.compute_txid();
-        for (vout, output) in tx.output.iter().enumerate() {
-            let outpoint = OutPoint {
+    for tx in block.transactions() {
+        let txid = tx.txid().to_bytes();
+        for (vout, output) in tx.outputs().enumerate() {
+            let outpoint = KernelOutPoint {
                 txid,
                 vout: u32::try_from(vout).context("transaction output index exceeds u32::MAX")?,
             };
-            if is_provably_unspendable(&output.script_pubkey)
+            let script_pubkey = output.script_pubkey().to_bytes();
+            if script_pubkey.len() > 10_000
+                || script_pubkey.first() == Some(&0x6a)
                 || same_block_spends.contains(&outpoint)
                 || bip30_exclusion == Some(outpoint)
             {
@@ -220,7 +264,7 @@ fn apply_block(
                 index: eligible_outputs,
             };
             if utxos.insert(outpoint, position).is_some() {
-                bail!("duplicate unspent outpoint {outpoint} at height {height}");
+                bail!("duplicate unspent outpoint {outpoint:?} at height {height}");
             }
             eligible_outputs = eligible_outputs
                 .checked_add(1)
@@ -230,20 +274,23 @@ fn apply_block(
     Ok(eligible_outputs)
 }
 
-fn same_block_spends(block: &Block) -> Result<AHashSet<OutPoint>> {
+fn same_block_spends(block: &KernelBlock) -> Result<AHashSet<KernelOutPoint>> {
     let mut created = AHashSet::new();
     let mut spent = AHashSet::new();
-    for tx in &block.txdata {
-        if !tx.is_coinbase() {
-            for input in &tx.input {
-                if created.contains(&input.previous_output) {
-                    spent.insert(input.previous_output);
-                }
+    for tx in block.transactions() {
+        for input in tx.inputs() {
+            let previous_output = input.outpoint();
+            let previous_output = KernelOutPoint {
+                txid: previous_output.txid().to_bytes(),
+                vout: previous_output.index(),
+            };
+            if created.contains(&previous_output) {
+                spent.insert(previous_output);
             }
         }
-        let txid = tx.compute_txid();
-        for vout in 0..tx.output.len() {
-            created.insert(OutPoint {
+        let txid = tx.txid().to_bytes();
+        for vout in 0..tx.output_count() {
+            created.insert(KernelOutPoint {
                 txid,
                 vout: u32::try_from(vout).context("transaction output index exceeds u32::MAX")?,
             });
@@ -252,25 +299,23 @@ fn same_block_spends(block: &Block) -> Result<AHashSet<OutPoint>> {
     Ok(spent)
 }
 
-fn is_provably_unspendable(script: &Script) -> bool {
-    script.len() > 10_000 || script.as_bytes().first() == Some(&0x6a)
-}
-
-fn bip30_excluded_outpoint(height: u32) -> Option<OutPoint> {
+fn bip30_excluded_outpoint(height: u32) -> Option<KernelOutPoint> {
     let txid = match height {
         91_722 => BIP30_FIRST_TXID_91722,
         91_812 => BIP30_FIRST_TXID_91812,
         _ => return None,
     };
-    Some(OutPoint {
-        txid: Txid::from_str(txid).expect("hardcoded BIP30 txid must be valid"),
+    Some(KernelOutPoint {
+        txid: Txid::from_str(txid)
+            .expect("hardcoded BIP30 txid must be valid")
+            .to_byte_array(),
         vout: 0,
     })
 }
 
 fn collect_unspent_indices(
     stop_height: u32,
-    utxos: AHashMap<OutPoint, LeafPosition>,
+    utxos: AHashMap<KernelOutPoint, LeafPosition>,
 ) -> Result<Vec<Vec<u32>>> {
     let mut indices = vec![Vec::new(); stop_height as usize + 1];
     for position in utxos.into_values() {
@@ -378,11 +423,14 @@ mod tests {
     use bitcoin::absolute;
     use bitcoin::block;
     use bitcoin::block::Header;
+    use bitcoin::consensus::serialize;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction;
     use bitcoin::Amount;
+    use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::CompactTarget;
+    use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
     use bitcoin::Sequence;
     use bitcoin::Transaction;
@@ -429,6 +477,17 @@ mod tests {
         }
     }
 
+    fn kernel_block(block: &Block) -> KernelBlock {
+        KernelBlock::new(&serialize(block)).unwrap()
+    }
+
+    fn kernel_outpoint(outpoint: OutPoint) -> KernelOutPoint {
+        KernelOutPoint {
+            txid: outpoint.txid.to_byte_array(),
+            vout: outpoint.vout,
+        }
+    }
+
     #[test]
     fn filters_outputs_before_assigning_per_block_indices() {
         let coinbase = transaction(
@@ -446,6 +505,7 @@ mod tests {
         };
         let spend_in_block = transaction(same_block_outpoint, vec![output(40, ScriptBuf::new())]);
         let first_block = block(1, vec![coinbase.clone(), spend_in_block.clone()]);
+        let first_kernel_block = kernel_block(&first_block);
 
         let surviving_first_outpoint = OutPoint {
             txid: coinbase.compute_txid(),
@@ -458,27 +518,28 @@ mod tests {
         let second_coinbase = transaction(OutPoint::null(), vec![output(50, ScriptBuf::new())]);
         let spend_old = transaction(surviving_first_outpoint, vec![output(60, ScriptBuf::new())]);
         let second_block = block(2, vec![second_coinbase.clone(), spend_old.clone()]);
+        let second_kernel_block = kernel_block(&second_block);
 
         let mut utxos = AHashMap::new();
-        assert_eq!(apply_block(1, &first_block, &mut utxos).unwrap(), 2);
+        assert_eq!(apply_block(1, &first_kernel_block, &mut utxos).unwrap(), 2);
         assert_eq!(
-            utxos.get(&surviving_first_outpoint),
+            utxos.get(&kernel_outpoint(surviving_first_outpoint)),
             Some(&LeafPosition {
                 height: 1,
                 index: 0
             })
         );
         assert_eq!(
-            utxos.get(&same_block_created_outpoint),
+            utxos.get(&kernel_outpoint(same_block_created_outpoint)),
             Some(&LeafPosition {
                 height: 1,
                 index: 1
             })
         );
-        assert!(!utxos.contains_key(&same_block_outpoint));
+        assert!(!utxos.contains_key(&kernel_outpoint(same_block_outpoint)));
 
-        assert_eq!(apply_block(2, &second_block, &mut utxos).unwrap(), 2);
-        assert!(!utxos.contains_key(&surviving_first_outpoint));
+        assert_eq!(apply_block(2, &second_kernel_block, &mut utxos).unwrap(), 2);
+        assert!(!utxos.contains_key(&kernel_outpoint(surviving_first_outpoint)));
         let indices = collect_unspent_indices(2, utxos).unwrap();
         assert_eq!(indices[1], vec![1]);
         assert_eq!(indices[2], vec![0, 1]);
@@ -495,15 +556,19 @@ mod tests {
     fn excludes_only_the_overwritten_bip30_first_occurrences() {
         assert_eq!(
             bip30_excluded_outpoint(91_722),
-            Some(OutPoint {
-                txid: Txid::from_str(BIP30_FIRST_TXID_91722).unwrap(),
+            Some(KernelOutPoint {
+                txid: Txid::from_str(BIP30_FIRST_TXID_91722)
+                    .unwrap()
+                    .to_byte_array(),
                 vout: 0,
             })
         );
         assert_eq!(
             bip30_excluded_outpoint(91_812),
-            Some(OutPoint {
-                txid: Txid::from_str(BIP30_FIRST_TXID_91812).unwrap(),
+            Some(KernelOutPoint {
+                txid: Txid::from_str(BIP30_FIRST_TXID_91812)
+                    .unwrap()
+                    .to_byte_array(),
                 vout: 0,
             })
         );

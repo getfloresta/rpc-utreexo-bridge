@@ -26,6 +26,7 @@ use crate::leaf_cache::DiskLeafStorage;
 use crate::node;
 use crate::node::WorkerContext;
 use crate::parallel_forest::build_parallel_forest;
+use crate::parallel_forest::KernelBlockSource;
 use crate::parallel_forest::ParallelForestConfig;
 use crate::prover;
 use crate::subdir;
@@ -63,8 +64,8 @@ pub fn run_bridge() -> anyhow::Result<()> {
         }
         config.lock_pages = !cli_options.forest_no_mlock;
 
-        let client: Arc<dyn crate::chaininterface::Blockchain> = Arc::from(get_chain_provider()?);
-        let summary = build_parallel_forest(client, &hints, config)?;
+        let source = KernelBlockSource::open(cli_options.network)?;
+        let summary = build_parallel_forest(&source, &hints, config)?;
         info!(
             "Built flat forest: leaves={} nodes={} bytes={} roots={} pages_locked={}",
             summary.leaves,
