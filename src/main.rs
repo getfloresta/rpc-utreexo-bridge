@@ -30,6 +30,8 @@ mod esplora;
 #[cfg(feature = "node")]
 mod node;
 
+#[cfg(not(feature = "shinigami"))]
+mod parallel_forest;
 mod prover;
 
 #[cfg(feature = "shinigami")]

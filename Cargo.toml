@@ -3,6 +3,7 @@ name = "bridge"
 version = "0.1.3"
 edition = "2021"
 rust-version = "1.85.0"
+default-run = "bridge"
 authors = ["Davidson Souza <davidson.lucas.souza@outlook.com>"]
 description = "A hiper specialized Utreexo bridge node"
 license = "MIT"
@@ -14,6 +15,7 @@ keywords = ["utreexo", "bitcoin", "blockchain", "rust"]
 categories = ["bitcoin", "tools"]
 
 [dependencies]
+bitcoinkernel = "0.3.0"
 bitcoin = { version = "0.32.4", features = ["serde"] }
 bip324 = "0.11.0"
 self_cell = "1.3.0"
@@ -44,6 +46,9 @@ reqwest = { version = "0.11.18", features = [
 serde_json = { version = "1.0.128" }
 actix-cors = { version = "=0.6.5", optional = true }
 mmap = "0.1.1"
+hintsfile = "0.1.1"
+libc = "0.2"
+memmap2 = "0.9"
 jemallocator = "0.5.4"
 starknet-crypto = { version = "0.7.2", optional = true }
 clap = { version = "4.5.20", features = ["derive"] }
