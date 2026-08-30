@@ -21,9 +21,9 @@ test:
 
 # Run clippy on all feature combinations with MSRV
 clippy:
-    cargo +1.80.0 clippy
-    cargo +1.80.0 clippy --features esplora
-    cargo +1.80.0 clippy --no-default-features --features shinigami
+    cargo +1.85.0 clippy
+    cargo +1.85.0 clippy --features esplora
+    cargo +1.85.0 clippy --no-default-features --features shinigami
 
 # Run all checks
 ci: check test clippy fmt-check
@@ -34,8 +34,8 @@ clean:
 
 # Format code
 fmt:
-    cargo +1.80.0 fmt
+    cargo +1.85.0 fmt
 
 # Check if code is formatted
 fmt-check:
-    cargo +1.80.0 fmt --check
+    cargo +1.85.0 fmt --check

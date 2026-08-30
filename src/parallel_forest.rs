@@ -14,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -41,9 +42,13 @@ use bitcoinkernel::ChainType;
 use bitcoinkernel::ChainstateManager;
 use bitcoinkernel::Context as KernelContext;
 use bitcoinkernel::ContextBuilder;
+use db_experiment::Config as LeafMapConfig;
+use db_experiment::Database;
+use db_experiment::Mode;
 use hintsfile::Hintsfile;
 use log::info;
 use log::warn;
+#[cfg(test)]
 use memmap2::Mmap;
 use memmap2::MmapMut;
 use memmap2::MmapOptions;
@@ -52,6 +57,7 @@ use rustreexo::accumulator::node_hash::BitcoinNodeHash;
 
 const READY: u8 = 1 << 0;
 const SPENT: u8 = 1 << 1;
+const HEIGHT_CHUNK_SIZE: u64 = 4;
 const WRITING: u8 = 1 << 2;
 const DEFAULT_SPIN_ITERATIONS: usize = 512;
 const BIP30_FIRST_TXID_91722: &str =
@@ -97,6 +103,7 @@ pub struct ForestNodeData {
 #[derive(Clone, Debug)]
 pub struct ParallelForestConfig {
     pub forest_path: PathBuf,
+    pub leaf_map_path: PathBuf,
     pub leaf_workers: usize,
     pub chaser_workers: usize,
     pub spin_iterations: usize,
@@ -105,6 +112,7 @@ pub struct ParallelForestConfig {
 
 impl ParallelForestConfig {
     pub fn new(forest_path: PathBuf) -> Self {
+        let leaf_map_path = forest_path.with_extension("leaf-map");
         let threads = thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -112,6 +120,7 @@ impl ParallelForestConfig {
         let chaser_workers = threads.saturating_sub(leaf_workers).max(1);
         Self {
             forest_path,
+            leaf_map_path,
             leaf_workers,
             chaser_workers,
             spin_iterations: DEFAULT_SPIN_ITERATIONS,
@@ -134,16 +143,19 @@ pub struct ForestBuildSummary {
     pub leaves: u64,
     pub initialized_nodes: u64,
     pub file_nodes: u64,
+    pub leaf_map_entries: u64,
     pub file_bytes: u64,
     pub pages_locked: bool,
     pub roots: Vec<ForestRoot>,
 }
 
+#[cfg(test)]
 /// Read-only access to a completed flat forest file.
 pub struct FlatForestReader {
     map: Mmap,
 }
 
+#[cfg(test)]
 impl FlatForestReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)
@@ -528,6 +540,59 @@ impl Hints for Hintsfile {
     }
 }
 
+const LEAF_MAP_KEY_SIZE: usize = 36;
+const LEAF_MAP_VALUE_SIZE: usize = size_of::<u64>();
+const LEAF_MAP_BLOCK_SIZE: u64 = 1 << 20;
+
+fn aligned_leaf_map_capacity(leaves: u64, bytes_per_leaf: u64) -> Result<u64> {
+    leaves
+        .checked_mul(bytes_per_leaf)
+        .context("leaf map capacity overflow")
+        .map(|bytes| bytes.max(LEAF_MAP_BLOCK_SIZE))
+        .and_then(|bytes| {
+            bytes
+                .div_ceil(LEAF_MAP_BLOCK_SIZE)
+                .checked_mul(LEAF_MAP_BLOCK_SIZE)
+                .context("leaf map capacity overflow")
+        })
+}
+
+fn create_leaf_map(path: &Path, leaves: u64, leaf_workers: usize) -> Result<Database> {
+    if path.exists() {
+        bail!(
+            "leaf map path {} already exists; remove it before rebuilding",
+            path.display()
+        );
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create leaf map directory {}", parent.display()))?;
+    }
+    let desired_buckets = leaves.div_ceil(4).max(1_024);
+    let bucket_count = desired_buckets
+        .checked_next_power_of_two()
+        .context("leaf map bucket count overflow")?;
+    let max_threads = u16::try_from(leaf_workers.max(1))
+        .context("leaf worker count exceeds leaf map thread limit")?;
+    let mut config = LeafMapConfig::new(Mode::Map, bucket_count, LEAF_MAP_KEY_SIZE);
+    config.body_capacity = aligned_leaf_map_capacity(leaves, 96)?;
+    config.blob_capacity = aligned_leaf_map_capacity(leaves, 16)?;
+    config.block_size = LEAF_MAP_BLOCK_SIZE;
+    config.max_threads = max_threads;
+    Database::create(path, config)
+        .with_context(|| format!("failed to create leaf map {}", path.display()))
+}
+
+fn leaf_map_key(txid: [u8; 32], vout: u32) -> [u8; LEAF_MAP_KEY_SIZE] {
+    let mut key = [0u8; LEAF_MAP_KEY_SIZE];
+    key[..32].copy_from_slice(&txid);
+    key[32..].copy_from_slice(&vout.to_le_bytes());
+    key
+}
+
 /// Build and persist a complete flat forest through the hintsfile's stop height.
 pub fn build_parallel_forest(
     source: &KernelBlockSource,
@@ -568,18 +633,25 @@ fn build_with_source<S: BlockSource, H: Hints>(
     if leaves == 0 {
         bail!("no Utreexo leaves found through height {stop_height}");
     }
+    let live_leaves = count_hinted_leaves(hints, stop_height, config.leaf_workers)?;
 
     let forest_rows = tree_rows(leaves);
     let file_nodes = forest_capacity(forest_rows)?;
+    let leaf_map = Arc::new(create_leaf_map(
+        &config.leaf_map_path,
+        live_leaves,
+        config.leaf_workers,
+    )?);
     let forest = Arc::new(FlatForest::create(
         &config.forest_path,
         file_nodes,
         config.lock_pages,
     )?);
+    let leaf_map_entries = Arc::new(AtomicU64::new(0));
     let availability = Arc::new(Availability::new());
 
     info!(
-        "building {leaves} leaves with {} leaf workers and {} chaser workers",
+        "building {leaves} leaves ({live_leaves} indexed) with {} leaf workers and {} chaser workers",
         config.leaf_workers, config.chaser_workers
     );
     run_builders(
@@ -593,10 +665,22 @@ fn build_with_source<S: BlockSource, H: Hints>(
         &config,
         &forest,
         &availability,
+        &leaf_map,
+        &leaf_map_entries,
     )?;
 
     let (initialized_nodes, roots) = validate_forest(&forest, leaves, forest_rows)?;
+    let pages_locked = forest.pages_locked;
     forest.flush()?;
+    drop(forest);
+    let leaf_map_entries = leaf_map_entries.load(Ordering::Relaxed);
+    if leaf_map_entries != live_leaves {
+        bail!("leaf map entry mismatch: expected {live_leaves}, indexed {leaf_map_entries}");
+    }
+    let leaf_map =
+        Arc::try_unwrap(leaf_map).map_err(|_| anyhow!("leaf map still has active writers"))?;
+    leaf_map.close().context("failed to close leaf map")?;
+    info!("closed {leaf_map_entries} leaf positions without checkpointing");
     let file_bytes = file_nodes
         .checked_mul(size_of::<ForestNode>() as u64)
         .context("forest file size overflow")?;
@@ -604,8 +688,9 @@ fn build_with_source<S: BlockSource, H: Hints>(
         leaves,
         initialized_nodes,
         file_nodes,
+        leaf_map_entries,
         file_bytes,
-        pages_locked: forest.pages_locked,
+        pages_locked,
         roots,
     })
 }
@@ -625,16 +710,18 @@ fn index_leaf_counts<S: BlockSource>(
     stop_height: u32,
     worker_count: usize,
 ) -> Result<Vec<u64>> {
-    let worker_count = worker_count.min(stop_height as usize).max(1);
+    let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
         for worker in 0..worker_count {
-            let range = height_range(stop_height, worker, worker_count);
             handles.push(scope.spawn(move || -> Result<Vec<(u32, u64)>> {
-                let mut counts = Vec::with_capacity(range.len());
-                for height in range {
-                    let count = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
-                    counts.push((height, count));
+                let mut counts = Vec::new();
+                for range in zig_zag_height_ranges(stop_height, worker, worker_count) {
+                    counts.reserve(range.len());
+                    for height in range {
+                        let count = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
+                        counts.push((height, count));
+                    }
                 }
                 Ok(counts)
             }));
@@ -652,6 +739,39 @@ fn index_leaf_counts<S: BlockSource>(
         Ok(counts)
     })
 }
+fn count_hinted_leaves<H: Hints>(hints: &H, stop_height: u32, worker_count: usize) -> Result<u64> {
+    let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            handles.push(scope.spawn(move || -> Result<u64> {
+                let mut count = 0u64;
+                for range in zig_zag_height_ranges(stop_height, worker, worker_count) {
+                    for height in range {
+                        let at_height = hints
+                            .indices_at_height(height)
+                            .ok_or_else(|| anyhow!("hints unavailable at height {height}"))?;
+                        count = count
+                            .checked_add(at_height.len() as u64)
+                            .context("hinted leaf count overflow")?;
+                    }
+                }
+                Ok(count)
+            }));
+        }
+        let mut count = 0u64;
+        for handle in handles {
+            count = count
+                .checked_add(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("hint counting worker panicked"))??,
+                )
+                .context("hinted leaf count overflow")?;
+        }
+        Ok(count)
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_builders<S: BlockSource, H: Hints>(
@@ -665,9 +785,14 @@ fn run_builders<S: BlockSource, H: Hints>(
     config: &ParallelForestConfig,
     forest: &Arc<FlatForest>,
     availability: &Arc<Availability>,
+    leaf_map: &Arc<Database>,
+    leaf_map_entries: &Arc<AtomicU64>,
 ) -> Result<()> {
     thread::scope(|scope| {
-        let leaf_worker_count = config.leaf_workers.min(stop_height as usize).max(1);
+        let leaf_worker_count = config
+            .leaf_workers
+            .min(height_chunk_count(stop_height))
+            .max(1);
         let mut leaf_handles = Vec::with_capacity(leaf_worker_count);
         let mut chaser_handles = Vec::with_capacity(config.chaser_workers);
 
@@ -694,21 +819,21 @@ fn run_builders<S: BlockSource, H: Hints>(
         }
 
         for worker in 0..leaf_worker_count {
-            let forest = Arc::clone(forest);
-            let availability = Arc::clone(availability);
-            let range = height_range(stop_height, worker, leaf_worker_count);
+            let outputs = LeafBuildOutputs {
+                forest: Arc::clone(forest),
+                availability: Arc::clone(availability),
+                leaf_map: Arc::clone(leaf_map),
+                leaf_map_entries: Arc::clone(leaf_map_entries),
+            };
             leaf_handles.push(scope.spawn(move || {
-                let result = fill_leaf_range(
-                    source,
-                    hints,
-                    range,
-                    leaf_counts,
-                    leaf_offsets,
-                    &forest,
-                    &availability,
-                );
+                let result = (|| {
+                    for range in zig_zag_height_ranges(stop_height, worker, leaf_worker_count) {
+                        fill_leaf_range(source, hints, range, leaf_counts, leaf_offsets, &outputs)?;
+                    }
+                    Ok(())
+                })();
                 if result.is_err() {
-                    availability.abort();
+                    outputs.availability.abort();
                 }
                 result
             }));
@@ -743,14 +868,20 @@ fn run_builders<S: BlockSource, H: Hints>(
     })
 }
 
+struct LeafBuildOutputs {
+    forest: Arc<FlatForest>,
+    availability: Arc<Availability>,
+    leaf_map: Arc<Database>,
+    leaf_map_entries: Arc<AtomicU64>,
+}
+
 fn fill_leaf_range<S: BlockSource, H: Hints>(
     source: &S,
     hints: &H,
     heights: Range<u32>,
     leaf_counts: &[u64],
     leaf_offsets: &[u64],
-    forest: &FlatForest,
-    availability: &Availability,
+    outputs: &LeafBuildOutputs,
 ) -> Result<()> {
     let publish_nodes = nodes_per_two_pages();
     for height in heights {
@@ -790,14 +921,31 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
                 leaf.value,
                 leaf.script_pubkey,
             );
-            forest.write(
-                block_offset + local_position,
-                ForestNodeData { hash: *hash, spent },
-            )?;
+            let bottom_position = block_offset + local_position;
+            outputs
+                .forest
+                .write(bottom_position, ForestNodeData { hash: *hash, spent })?;
+            if !spent {
+                let key = leaf_map_key(leaf.txid, leaf.vout);
+                let value: [u8; LEAF_MAP_VALUE_SIZE] = bottom_position.to_le_bytes();
+                if outputs
+                    .leaf_map
+                    .put_new(&key, &value)
+                    .context("failed to index leaf position")?
+                {
+                    outputs.leaf_map_entries.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    bail!(
+                        "outpoint {:02x?}:{} was indexed more than once",
+                        leaf.txid,
+                        leaf.vout
+                    );
+                }
+            }
             local_position += 1;
             unpublished += 1;
             if unpublished >= publish_nodes {
-                availability.publish()?;
+                outputs.availability.publish()?;
                 unpublished = 0;
             }
             Ok(())
@@ -814,7 +962,7 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             );
         }
         // Even an empty block/range publication wakes every chaser, as required by the wait path.
-        availability.publish()?;
+        outputs.availability.publish()?;
     }
     Ok(())
 }
@@ -994,11 +1142,27 @@ fn bip30_excluded_outpoint(height: u32) -> Option<KernelOutPoint> {
     })
 }
 
-fn height_range(stop_height: u32, worker: usize, worker_count: usize) -> Range<u32> {
-    let total = stop_height as u64;
-    let start = total * worker as u64 / worker_count as u64 + 1;
-    let end = total * (worker + 1) as u64 / worker_count as u64 + 1;
-    start as u32..end as u32
+fn height_chunk_count(stop_height: u32) -> usize {
+    (u64::from(stop_height).div_ceil(HEIGHT_CHUNK_SIZE)) as usize
+}
+
+fn zig_zag_height_ranges(
+    stop_height: u32,
+    worker: usize,
+    worker_count: usize,
+) -> impl Iterator<Item = Range<u32>> {
+    let stop_height = u64::from(stop_height);
+    let mut chunk = worker as u64;
+    std::iter::from_fn(move || {
+        let zero_based_start = chunk.checked_mul(HEIGHT_CHUNK_SIZE)?;
+        if zero_based_start >= stop_height {
+            return None;
+        }
+        let start = zero_based_start + 1;
+        let end = (zero_based_start + HEIGHT_CHUNK_SIZE).min(stop_height) + 1;
+        chunk = chunk.checked_add(worker_count as u64)?;
+        Some(start as u32..end as u32)
+    })
 }
 
 fn deterministic_chunk_count(total: u64, minimum: u64) -> u64 {
@@ -1217,6 +1381,19 @@ mod tests {
     }
 
     #[test]
+    fn leaf_workers_zig_zag_across_adjacent_chunks() {
+        assert_eq!(
+            zig_zag_height_ranges(16, 0, 2).collect::<Vec<_>>(),
+            vec![1..5, 9..13]
+        );
+        assert_eq!(
+            zig_zag_height_ranges(16, 1, 2).collect::<Vec<_>>(),
+            vec![5..9, 13..17]
+        );
+        assert_eq!(height_chunk_count(16), 4);
+    }
+
+    #[test]
     fn deterministic_chunks_cover_each_row_with_page_sized_work() {
         let minimum = parents_per_two_child_pages();
         let total = minimum * 4 + minimum / 2;
@@ -1286,11 +1463,13 @@ mod tests {
         config.chaser_workers = 2;
         config.spin_iterations = 8;
         config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
 
         let summary = build_with_source(&source, &hints, config).unwrap();
         assert_eq!(summary.leaves, 6);
         assert_eq!(summary.initialized_nodes, 10);
         assert_eq!(summary.file_nodes, 15);
+        assert_eq!(summary.leaf_map_entries, 4);
         assert_eq!(summary.roots.len(), 2);
         assert_eq!(summary.roots[0].position, 12);
         assert_eq!(summary.roots[1].position, 10);
@@ -1327,6 +1506,24 @@ mod tests {
             );
             assert_eq!(reader.read(10).unwrap().hash, *small_root);
         }
+        {
+            let leaf_map = Database::open_runtime(&leaf_map_path).unwrap();
+            let first_txid = source.blocks[0].txdata[0].compute_txid().to_byte_array();
+            let second_txid = source.blocks[1].txdata[0].compute_txid().to_byte_array();
+            let position = |txid, vout| {
+                leaf_map
+                    .get(&leaf_map_key(txid, vout))
+                    .unwrap()
+                    .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+            };
+            assert_eq!(position(first_txid, 0), None);
+            assert_eq!(position(first_txid, 1), Some(1));
+            assert_eq!(position(first_txid, 2), None);
+            assert_eq!(position(second_txid, 0), Some(3));
+            assert_eq!(position(second_txid, 1), Some(4));
+            assert_eq!(position(second_txid, 2), Some(5));
+        }
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(leaf_map_path).unwrap();
     }
 }

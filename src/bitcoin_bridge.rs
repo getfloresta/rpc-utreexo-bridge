@@ -53,6 +53,10 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| subdir("forest.dat").into());
         let mut config = ParallelForestConfig::new(forest_path);
+        config.leaf_map_path = cli_options
+            .leaf_map_path
+            .clone()
+            .unwrap_or_else(|| subdir("leaf-map").into());
         if let Some(workers) = cli_options.forest_leaf_workers {
             config.leaf_workers = workers;
         }
@@ -67,9 +71,10 @@ pub fn run_bridge() -> anyhow::Result<()> {
         let source = KernelBlockSource::open(cli_options.network)?;
         let summary = build_parallel_forest(&source, &hints, config)?;
         info!(
-            "Built flat forest: leaves={} nodes={} bytes={} roots={} pages_locked={}",
+            "Built flat forest: leaves={} nodes={} leaf_map_entries={} bytes={} roots={} pages_locked={}",
             summary.leaves,
             summary.initialized_nodes,
+            summary.leaf_map_entries,
             summary.file_bytes,
             summary.roots.len(),
             summary.pages_locked

@@ -40,6 +40,10 @@ pub struct CliArgs {
     #[clap(long, requires = "build_forest", value_name = "FOREST_FILE")]
     pub forest_file: Option<std::path::PathBuf>,
 
+    /// Output directory for the outpoint-to-bottom-row leaf map. Defaults to `$DATA_DIR/leaf-map`.
+    #[clap(long, requires = "build_forest", value_name = "LEAF_MAP_DIR")]
+    pub leaf_map_path: Option<std::path::PathBuf>,
+
     /// Number of concurrent block-fetching leaf workers.
     #[clap(long, requires = "build_forest")]
     pub forest_leaf_workers: Option<usize>,

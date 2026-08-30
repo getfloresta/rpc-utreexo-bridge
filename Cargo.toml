@@ -15,6 +15,7 @@ categories = ["bitcoin", "tools"]
 
 [dependencies]
 bitcoinkernel = "0.3.0"
+db-experiment = { git = "https://github.com/Davidson-Souza/ultra-fast-database" }
 bitcoin = { version = "0.32.4", features = ["serde"] }
 bitcoincore-rpc = "0.19"
 bitcoin_hashes = "0.11"
