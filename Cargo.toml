@@ -16,6 +16,7 @@ categories = ["bitcoin", "tools"]
 
 [dependencies]
 bitcoinkernel = "0.3.0"
+db-experiment = { path = "../ultra-fast-database" }
 bitcoin = { version = "0.32.4", features = ["serde"] }
 bip324 = "0.11.0"
 self_cell = "1.3.0"
