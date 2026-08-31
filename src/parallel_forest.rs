@@ -45,6 +45,7 @@ use bitcoinkernel::ContextBuilder;
 use db_experiment::Config as LeafMapConfig;
 use db_experiment::Database;
 use db_experiment::Mode;
+use db_experiment::WriteOnlyWriter;
 use hintsfile::Hintsfile;
 use log::info;
 use log::warn;
@@ -578,8 +579,9 @@ fn create_leaf_map(path: &Path, leaves: u64, leaf_workers: usize) -> Result<Data
     let max_threads = u16::try_from(leaf_workers.max(1))
         .context("leaf worker count exceeds leaf map thread limit")?;
     let mut config = LeafMapConfig::new(Mode::Map, bucket_count, LEAF_MAP_KEY_SIZE);
+    config.inline_value_size = LEAF_MAP_VALUE_SIZE;
     config.body_capacity = aligned_leaf_map_capacity(leaves, 96)?;
-    config.blob_capacity = aligned_leaf_map_capacity(leaves, 16)?;
+    config.blob_capacity = 0;
     config.block_size = LEAF_MAP_BLOCK_SIZE;
     config.max_threads = max_threads;
     Database::create(path, config)
@@ -711,12 +713,14 @@ fn index_leaf_counts<S: BlockSource>(
     worker_count: usize,
 ) -> Result<Vec<u64>> {
     let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
+    let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
-        for worker in 0..worker_count {
+        for _worker in 0..worker_count {
+            let ranges = Arc::clone(&ranges);
             handles.push(scope.spawn(move || -> Result<Vec<(u32, u64)>> {
                 let mut counts = Vec::new();
-                for range in zig_zag_height_ranges(stop_height, worker, worker_count) {
+                while let Some(range) = ranges.acquire() {
                     counts.reserve(range.len());
                     for height in range {
                         let count = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
@@ -741,12 +745,14 @@ fn index_leaf_counts<S: BlockSource>(
 }
 fn count_hinted_leaves<H: Hints>(hints: &H, stop_height: u32, worker_count: usize) -> Result<u64> {
     let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
+    let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
-        for worker in 0..worker_count {
+        for _worker in 0..worker_count {
+            let ranges = Arc::clone(&ranges);
             handles.push(scope.spawn(move || -> Result<u64> {
                 let mut count = 0u64;
-                for range in zig_zag_height_ranges(stop_height, worker, worker_count) {
+                while let Some(range) = ranges.acquire() {
                     for height in range {
                         let at_height = hints
                             .indices_at_height(height)
@@ -795,6 +801,7 @@ fn run_builders<S: BlockSource, H: Hints>(
             .max(1);
         let mut leaf_handles = Vec::with_capacity(leaf_worker_count);
         let mut chaser_handles = Vec::with_capacity(config.chaser_workers);
+        let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
 
         for worker in 0..config.chaser_workers {
             let forest = Arc::clone(forest);
@@ -825,10 +832,23 @@ fn run_builders<S: BlockSource, H: Hints>(
                 leaf_map: Arc::clone(leaf_map),
                 leaf_map_entries: Arc::clone(leaf_map_entries),
             };
+            let ranges = Arc::clone(&ranges);
             leaf_handles.push(scope.spawn(move || {
                 let result = (|| {
-                    for range in zig_zag_height_ranges(stop_height, worker, leaf_worker_count) {
-                        fill_leaf_range(source, hints, range, leaf_counts, leaf_offsets, &outputs)?;
+                    while let Some(range) = ranges.acquire() {
+                        let writer = outputs
+                            .leaf_map
+                            .write_only()
+                            .context("failed to create range leaf-map writer")?;
+                        fill_leaf_range(
+                            source,
+                            hints,
+                            range,
+                            leaf_counts,
+                            leaf_offsets,
+                            &outputs,
+                            &writer,
+                        )?;
                     }
                     Ok(())
                 })();
@@ -882,6 +902,7 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
     leaf_counts: &[u64],
     leaf_offsets: &[u64],
     outputs: &LeafBuildOutputs,
+    writer: &WriteOnlyWriter<'_>,
 ) -> Result<()> {
     let publish_nodes = nodes_per_two_pages();
     for height in heights {
@@ -928,19 +949,10 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             if !spent {
                 let key = leaf_map_key(leaf.txid, leaf.vout);
                 let value: [u8; LEAF_MAP_VALUE_SIZE] = bottom_position.to_le_bytes();
-                if outputs
-                    .leaf_map
-                    .put_new(&key, &value)
-                    .context("failed to index leaf position")?
-                {
-                    outputs.leaf_map_entries.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    bail!(
-                        "outpoint {:02x?}:{} was indexed more than once",
-                        leaf.txid,
-                        leaf.vout
-                    );
-                }
+                writer
+                    .put_unique(&key, &value)
+                    .context("failed to index unique leaf position")?;
+                outputs.leaf_map_entries.fetch_add(1, Ordering::Relaxed);
             }
             local_position += 1;
             unpublished += 1;
@@ -1146,23 +1158,29 @@ fn height_chunk_count(stop_height: u32) -> usize {
     (u64::from(stop_height).div_ceil(HEIGHT_CHUNK_SIZE)) as usize
 }
 
-fn zig_zag_height_ranges(
-    stop_height: u32,
-    worker: usize,
-    worker_count: usize,
-) -> impl Iterator<Item = Range<u32>> {
-    let stop_height = u64::from(stop_height);
-    let mut chunk = worker as u64;
-    std::iter::from_fn(move || {
+struct HeightRangeAllocator {
+    stop_height: u64,
+    next_chunk: AtomicU64,
+}
+
+impl HeightRangeAllocator {
+    fn new(stop_height: u32) -> Self {
+        Self {
+            stop_height: u64::from(stop_height),
+            next_chunk: AtomicU64::new(0),
+        }
+    }
+
+    fn acquire(&self) -> Option<Range<u32>> {
+        let chunk = self.next_chunk.fetch_add(1, Ordering::Relaxed);
         let zero_based_start = chunk.checked_mul(HEIGHT_CHUNK_SIZE)?;
-        if zero_based_start >= stop_height {
+        if zero_based_start >= self.stop_height {
             return None;
         }
         let start = zero_based_start + 1;
-        let end = (zero_based_start + HEIGHT_CHUNK_SIZE).min(stop_height) + 1;
-        chunk = chunk.checked_add(worker_count as u64)?;
+        let end = (zero_based_start + HEIGHT_CHUNK_SIZE).min(self.stop_height) + 1;
         Some(start as u32..end as u32)
-    })
+    }
 }
 
 fn deterministic_chunk_count(total: u64, minimum: u64) -> u64 {
@@ -1381,15 +1399,27 @@ mod tests {
     }
 
     #[test]
-    fn leaf_workers_zig_zag_across_adjacent_chunks() {
-        assert_eq!(
-            zig_zag_height_ranges(16, 0, 2).collect::<Vec<_>>(),
-            vec![1..5, 9..13]
-        );
-        assert_eq!(
-            zig_zag_height_ranges(16, 1, 2).collect::<Vec<_>>(),
-            vec![5..9, 13..17]
-        );
+    fn leaf_workers_claim_each_adjacent_chunk_once() {
+        let allocator = HeightRangeAllocator::new(16);
+        let mut acquired = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _worker in 0..2 {
+                let allocator = &allocator;
+                handles.push(scope.spawn(move || {
+                    let mut ranges = Vec::new();
+                    while let Some(range) = allocator.acquire() {
+                        ranges.push(range);
+                    }
+                    ranges
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        acquired.sort_unstable_by_key(|range| range.start);
+        assert_eq!(acquired, vec![1..5, 5..9, 9..13, 13..17]);
         assert_eq!(height_chunk_count(16), 4);
     }
 
@@ -1506,6 +1536,7 @@ mod tests {
             );
             assert_eq!(reader.read(10).unwrap().hash, *small_root);
         }
+        assert!(!leaf_map_path.join("blobs").exists());
         {
             let leaf_map = Database::open_runtime(&leaf_map_path).unwrap();
             let first_txid = source.blocks[0].txdata[0].compute_txid().to_byte_array();

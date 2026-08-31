@@ -109,6 +109,12 @@ where an entire upper row is smaller. A deleted child promotes its surviving sib
 parent; two deleted children mark the parent deleted, recursively promoting surviving subtrees
 through roots. Independent ranges apply these rules concurrently with leaf publication.
 
+The leaf-map database uses an insert-only range writer: one writer is created per fetched range,
+keys are published directly with a bucket-head CAS, and no lookup, hazard registration,
+replacement, deletion, or reclamation runs on the hot path. The fixed eight-byte position is
+stored inline in the body node, so no blob files are created. Mutable bucket heads stay in memory
+during construction and are serialized sequentially only during clean close.
+
 Leaf-map keys are the 32-byte internal txid followed by little-endian `vout`; values are
 little-endian `u64` bottom-row positions. Only unspent leaves are indexed. A promoted leaf keeps
 its original bottom-row value permanently—the parent chasers never update the map. On clean

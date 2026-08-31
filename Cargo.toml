@@ -18,8 +18,9 @@ bitcoinkernel = "0.3.0"
 db-experiment = { git = "https://github.com/Davidson-Souza/ultra-fast-database" }
 bitcoin = { version = "0.32.4", features = ["serde"] }
 bitcoincore-rpc = "0.19"
-bitcoin_hashes = "0.11"
-rustreexo = { version = "0.4.0", features = ["with-serde"] }
+bip324 = "0.11.0"
+rustreexo = { git = "https://github.com/Davidson-Souza/rustreexo", branch = "bridge-changes", features = ["with-serde"] }
+rayon = "1.10"
 sha2 = "0.10.6"
 anyhow = "1.0.71"
 kv = "0.24.0"
