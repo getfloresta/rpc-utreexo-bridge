@@ -85,10 +85,6 @@ impl BlockFile {
         }
     }
 
-    pub fn get_block_slice(&self, index: BlockIndex) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.read(&index), index.size) }
-    }
-
     /// Appends a block to the file and returns the index of the block.
     pub fn append(&mut self, block: &UtreexoBlock) -> BlockIndex {
         // seek to the end of the file

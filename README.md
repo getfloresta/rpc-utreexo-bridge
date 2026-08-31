@@ -176,6 +176,13 @@ blocks are fetched from Core and are not retained. A clean shutdown flushes the 
 proof file. Chain rollback is not yet supported; steady state stops advancing if Core reports a
 tip below the retained proof height.
 
+Steady state also starts a BIP 183 proof server on `P2P_HOST`/`P2P_PORT`. It accepts Floresta's
+`getuproof` field mask and least-significant-bit-first proof/leaf bitmaps, then replies with an
+`uproof` payload ordered as proof hashes, targets, and compact leaf data. Empty bitmaps request
+every element. The version handshake advertises only `NODE_WITNESS` and `NODE_UTREEXO`; it does
+not advertise `NODE_NETWORK` or `NODE_NETWORK_LIMITED`, and block `getdata` requests are not
+served. Clients must obtain blocks from a separate Bitcoin peer.
+
 ## Building with esplora backends
 
 You can use esplora backends to grab blocks and transactions. To do so, you'll need to enable the `esplora` feature when building the node:

@@ -34,7 +34,7 @@ use std::time::Duration;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::serialize;
 use bitcoin::consensus::Decodable;
-use bitcoin::hashes::Hash;
+use bitcoin::consensus::Encodable;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
@@ -43,6 +43,7 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::BlockHash;
+use bitcoin::VarInt;
 use log::debug;
 use log::info;
 use mio::net::TcpListener;
@@ -51,15 +52,25 @@ use mio::Events;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
 use crate::blockfile::BlockFile;
+use crate::blockfile::ProofFile;
 use crate::chainview::ChainView;
+use crate::udata::CompactBlockProof;
 
 /// DEPRECATED: This is a constant that defines the filter type for Utreexo
 pub const FILTER_TYPE_UTREEXO: u8 = 1;
 
 /// How many workers we want to spawn
 const WORKES_PER_CLUSTER: usize = 4;
+
+const GET_UTREEXO_PROOF_COMMAND: &str = "getuproof";
+const UTREEXO_PROOF_COMMAND: &str = "uproof";
+const NODE_UTREEXO: u64 = 1 << 12;
+const REQUEST_TARGETS: u8 = 1 << 0;
+const REQUEST_PROOF_HASHES: u8 = 1 << 1;
+const REQUEST_LEAF_DATA: u8 = 1 << 2;
 
 #[derive(Debug)]
 /// A minimal version of the message header
@@ -85,12 +96,34 @@ pub struct P2PMessageHeader {
 }
 
 #[derive(Clone)]
+pub enum ProofBackend {
+    LegacyBlocks(Arc<RwLock<BlockFile>>),
+    CompactProofs(Arc<RwLock<ProofFile>>),
+}
+
+impl ProofBackend {
+    fn get(&self, index: BlockIndex) -> Option<CompactBlockProof> {
+        match self {
+            Self::LegacyBlocks(blocks) => {
+                let block = blocks.read().ok()?.get_block(index)?;
+                let proof = block.udata?;
+                Some(CompactBlockProof {
+                    proof: proof.proof,
+                    leaves: proof.leaves,
+                })
+            }
+            Self::CompactProofs(proofs) => proofs.read().ok()?.get(&index),
+        }
+    }
+}
+
+#[derive(Clone)]
 /// Data required by our peers to handle requests
 pub struct WorkerContext {
-    /// The actual blocks and proofs
-    pub proof_backend: Arc<RwLock<BlockFile>>,
+    /// Compact proofs retained after the hintsfile boundary, or legacy block-plus-proof storage.
+    pub proof_backend: ProofBackend,
 
-    /// An index on [BlockFile] so we can get specific blocks
+    /// An index on the selected proof backend.
     pub proof_index: Arc<BlocksIndex>,
 
     /// Our chain metadata. Things like our height, and  an index height -> hash
@@ -115,6 +148,103 @@ impl Decodable for P2PMessageHeader {
             _magic,
         })
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct GetUtreexoProof {
+    block_hash: BlockHash,
+    request_mask: u8,
+    proof_hashes_bitmap: Vec<u8>,
+    leaf_data_bitmap: Vec<u8>,
+}
+
+impl Decodable for GetUtreexoProof {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, bitcoin::consensus::encode::Error> {
+        Ok(Self {
+            block_hash: BlockHash::consensus_decode(reader)?,
+            request_mask: u8::consensus_decode(reader)?,
+            proof_hashes_bitmap: Vec::<u8>::consensus_decode(reader)?,
+            leaf_data_bitmap: Vec::<u8>::consensus_decode(reader)?,
+        })
+    }
+}
+
+fn request_field(mask: u8, field: u8) -> bool {
+    mask & field != 0
+}
+
+fn bitmap_requests(bitmap: &[u8], index: usize) -> bool {
+    bitmap.is_empty()
+        || bitmap
+            .get(index / u8::BITS as usize)
+            .is_some_and(|byte| byte & (1 << (index % u8::BITS as usize)) != 0)
+}
+
+fn selected_count(bitmap: &[u8], length: usize) -> usize {
+    (0..length)
+        .filter(|index| bitmap_requests(bitmap, *index))
+        .count()
+}
+
+fn encode_utreexo_proof(
+    block_hash: BlockHash,
+    request: &GetUtreexoProof,
+    proof: &CompactBlockProof,
+) -> Result<Vec<u8>, bitcoin::io::Error> {
+    let mut payload = Vec::new();
+    block_hash.consensus_encode(&mut payload)?;
+
+    let include_proof_hashes = request_field(request.request_mask, REQUEST_PROOF_HASHES);
+    let proof_hash_count = if include_proof_hashes {
+        selected_count(&request.proof_hashes_bitmap, proof.proof.hashes.len())
+    } else {
+        0
+    };
+    VarInt(proof_hash_count as u64).consensus_encode(&mut payload)?;
+    if include_proof_hashes {
+        for (index, hash) in proof.proof.hashes.iter().enumerate() {
+            if bitmap_requests(&request.proof_hashes_bitmap, index) {
+                hash.consensus_encode(&mut payload)?;
+            }
+        }
+    }
+
+    let include_targets = request_field(request.request_mask, REQUEST_TARGETS);
+    VarInt(if include_targets {
+        proof.proof.targets.len() as u64
+    } else {
+        0
+    })
+    .consensus_encode(&mut payload)?;
+    if include_targets {
+        for target in &proof.proof.targets {
+            target.consensus_encode(&mut payload)?;
+        }
+    }
+
+    let include_leaf_data = request_field(request.request_mask, REQUEST_LEAF_DATA);
+    let leaf_data_count = if include_leaf_data {
+        selected_count(&request.leaf_data_bitmap, proof.leaves.len())
+    } else {
+        0
+    };
+    VarInt(leaf_data_count as u64).consensus_encode(&mut payload)?;
+    if include_leaf_data {
+        for (index, leaf) in proof.leaves.iter().enumerate() {
+            if bitmap_requests(&request.leaf_data_bitmap, index) {
+                leaf.header_code.consensus_encode(&mut payload)?;
+                leaf.amount.consensus_encode(&mut payload)?;
+                leaf.spk_ty.consensus_encode(&mut payload)?;
+            }
+        }
+    }
+    Ok(payload)
+}
+
+fn advertised_services() -> ServiceFlags {
+    ServiceFlags::WITNESS | ServiceFlags::from(NODE_UTREEXO)
 }
 
 /// A struct that will set everything up and running. It doesn't have any state nor runs on any
@@ -433,6 +563,12 @@ impl From<bitcoin::consensus::encode::Error> for PeerError {
     }
 }
 
+impl From<bitcoin::io::Error> for PeerError {
+    fn from(error: bitcoin::io::Error) -> Self {
+        PeerError::Decode(bitcoin::consensus::encode::Error::Io(error))
+    }
+}
+
 impl<T> From<PoisonError<T>> for PeerError {
     fn from(_: PoisonError<T>) -> Self {
         PeerError::Poison
@@ -475,6 +611,21 @@ impl Peer {
         Ok(())
     }
 
+    fn send_raw_message(&mut self, command: &str, payload: &[u8]) -> Result<(), PeerError> {
+        if command.len() > 12 || payload.len() > u32::MAX as usize {
+            return Err(PeerError::MessageTooLarge);
+        }
+        let checksum = Self::sha256d_payload(payload);
+        let mut header = [0u8; 24];
+        header[..4].copy_from_slice(&self.context.magic.to_bytes());
+        header[4..4 + command.len()].copy_from_slice(command.as_bytes());
+        header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[20..24].copy_from_slice(&checksum[..4]);
+        self.write_buffer.extend_from_slice(&header);
+        self.write_buffer.extend_from_slice(payload);
+        Ok(())
+    }
+
     fn read_pending(&mut self, stream: &mut TcpStream) -> Result<usize, PeerError> {
         let mut buffer = vec![0; 4_000_000];
         let read = stream.read(&mut buffer)?;
@@ -483,7 +634,7 @@ impl Peer {
         Ok(read)
     }
 
-    fn sha256d_payload(&self, payload: &[u8]) -> [u8; 32] {
+    fn sha256d_payload(payload: &[u8]) -> [u8; 32] {
         let mut sha = Sha256::new();
         sha.update(payload);
 
@@ -515,94 +666,41 @@ impl Peer {
                 break;
             };
 
-            self.handle_request_inner(request, stream)?;
+            self.handle_request_inner(request)?;
         }
 
         Ok(())
     }
 
-    fn handle_request_inner(
-        &mut self,
-        request: RawNetworkMessage,
-        stream: &mut TcpStream,
-    ) -> Result<(), PeerError> {
+    fn handle_request_inner(&mut self, request: RawNetworkMessage) -> Result<(), PeerError> {
         match request.payload() {
             NetworkMessage::Ping(nonce) => {
                 let pong = NetworkMessage::Pong(*nonce);
                 self.send_message(pong)?;
             }
 
-            NetworkMessage::GetData(inv) => {
-                let mut blocks = vec![];
-                for el in inv {
-                    match el {
-                        Inventory::Unknown { hash, inv_type } => {
-                            if *inv_type != 0x41000002 {
-                                continue;
-                            }
-                            let block_hash = BlockHash::from_byte_array(*hash);
-                            let Some(block) = self.context.proof_index.get_index(block_hash) else {
-                                let not_found =
-                                    NetworkMessage::NotFound(vec![Inventory::Unknown {
-                                        inv_type: 0x41000002,
-                                        hash: *hash,
-                                    }]);
-
-                                self.send_message(not_found)?;
-                                continue;
-                            };
-
-                            let lock = self.context.proof_backend.read()?;
-                            let payload = lock.get_block_slice(block);
-                            let checksum = &self.sha256d_payload(payload)[0..4];
-
-                            let mut message_header = [0u8; 24];
-                            message_header[0..4].copy_from_slice(&request.magic().to_bytes());
-                            message_header[4..9].copy_from_slice("block".as_bytes());
-                            message_header[16..20]
-                                .copy_from_slice(&(payload.len() as u32).to_le_bytes());
-                            message_header[20..24].copy_from_slice(checksum);
-
-                            stream.write_all(&message_header)?;
-                            stream.write_all(payload)?;
-                        }
-                        Inventory::WitnessBlock(block_hash) => {
-                            let Some(block) = self.context.proof_index.get_index(*block_hash)
-                            else {
-                                let not_found =
-                                    NetworkMessage::NotFound(vec![Inventory::WitnessBlock(
-                                        *block_hash,
-                                    )]);
-                                self.send_message(not_found)?;
-                                continue;
-                            };
-                            let lock = self.context.proof_backend.read().expect("lock failed");
-                            match lock.get_block(block) {
-                                //TODO: Rust-Bitcoin asks for a block, but we have it serialized on disk already.
-                                //      We should be able to just send the block without deserializing it.
-                                Some(block) => {
-                                    let block = NetworkMessage::Block(block.into());
-                                    blocks.push(block);
-                                }
-                                None => {
-                                    let not_foud =
-                                        NetworkMessage::NotFound(vec![Inventory::WitnessBlock(
-                                            *block_hash,
-                                        )]);
-
-                                    let res = not_foud;
-                                    blocks.push(res);
-                                }
-                            }
-                        }
-                        // TODO: Prove mempool txs
-                        _ => {}
-                    }
-                }
-
-                for block in blocks {
-                    self.send_message(block)?;
-                }
+            NetworkMessage::Unknown { command, payload }
+                if command.as_ref() == GET_UTREEXO_PROOF_COMMAND =>
+            {
+                let proof_request: GetUtreexoProof = deserialize(payload)?;
+                let Some(index) = self.context.proof_index.get_index(proof_request.block_hash)
+                else {
+                    debug!(
+                        "peer requested unavailable proof {}",
+                        proof_request.block_hash
+                    );
+                    return Ok(());
+                };
+                let Some(proof) = self.context.proof_backend.get(index) else {
+                    debug!(
+                        "proof index for {} points to unavailable data",
+                        proof_request.block_hash
+                    );
+                    return Ok(());
+                };
+                let payload =
+                    encode_utreexo_proof(proof_request.block_hash, &proof_request, &proof)?;
+                self.send_raw_message(UTREEXO_PROOF_COMMAND, &payload)?;
             }
 
             NetworkMessage::GetHeaders(locator) => {
@@ -648,10 +746,7 @@ impl Peer {
 
                 let version = NetworkMessage::Version(VersionMessage {
                     version: 70001,
-                    services: ServiceFlags::NETWORK_LIMITED
-                        | ServiceFlags::NETWORK
-                        | ServiceFlags::WITNESS
-                        | ServiceFlags::from(1 << 24), // UTREEXO
+                    services: advertised_services(),
                     timestamp: version.timestamp + 1,
                     receiver: version.sender.clone(),
                     sender: version.receiver.clone(),
@@ -691,5 +786,104 @@ impl Peer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash;
+
+    use super::*;
+    use crate::udata::BatchProof;
+    use crate::udata::CompactLeafData;
+    use crate::udata::ScriptPubkeyType;
+
+    fn sample_proof() -> CompactBlockProof {
+        CompactBlockProof {
+            proof: BatchProof {
+                targets: vec![VarInt(3), VarInt(9)],
+                hashes: vec![
+                    BlockHash::from_byte_array([1; 32]),
+                    BlockHash::from_byte_array([2; 32]),
+                ],
+            },
+            leaves: vec![
+                CompactLeafData {
+                    header_code: 10,
+                    amount: 20,
+                    spk_ty: ScriptPubkeyType::PubKeyHash,
+                },
+                CompactLeafData {
+                    header_code: 11,
+                    amount: 21,
+                    spk_ty: ScriptPubkeyType::WitnessV0PubKeyHash,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn decodes_floresta_getuproof_request() {
+        let block_hash = BlockHash::from_byte_array([3; 32]);
+        let mut payload = Vec::new();
+        block_hash.consensus_encode(&mut payload).unwrap();
+        7u8.consensus_encode(&mut payload).unwrap();
+        vec![0b10u8].consensus_encode(&mut payload).unwrap();
+        vec![0b01u8].consensus_encode(&mut payload).unwrap();
+
+        let request: GetUtreexoProof = deserialize(&payload).unwrap();
+        assert_eq!(
+            request,
+            GetUtreexoProof {
+                block_hash,
+                request_mask: 7,
+                proof_hashes_bitmap: vec![0b10],
+                leaf_data_bitmap: vec![0b01],
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_requested_proof_fields_in_bip183_order() {
+        let block_hash = BlockHash::from_byte_array([3; 32]);
+        let request = GetUtreexoProof {
+            block_hash,
+            request_mask: REQUEST_TARGETS | REQUEST_PROOF_HASHES | REQUEST_LEAF_DATA,
+            proof_hashes_bitmap: vec![0b10],
+            leaf_data_bitmap: vec![0b01],
+        };
+        let payload = encode_utreexo_proof(block_hash, &request, &sample_proof()).unwrap();
+        let mut reader = payload.as_slice();
+
+        assert_eq!(
+            BlockHash::consensus_decode(&mut reader).unwrap(),
+            block_hash
+        );
+        assert_eq!(VarInt::consensus_decode(&mut reader).unwrap().0, 1);
+        assert_eq!(
+            BlockHash::consensus_decode(&mut reader).unwrap(),
+            BlockHash::from_byte_array([2; 32])
+        );
+        assert_eq!(VarInt::consensus_decode(&mut reader).unwrap().0, 2);
+        assert_eq!(VarInt::consensus_decode(&mut reader).unwrap().0, 3);
+        assert_eq!(VarInt::consensus_decode(&mut reader).unwrap().0, 9);
+        assert_eq!(VarInt::consensus_decode(&mut reader).unwrap().0, 1);
+        assert_eq!(u32::consensus_decode(&mut reader).unwrap(), 10);
+        assert_eq!(u64::consensus_decode(&mut reader).unwrap(), 20);
+        assert_eq!(
+            ScriptPubkeyType::consensus_decode(&mut reader).unwrap(),
+            ScriptPubkeyType::PubKeyHash
+        );
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn advertises_only_witness_and_utreexo_services() {
+        let services = advertised_services();
+        assert!(services.has(ServiceFlags::WITNESS));
+        assert!(services.has(ServiceFlags::from(NODE_UTREEXO)));
+        assert!(!services.has(ServiceFlags::NETWORK));
+        assert!(!services.has(ServiceFlags::NETWORK_LIMITED));
     }
 }

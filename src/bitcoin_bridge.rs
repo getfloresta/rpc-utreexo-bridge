@@ -18,12 +18,14 @@ use log::warn;
 use crate::api;
 use crate::block_index::BlocksIndex;
 use crate::blockfile::BlockFile;
+use crate::blockfile::ProofFile;
 use crate::chainview;
 use crate::cli::CliArgs;
 use crate::get_chain_provider;
 use crate::init_logger;
 use crate::leaf_cache::DiskLeafStorage;
 use crate::node;
+use crate::node::ProofBackend;
 use crate::node::WorkerContext;
 use crate::parallel_forest::build_parallel_forest;
 use crate::parallel_forest::KernelBlockSource;
@@ -95,6 +97,16 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| subdir("leaf-map").into());
         let proof_index = Arc::new(open_index(subdir("proof-index/")));
+        let proof_file = Arc::new(RwLock::new(ProofFile::new(subdir("proofs").into())?));
+        let view = open_chain_view(cli_options.network);
+        let (block_notifier_tx, block_notifier_rx) = std::sync::mpsc::channel();
+        start_p2p(
+            cli_options.network,
+            view,
+            proof_index.clone(),
+            ProofBackend::CompactProofs(proof_file.clone()),
+            block_notifier_rx,
+        );
         let client = get_chain_provider()?;
         let kill_signal = Arc::new(Mutex::new(false));
         let shutdown = kill_signal.clone();
@@ -105,41 +117,17 @@ pub fn run_bridge() -> anyhow::Result<()> {
             client,
             &forest_path,
             &leaf_map_path,
-            subdir("proofs").into(),
+            proof_file,
             proof_index,
             hints.stop_height(),
             !cli_options.forest_no_mlock,
             kill_signal,
+            block_notifier_tx,
         )?;
         return prover.keep_up();
     }
 
-    // to keep track of the current chain state and speed up replying to headers requests
-    // from peers.
-    let store = kv::Store::new(kv::Config {
-        path: subdir("chain_view").into(),
-        temporary: false,
-        use_compression: false,
-        flush_every_ms: None,
-        cache_capacity: None,
-        segment_size: None,
-    })
-    .expect("Failed to open chainview database");
-
-    // Chainview is a collection of metadata about the chain, like tip and block
-    // indexes. It's stored in a key-value database.
-    let view = chainview::ChainView::new(store);
-    let view = Arc::new(view);
-
-    let network = cli_options.network;
-    let genesis = genesis_block(network);
-
-    if view.get_height(genesis.block_hash()).is_err() {
-        view.save_header(genesis.block_hash(), serialize(&genesis.header))
-            .expect("Failed to save genesis header");
-        view.save_height(genesis.header.block_hash(), 0)
-            .expect("Failed to save genesis height");
-    }
+    let view = open_chain_view(cli_options.network);
 
     // This database stores some useful information about the blocks, but not
     // the blocks themselves.
@@ -186,27 +174,11 @@ pub fn run_bridge() -> anyhow::Result<()> {
         block_notifier_tx,
     );
 
-    info!("Starting p2p node");
-
-    // This is our implementation of the Bitcoin p2p protocol, it will listen
-    // for incoming connections and serve blocks and proofs to peers.
-    let p2p_port = env::var("P2P_PORT").unwrap_or_else(|_| "8333".into());
-    let p2p_address = format!(
-        "{}:{}",
-        env::var("P2P_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
-        p2p_port
-    );
-
-    let worker_context = WorkerContext {
-        chainview: view.clone(),
-        magic: cli_options.network.magic(),
-        proof_index: index_store.clone(),
-        proof_backend: blocks.clone(),
-    };
-
-    node::Node::run(
-        p2p_address.parse().unwrap(),
-        worker_context,
+    start_p2p(
+        cli_options.network,
+        view.clone(),
+        index_store.clone(),
+        ProofBackend::LegacyBlocks(blocks.clone()),
         block_notifier_rx,
     );
 
@@ -233,6 +205,54 @@ pub fn run_bridge() -> anyhow::Result<()> {
     });
 
     prover.keep_up(receiver)
+}
+
+fn open_chain_view(network: bitcoin::Network) -> Arc<chainview::ChainView> {
+    let store = kv::Store::new(kv::Config {
+        path: subdir("chain_view").into(),
+        temporary: false,
+        use_compression: false,
+        flush_every_ms: None,
+        cache_capacity: None,
+        segment_size: None,
+    })
+    .expect("Failed to open chainview database");
+    let view = Arc::new(chainview::ChainView::new(store));
+    let genesis = genesis_block(network);
+    if view.get_height(genesis.block_hash()).is_err() {
+        view.save_header(genesis.block_hash(), serialize(&genesis.header))
+            .expect("Failed to save genesis header");
+        view.save_height(genesis.header.block_hash(), 0)
+            .expect("Failed to save genesis height");
+    }
+    view
+}
+
+fn start_p2p(
+    network: bitcoin::Network,
+    view: Arc<chainview::ChainView>,
+    proof_index: Arc<BlocksIndex>,
+    proof_backend: ProofBackend,
+    block_notifier: std::sync::mpsc::Receiver<bitcoin::BlockHash>,
+) {
+    info!("Starting BIP 183 proof server");
+    let p2p_port = env::var("P2P_PORT").unwrap_or_else(|_| "8333".into());
+    let p2p_address = format!(
+        "{}:{}",
+        env::var("P2P_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
+        p2p_port
+    );
+    let worker_context = WorkerContext {
+        chainview: view,
+        magic: network.magic(),
+        proof_index,
+        proof_backend,
+    };
+    node::Node::run(
+        p2p_address.parse().expect("invalid P2P listen address"),
+        worker_context,
+        block_notifier,
+    );
 }
 
 fn open_index(path: String) -> BlocksIndex {

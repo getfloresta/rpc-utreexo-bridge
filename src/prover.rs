@@ -623,10 +623,11 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
 pub struct FlatFileProver {
     rpc: Box<dyn Blockchain>,
     acc: SteadyStateForest,
-    proof_file: ProofFile,
+    proof_file: Arc<RwLock<ProofFile>>,
     proof_index: Arc<BlocksIndex>,
     height: u32,
     shutdown_flag: Arc<Mutex<bool>>,
+    block_notification: Sender<BlockHash>,
 }
 
 #[cfg(not(feature = "shinigami"))]
@@ -636,11 +637,12 @@ impl FlatFileProver {
         rpc: Box<dyn Blockchain>,
         forest_path: &Path,
         leaf_map_path: &Path,
-        proof_path: PathBuf,
+        proof_file: Arc<RwLock<ProofFile>>,
         proof_index: Arc<BlocksIndex>,
         bootstrap_height: u32,
         lock_pages: bool,
         shutdown_flag: Arc<Mutex<bool>>,
+        block_notification: Sender<BlockHash>,
     ) -> anyhow::Result<Self> {
         let indexed_height = proof_index.load_height() as u32;
         let height = if indexed_height == 0 {
@@ -654,7 +656,6 @@ impl FlatFileProver {
             indexed_height
         };
         let acc = SteadyStateForest::open(forest_path, leaf_map_path, lock_pages)?;
-        let proof_file = ProofFile::new(proof_path)?;
         info!(
             "Opened steady-state forest at height {height} with {} historical leaves",
             acc.leaves()
@@ -666,6 +667,7 @@ impl FlatFileProver {
             proof_index,
             height,
             shutdown_flag,
+            block_notification,
         })
     }
 
@@ -707,13 +709,21 @@ impl FlatFileProver {
             let block = self.rpc.get_block(block_hash)?;
             let median_time_past = self.rpc.get_mtp(block.header.prev_blockhash)?;
             let compact_proof = self.process_block(&block, height, median_time_past)?;
-            let index = self.proof_file.append(&compact_proof)?;
-            if self.proof_file.get(&index).as_ref() != Some(&compact_proof) {
-                anyhow::bail!("failed to read back compact proof for {block_hash}");
-            }
+            let index = {
+                let mut proof_file = self
+                    .proof_file
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("proof file lock poisoned"))?;
+                let index = proof_file.append(&compact_proof)?;
+                if proof_file.get(&index).as_ref() != Some(&compact_proof) {
+                    anyhow::bail!("failed to read back compact proof for {block_hash}");
+                }
+                index
+            };
             self.proof_index.append(index, block_hash);
             self.proof_index.update_height(height as usize);
             self.height = height;
+            let _ = self.block_notification.send(block_hash);
             info!(
                 "steady-state height={height} hash={block_hash} targets={} proof_hashes={} leaf_data={} leaves={}",
                 compact_proof.proof.targets.len(),
@@ -831,7 +841,10 @@ impl FlatFileProver {
 
     pub fn sync(&self) -> anyhow::Result<()> {
         self.acc.sync()?;
-        self.proof_file.sync()?;
+        self.proof_file
+            .read()
+            .map_err(|_| anyhow::anyhow!("proof file lock poisoned"))?
+            .sync()?;
         Ok(())
     }
 }
