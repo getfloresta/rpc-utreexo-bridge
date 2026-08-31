@@ -19,6 +19,10 @@
 //! ignored without invoking their potentially allocation-heavy Bitcoin
 //! decoders.
 //!
+//! Proof requests read either legacy block-plus-proof records or compact-only
+//! proof records through [`ProofBackend`]. Compact-only storage cannot answer
+//! block downloads; those requests receive `notfound`.
+//!
 //! # Admission and failure isolation
 //!
 //! [`PeerRegistry`] caps the total admitted population, temporarily bans peers
@@ -91,9 +95,12 @@ use mio::Interest;
 use mio::Token;
 use self_cell::self_cell;
 
+use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
 use crate::blockfile::BlockFile;
+use crate::blockfile::ProofFile;
 use crate::chainview::ChainView;
+use crate::udata::CompactBlockProof;
 use crate::udata::CompactLeafData;
 
 /// Deprecated Utreexo compact-filter type retained for compatibility.
@@ -446,13 +453,42 @@ impl MessageRateLimiter {
     }
 }
 
+/// Storage used to answer BIP 183 proof requests.
+#[derive(Clone)]
+pub enum ProofBackend {
+    /// Legacy records containing both Bitcoin blocks and their proofs.
+    LegacyBlocks(Arc<RwLock<BlockFile>>),
+    /// Compact proof records retained after the hintsfile boundary.
+    CompactProofs(Arc<RwLock<ProofFile>>),
+}
+
+impl ProofBackend {
+    fn get(&self, index: BlockIndex) -> Result<Option<CompactBlockProof>, PeerError> {
+        match self {
+            Self::LegacyBlocks(blocks) => {
+                let blocks = blocks.read().map_err(|_| PeerError::PoisonedProofBackend)?;
+                Ok(blocks.get_block(index).and_then(|block| {
+                    block.udata.map(|udata| CompactBlockProof {
+                        proof: udata.proof,
+                        leaves: udata.leaves,
+                    })
+                }))
+            }
+            Self::CompactProofs(proofs) => {
+                let proofs = proofs.read().map_err(|_| PeerError::PoisonedProofBackend)?;
+                Ok(proofs.get(&index))
+            }
+        }
+    }
+}
+
 /// Data required by peers to answer requests.
 #[derive(Clone)]
 pub struct WorkerContext {
-    /// The blocks and proofs served to peers.
-    pub proof_backend: Arc<RwLock<BlockFile>>,
+    /// Compact-only proofs or legacy block-plus-proof records served to peers.
+    pub proof_backend: ProofBackend,
 
-    /// The index used to locate blocks in the proof backend.
+    /// The index used to locate records in the selected proof backend.
     pub proof_index: Arc<BlocksIndex>,
 
     /// Cached active-chain metadata and headers.
@@ -1504,7 +1540,7 @@ impl Peer {
                 );
                 self.send_message(NetworkMessage::Version(VersionMessage {
                     version: 70016,
-                    services: Self::advertised_services(),
+                    services: Self::advertised_services(&self.context.proof_backend),
                     timestamp: version.timestamp.saturating_add(1),
                     receiver: version.sender.clone(),
                     sender: version.receiver,
@@ -1540,12 +1576,13 @@ impl Peer {
                     not_found.push(Inventory::WitnessBlock(block_hash));
                     continue;
                 };
-                let block = self
-                    .context
-                    .proof_backend
-                    .read()
-                    .map_err(|_| PeerError::PoisonedProofBackend)?
-                    .get_block(index);
+                let block = match &self.context.proof_backend {
+                    ProofBackend::LegacyBlocks(blocks) => blocks
+                        .read()
+                        .map_err(|_| PeerError::PoisonedProofBackend)?
+                        .get_block(index),
+                    ProofBackend::CompactProofs(_) => None,
+                };
                 match block {
                     Some(block) => self.send_message(NetworkMessage::Block(block.into()))?,
                     None => not_found.push(Inventory::WitnessBlock(block_hash)),
@@ -1567,32 +1604,22 @@ impl Peer {
         let Some(index) = self.context.proof_index.get_index(request.block_hash) else {
             return Ok(());
         };
-        let proof = {
-            let backend = self
-                .context
-                .proof_backend
-                .read()
-                .map_err(|_| PeerError::PoisonedProofBackend)?;
-            let Some(block) = backend.get_block(index) else {
-                return Ok(());
-            };
-            let Some(udata) = block.udata else {
-                return Ok(());
-            };
-            UtreexoProof {
-                block_hash: request.block_hash,
-                proof_hashes: if request.include_all {
-                    udata.proof.hashes
-                } else {
-                    Self::select_bitmap(&udata.proof.hashes, &request.proof_bitmap)
-                },
-                target_locations: udata.proof.targets,
-                leaf_data: if request.include_all {
-                    udata.leaves
-                } else {
-                    Self::select_bitmap(&udata.leaves, &request.leaf_bitmap)
-                },
-            }
+        let Some(stored_proof) = self.context.proof_backend.get(index)? else {
+            return Ok(());
+        };
+        let proof = UtreexoProof {
+            block_hash: request.block_hash,
+            proof_hashes: if request.include_all {
+                stored_proof.proof.hashes
+            } else {
+                Self::select_bitmap(&stored_proof.proof.hashes, &request.proof_bitmap)
+            },
+            target_locations: stored_proof.proof.targets,
+            leaf_data: if request.include_all {
+                stored_proof.leaves
+            } else {
+                Self::select_bitmap(&stored_proof.leaves, &request.leaf_bitmap)
+            },
         };
         let payload = V2Codec::encode(&V2Message::UtreexoProof(proof))?;
         self.send_payload(&payload)
@@ -1646,12 +1673,15 @@ impl Peer {
         Ok(headers)
     }
 
-    fn advertised_services() -> ServiceFlags {
-        ServiceFlags::NETWORK_LIMITED
-            | ServiceFlags::NETWORK
-            | ServiceFlags::WITNESS
-            | ServiceFlags::P2P_V2
-            | ServiceFlags::from(NODE_UTREEXO)
+    fn advertised_services(backend: &ProofBackend) -> ServiceFlags {
+        let services =
+            ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO);
+        match backend {
+            ProofBackend::LegacyBlocks(_) => {
+                services | ServiceFlags::NETWORK_LIMITED | ServiceFlags::NETWORK
+            }
+            ProofBackend::CompactProofs(_) => services,
+        }
     }
 }
 
@@ -2272,9 +2302,9 @@ mod tests {
             .expect("open test database")
         };
         WorkerContext {
-            proof_backend: Arc::new(RwLock::new(
+            proof_backend: ProofBackend::LegacyBlocks(Arc::new(RwLock::new(
                 BlockFile::new(root.join("blocks.dat"), 1024 * 1024).expect("open test block file"),
-            )),
+            ))),
             proof_index: Arc::new(BlocksIndex {
                 database: store("index"),
             }),
@@ -2337,6 +2367,15 @@ mod tests {
 
     #[test]
     fn slow_and_malformed_peers_do_not_block_bip183_proof_service() {
+        exercise_proof_service(false);
+    }
+
+    #[test]
+    fn slow_and_malformed_peers_do_not_block_compact_bip183_proof_service() {
+        exercise_proof_service(true);
+    }
+
+    fn exercise_proof_service(compact: bool) {
         let storage = std::env::temp_dir().join(format!(
             "bridge-worker-test-{}-{}",
             std::process::id(),
@@ -2345,7 +2384,19 @@ mod tests {
                 .expect("system clock after epoch")
                 .as_nanos()
         ));
-        let context = test_worker_context(&storage);
+        let mut context = test_worker_context(&storage);
+        if compact {
+            context.proof_backend = ProofBackend::CompactProofs(Arc::new(RwLock::new(
+                ProofFile::new(storage.join("proofs.dat")).expect("open test proof file"),
+            )));
+        }
+        let services = Peer::advertised_services(&context.proof_backend);
+        assert!(services.has(ServiceFlags::P2P_V2));
+        assert!(services.has(ServiceFlags::WITNESS));
+        assert!(services.has(ServiceFlags::from(1 << 12)));
+        assert!(!services.has(ServiceFlags::from(1 << 24)));
+        assert_eq!(services.has(ServiceFlags::NETWORK), !compact);
+        assert_eq!(services.has(ServiceFlags::NETWORK_LIMITED), !compact);
         let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         let block_hash = block.block_hash();
         let proof_hash = BlockHash::from_byte_array([1; 32]);
@@ -2365,11 +2416,23 @@ mod tests {
                 leaves: vec![leaf.clone()],
             }),
         };
-        let index = context
-            .proof_backend
-            .write()
-            .expect("lock test block file")
-            .append(&stored_block);
+        let index = match &context.proof_backend {
+            ProofBackend::LegacyBlocks(blocks) => blocks
+                .write()
+                .expect("lock test block file")
+                .append(&stored_block),
+            ProofBackend::CompactProofs(proofs) => {
+                let udata = stored_block.udata.expect("test block has a proof");
+                proofs
+                    .write()
+                    .expect("lock test proof file")
+                    .append(&CompactBlockProof {
+                        proof: udata.proof,
+                        leaves: udata.leaves,
+                    })
+                    .expect("append compact proof")
+            }
+        };
         context.proof_index.append(index, block_hash);
         let expected_proof = UtreexoProof {
             block_hash,
@@ -2493,6 +2556,32 @@ mod tests {
             expected_proof
         );
 
+        let request = V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::GetData(vec![
+            Inventory::WitnessBlock(block_hash),
+        ])))
+        .expect("encode block request");
+        protocol
+            .write(&Payload::genuine(request))
+            .expect("send block request");
+        let response = protocol.read().expect("receive block response");
+        let (short_id, payload) = response
+            .contents()
+            .split_first()
+            .expect("block response short ID");
+        if compact {
+            assert_eq!(*short_id, 17);
+            assert_eq!(
+                deserialize::<Vec<Inventory>>(payload).expect("decode notfound"),
+                vec![Inventory::WitnessBlock(block_hash)]
+            );
+        } else {
+            assert_eq!(*short_id, 2);
+            assert_eq!(
+                deserialize::<bitcoin::Block>(payload).expect("decode block"),
+                bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            );
+        }
+
         drop(protocol);
         drop(malicious_protocol);
         drop(slow_clients);
@@ -2551,15 +2640,6 @@ mod tests {
             registry.software_summary().to_string(),
             "P2P peers total=4 software=[Floresta=1 Satoshi=2] unidentified=1"
         );
-    }
-
-    #[test]
-    fn advertised_services_use_assigned_bip183_bit() {
-        let services = Peer::advertised_services();
-        assert!(services.has(ServiceFlags::P2P_V2));
-        assert!(services.has(ServiceFlags::WITNESS));
-        assert!(services.has(ServiceFlags::from(1 << 12)));
-        assert!(!services.has(ServiceFlags::from(1 << 24)));
     }
 
     #[test]
@@ -2699,3 +2779,4 @@ mod tests {
         assert!(matches!(result, Err(PeerError::Panicked)));
     }
 }
+
