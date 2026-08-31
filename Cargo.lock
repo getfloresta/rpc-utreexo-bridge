@@ -705,6 +705,7 @@ dependencies = [
  "bitcoinkernel",
  "clap",
  "ctrlc",
+ "db-experiment",
  "derive_more",
  "dotenv",
  "futures",
@@ -986,6 +987,10 @@ dependencies = [
  "nix",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "db-experiment"
+version = "0.1.0"
 
 [[package]]
 name = "deranged"

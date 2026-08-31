@@ -14,7 +14,7 @@ It contains multiple components:
 ### Requirements
 
 - Rust 1.85.0 or later
-- Linux or MacOS
+- Linux x86-64
 - A C++ toolchain, CMake, and Boost to compile `rust-bitcoinkernel`
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
@@ -90,21 +90,39 @@ file. The hintsfile stop height is the build target:
 ./target/release/bridge \
     --network signet \
     --build-forest /path/to/utxo.hints \
-    --forest-file /path/to/forest.dat
+    --forest-file /path/to/forest.dat \
+    --leaf-map-path /path/to/leaf-map
 ```
-The forest builder automatically reuses the kernel database created by `bridge-hints`.
+
+The leaf map defaults to `$DATA_DIR/leaf-map`. Its directory must not already exist.
 
 `--forest-leaf-workers` and `--forest-chaser-workers` override the default half-CPU split.
 `--forest-spin-iterations` controls how long chasers spin before sleeping on the publication
 condition variable.
+Leaf fetchers take four-height chunks in round-robin order: each worker processes one adjacent
+chunk, jumps past the other workers' chunks, then repeats. No worker owns a fixed chain range.
 
 The builder first reads blocks once to determine deterministic leaf offsets, then reads them
-concurrently again from Core's block files while writing leaves. Hints indices are interpreted over Utreexo-eligible
-outputs in block order; provably unspendable outputs and outputs consumed in their creating block
-are excluded. Chasers own deterministic ranges, each covering at least two input pages except
+concurrently again through Core's kernel chainstate while writing leaves. Each leaf-fetching
+thread writes the leaf to the forest and concurrently inserts every unspent outpoint into the
+leaf map. Hints indices are interpreted over Utreexo-eligible outputs in block order; provably
+unspendable outputs and outputs consumed in their creating block are excluded.
+Chasers own deterministic ranges, each covering at least two input pages except
 where an entire upper row is smaller. A deleted child promotes its surviving sibling to the
 parent; two deleted children mark the parent deleted, recursively promoting surviving subtrees
 through roots. Independent ranges apply these rules concurrently with leaf publication.
+
+The leaf-map database uses an insert-only range writer: one writer is created per fetched range,
+keys are published directly with a bucket-head CAS, and no lookup, hazard registration,
+replacement, deletion, or reclamation runs on the hot path. The fixed eight-byte position is
+stored inline in the body node, so no blob files are created. Mutable bucket heads stay in memory
+during construction and are serialized sequentially only during clean close.
+
+Leaf-map keys are the 32-byte internal txid followed by little-endian `vout`; values are
+little-endian `u64` bottom-row positions. Only unspent leaves are indexed. A promoted leaf keeps
+its original bottom-row value permanently—the parent chasers never update the map. On clean
+completion, the mutable runtime files are synced and closed directly; no checkpoint snapshot is
+created. Crash recovery for interrupted builds is intentionally deferred.
 
 The output has no header. A node at forest position `N` starts at
 `N * size_of::<ForestNode>()`. Each 33-byte node contains a 32-byte hash and one flags byte:
