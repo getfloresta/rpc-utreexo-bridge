@@ -29,6 +29,7 @@ use crate::parallel_forest::build_parallel_forest;
 use crate::parallel_forest::KernelBlockSource;
 use crate::parallel_forest::ParallelForestConfig;
 use crate::prover;
+use crate::prover::FlatFileProver;
 use crate::subdir;
 
 pub fn run_bridge() -> anyhow::Result<()> {
@@ -82,6 +83,37 @@ pub fn run_bridge() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(hints_path) = cli_options.steady_state.as_deref() {
+        let file = File::open(hints_path)?;
+        let hints = Hintsfile::from_reader(&mut BufReader::new(file))?;
+        let forest_path = cli_options
+            .forest_file
+            .clone()
+            .unwrap_or_else(|| subdir("forest.dat").into());
+        let leaf_map_path = cli_options
+            .leaf_map_path
+            .clone()
+            .unwrap_or_else(|| subdir("leaf-map").into());
+        let proof_index = Arc::new(open_index(subdir("proof-index/")));
+        let client = get_chain_provider()?;
+        let kill_signal = Arc::new(Mutex::new(false));
+        let shutdown = kill_signal.clone();
+        ctrlc::set_handler(move || {
+            *shutdown.lock().unwrap() = true;
+        })?;
+        let mut prover = FlatFileProver::new(
+            client,
+            &forest_path,
+            &leaf_map_path,
+            subdir("proofs").into(),
+            proof_index,
+            hints.stop_height(),
+            !cli_options.forest_no_mlock,
+            kill_signal,
+        )?;
+        return prover.keep_up();
+    }
+
     // to keep track of the current chain state and speed up replying to headers requests
     // from peers.
     let store = kv::Store::new(kv::Config {
@@ -110,18 +142,8 @@ pub fn run_bridge() -> anyhow::Result<()> {
     }
 
     // This database stores some useful information about the blocks, but not
-    // the blocks themselves
-    let index_store = BlocksIndex {
-        database: kv::Store::new(kv::Config {
-            path: subdir("index/").into(),
-            temporary: false,
-            use_compression: false,
-            flush_every_ms: Some(1000),
-            cache_capacity: Some(1_000_000),
-            segment_size: None,
-        })
-        .unwrap(),
-    };
+    // the blocks themselves.
+    let index_store = open_index(subdir("index/"));
 
     // Put it into an Arc so we can share it between threads
     let index_store = Arc::new(index_store);
@@ -211,4 +233,18 @@ pub fn run_bridge() -> anyhow::Result<()> {
     });
 
     prover.keep_up(receiver)
+}
+
+fn open_index(path: String) -> BlocksIndex {
+    BlocksIndex {
+        database: kv::Store::new(kv::Config {
+            path: path.into(),
+            temporary: false,
+            use_compression: false,
+            flush_every_ms: Some(1000),
+            cache_capacity: Some(1_000_000),
+            segment_size: None,
+        })
+        .expect("Failed to open proof index"),
+    }
 }

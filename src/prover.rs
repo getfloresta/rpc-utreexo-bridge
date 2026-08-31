@@ -6,8 +6,12 @@
 //! uses a channel to receive requests and sends responses through a oneshot channel, provided
 //! by the request sender. Maybe there is a better way to do this, but this is a TODO for later.
 use std::collections::HashMap;
+#[cfg(not(feature = "shinigami"))]
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
+#[cfg(not(feature = "shinigami"))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -17,6 +21,8 @@ use std::sync::RwLock;
 use anyhow::Context;
 use bitcoin::consensus::serialize;
 use bitcoin::consensus::Encodable;
+#[cfg(not(feature = "shinigami"))]
+use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
@@ -24,8 +30,10 @@ use bitcoin::Script;
 use bitcoin::Transaction;
 use bitcoin::TxIn;
 use bitcoin::TxOut;
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", not(feature = "shinigami")))]
 use bitcoin::Txid;
+#[cfg(not(feature = "shinigami"))]
+use bitcoin::VarInt;
 #[cfg(feature = "api")]
 use futures::channel::mpsc::Receiver;
 use log::error;
@@ -39,8 +47,20 @@ use serde::Serialize;
 
 use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
+#[cfg(not(feature = "shinigami"))]
+use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
+#[cfg(not(feature = "shinigami"))]
+use crate::chaininterface::TransactionInfo;
 use crate::chainview;
+#[cfg(not(feature = "shinigami"))]
+use crate::parallel_forest::SteadyStateForest;
+#[cfg(not(feature = "shinigami"))]
+use crate::udata::BatchProof;
+#[cfg(not(feature = "shinigami"))]
+use crate::udata::CompactBlockProof;
+#[cfg(not(feature = "shinigami"))]
+use crate::udata::CompactLeafData;
 use crate::udata::LeafContext;
 use crate::udata::LeafData;
 use crate::udata::UtreexoBlock;
@@ -596,6 +616,288 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
 
         Ok((proof, compact_leaves))
     }
+}
+
+#[cfg(not(feature = "shinigami"))]
+/// Sequential steady-state prover backed by the bootstrapped flat forest and persistent leaf map.
+pub struct FlatFileProver {
+    rpc: Box<dyn Blockchain>,
+    acc: SteadyStateForest,
+    proof_file: ProofFile,
+    proof_index: Arc<BlocksIndex>,
+    height: u32,
+    shutdown_flag: Arc<Mutex<bool>>,
+}
+
+#[cfg(not(feature = "shinigami"))]
+impl FlatFileProver {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rpc: Box<dyn Blockchain>,
+        forest_path: &Path,
+        leaf_map_path: &Path,
+        proof_path: PathBuf,
+        proof_index: Arc<BlocksIndex>,
+        bootstrap_height: u32,
+        lock_pages: bool,
+        shutdown_flag: Arc<Mutex<bool>>,
+    ) -> anyhow::Result<Self> {
+        let indexed_height = proof_index.load_height() as u32;
+        let height = if indexed_height == 0 {
+            bootstrap_height
+        } else {
+            if indexed_height < bootstrap_height {
+                anyhow::bail!(
+                    "proof index height {indexed_height} precedes bootstrap height {bootstrap_height}"
+                );
+            }
+            indexed_height
+        };
+        let acc = SteadyStateForest::open(forest_path, leaf_map_path, lock_pages)?;
+        let proof_file = ProofFile::new(proof_path)?;
+        info!(
+            "Opened steady-state forest at height {height} with {} historical leaves",
+            acc.leaves()
+        );
+        Ok(Self {
+            rpc,
+            acc,
+            proof_file,
+            proof_index,
+            height,
+            shutdown_flag,
+        })
+    }
+
+    pub fn keep_up(&mut self) -> anyhow::Result<()> {
+        loop {
+            if *self.shutdown_flag.lock().unwrap() {
+                self.sync()?;
+                return Ok(());
+            }
+            if let Err(error) = self.sync_to_tip() {
+                error!("steady-state sync failed: {error:#}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    }
+
+    pub fn sync_to_tip(&mut self) -> anyhow::Result<u32> {
+        let tip = self.rpc.get_block_count()? as u32;
+        if tip < self.height {
+            anyhow::bail!(
+                "Core tip {tip} is behind steady-state height {}; reorg rollback is unsupported",
+                self.height
+            );
+        }
+        let start = self.height + 1;
+        if start > tip {
+            return Ok(0);
+        }
+        self.prove_range(start, tip)?;
+        Ok(tip - start + 1)
+    }
+
+    pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
+        for height in start..=end {
+            if *self.shutdown_flag.lock().unwrap() {
+                break;
+            }
+            let block_hash = self.rpc.get_block_hash(height as u64)?;
+            let block = self.rpc.get_block(block_hash)?;
+            let median_time_past = self.rpc.get_mtp(block.header.prev_blockhash)?;
+            let compact_proof = self.process_block(&block, height, median_time_past)?;
+            let index = self.proof_file.append(&compact_proof)?;
+            if self.proof_file.get(&index).as_ref() != Some(&compact_proof) {
+                anyhow::bail!("failed to read back compact proof for {block_hash}");
+            }
+            self.proof_index.append(index, block_hash);
+            self.proof_index.update_height(height as usize);
+            self.height = height;
+            info!(
+                "steady-state height={height} hash={block_hash} targets={} proof_hashes={} leaf_data={} leaves={}",
+                compact_proof.proof.targets.len(),
+                compact_proof.proof.hashes.len(),
+                compact_proof.leaves.len(),
+                self.acc.leaves()
+            );
+        }
+        Ok(())
+    }
+
+    fn process_block(
+        &mut self,
+        block: &Block,
+        height: u32,
+        median_time_past: u32,
+    ) -> anyhow::Result<CompactBlockProof> {
+        let spent_in_block = same_block_spends(block);
+        let mut transaction_cache = HashMap::<Txid, TransactionInfo>::new();
+        let mut deletions = Vec::new();
+        let mut deletion_hashes = Vec::new();
+        let mut proof_targets = Vec::new();
+        let mut leaf_data = Vec::new();
+
+        for transaction in &block.txdata {
+            if transaction.is_coinbase() {
+                continue;
+            }
+            for input in &transaction.input {
+                if spent_in_block.contains(&input.previous_output) {
+                    continue;
+                }
+                let outpoint = input.previous_output;
+                let bottom_position = self.acc.leaf_position(&outpoint)?;
+                let proof_position = self.acc.proof_position(bottom_position)?;
+                let leaf =
+                    leaf_context_from_rpc(self.rpc.as_ref(), &mut transaction_cache, outpoint)?;
+                let hash = LeafData::get_leaf_hashes(&leaf);
+                let stored_hash = self.acc.leaf_hash(bottom_position)?;
+                if hash != stored_hash {
+                    anyhow::bail!(
+                        "leaf hash mismatch for {outpoint} at position {bottom_position}"
+                    );
+                }
+                deletions.push((outpoint, bottom_position));
+                deletion_hashes.push(hash);
+                proof_targets.push(proof_position);
+                leaf_data.push(leaf);
+            }
+        }
+
+        let proof = self.acc.prove(&proof_targets)?;
+        let original_stump = Stump {
+            leaves: self.acc.leaves(),
+            roots: self.acc.roots()?,
+        };
+        if !original_stump
+            .verify(&proof, &deletion_hashes)
+            .map_err(anyhow::Error::msg)?
+        {
+            anyhow::bail!("generated proof does not verify against the flat-forest roots");
+        }
+
+        let mut additions = Vec::new();
+        let mut addition_hashes = Vec::new();
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                let outpoint = OutPoint {
+                    txid,
+                    vout: u32::try_from(vout).context("transaction output index overflow")?,
+                };
+                if is_unspendable(&output.script_pubkey) || spent_in_block.contains(&outpoint) {
+                    continue;
+                }
+                let leaf = LeafContext {
+                    block_hash: block.block_hash(),
+                    median_time_past,
+                    txid,
+                    vout: outpoint.vout,
+                    value: output.value.to_sat(),
+                    pk_script: output.script_pubkey.clone(),
+                    block_height: height,
+                    is_coinbase: transaction.is_coinbase(),
+                };
+                let hash = LeafData::get_leaf_hashes(&leaf);
+                additions.push((outpoint, hash));
+                addition_hashes.push(hash);
+            }
+        }
+
+        let expected_stump = original_stump
+            .modify(&addition_hashes, &deletion_hashes, &proof)
+            .map_err(anyhow::Error::msg)?
+            .0;
+        self.acc.delete(&deletions)?;
+        self.acc.add(&additions)?;
+        let actual_roots = self.acc.roots()?;
+        if expected_stump.leaves != self.acc.leaves() || expected_stump.roots != actual_roots {
+            anyhow::bail!("flat-forest mutation diverged from verified stump update");
+        }
+
+        Ok(CompactBlockProof {
+            proof: BatchProof {
+                targets: proof.targets.iter().copied().map(VarInt).collect(),
+                hashes: proof
+                    .hashes
+                    .iter()
+                    .map(|hash| BlockHash::from_byte_array(**hash))
+                    .collect(),
+            },
+            leaves: leaf_data.iter().map(CompactLeafData::from).collect(),
+        })
+    }
+
+    pub fn sync(&self) -> anyhow::Result<()> {
+        self.acc.sync()?;
+        self.proof_file.sync()?;
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "shinigami"))]
+fn same_block_spends(block: &Block) -> HashSet<OutPoint> {
+    let mut created = HashSet::new();
+    let mut spent = HashSet::new();
+    for transaction in &block.txdata {
+        for input in &transaction.input {
+            if created.contains(&input.previous_output) {
+                spent.insert(input.previous_output);
+            }
+        }
+        let txid = transaction.compute_txid();
+        for vout in 0..transaction.output.len() {
+            created.insert(OutPoint {
+                txid,
+                vout: vout as u32,
+            });
+        }
+    }
+    spent
+}
+
+#[cfg(not(feature = "shinigami"))]
+fn leaf_context_from_rpc(
+    rpc: &dyn Blockchain,
+    cache: &mut HashMap<Txid, TransactionInfo>,
+    outpoint: OutPoint,
+) -> anyhow::Result<LeafContext> {
+    let transaction = match cache.entry(outpoint.txid) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let transaction = rpc
+                .get_raw_transaction_info(&outpoint.txid)
+                .with_context(|| {
+                    format!("failed to fetch previous transaction {}", outpoint.txid)
+                })?;
+            entry.insert(transaction)
+        }
+    };
+    let block_hash = transaction
+        .blockhash
+        .ok_or_else(|| anyhow::anyhow!("previous transaction {} is unconfirmed", outpoint.txid))?;
+    let output = transaction
+        .tx
+        .output
+        .get(outpoint.vout as usize)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "previous transaction {} has no output {}",
+                outpoint.txid,
+                outpoint.vout
+            )
+        })?;
+    Ok(LeafContext {
+        block_hash,
+        median_time_past: 0,
+        block_height: transaction.height,
+        is_coinbase: transaction.is_coinbase,
+        pk_script: output.script_pubkey.clone(),
+        value: output.value.to_sat(),
+        vout: outpoint.vout,
+        txid: outpoint.txid,
+    })
 }
 
 #[cfg(feature = "api")]

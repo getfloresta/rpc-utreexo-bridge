@@ -52,6 +52,28 @@ pub struct CompactLeafData {
     pub spk_ty: ScriptPubkeyType,
 }
 
+impl From<&LeafContext> for CompactLeafData {
+    fn from(leaf: &LeafContext) -> Self {
+        let spk_ty = if leaf.pk_script.is_p2pkh() {
+            ScriptPubkeyType::PubKeyHash
+        } else if leaf.pk_script.is_p2sh() {
+            ScriptPubkeyType::ScriptHash
+        } else if leaf.pk_script.is_p2wpkh() {
+            ScriptPubkeyType::WitnessV0PubKeyHash
+        } else if leaf.pk_script.is_p2wsh() {
+            ScriptPubkeyType::WitnessV0ScriptHash
+        } else {
+            ScriptPubkeyType::Other(leaf.pk_script.to_bytes().into_boxed_slice())
+        };
+
+        Self {
+            header_code: (leaf.block_height << 1) | u32::from(leaf.is_coinbase),
+            amount: leaf.value,
+            spk_ty,
+        }
+    }
+}
+
 /// A recoverable scriptPubkey type, this avoids copying over data that are already
 /// present or can be computed from the transaction itself.
 /// An example is a p2pkh, the public key is serialized in the scriptSig, so we can just
@@ -142,6 +164,72 @@ pub struct BatchProof {
     pub targets: Vec<VarInt>,
     /// The inner hashes of a proof
     pub hashes: Vec<BlockHash>,
+}
+
+/// A block proof retained independently from the block fetched through Bitcoin Core.
+///
+/// Its consensus encoding is exactly `<targets><proof hashes><leaf data>`; it does not
+/// contain a block or the unused remember indexes from [`UData`].
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
+pub struct CompactBlockProof {
+    pub proof: BatchProof,
+    pub leaves: Vec<CompactLeafData>,
+}
+
+impl Encodable for CompactBlockProof {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, bitcoin::io::Error> {
+        let mut len = VarInt(self.proof.targets.len() as u64).consensus_encode(writer)?;
+        for target in &self.proof.targets {
+            len += target.consensus_encode(writer)?;
+        }
+        len += VarInt(self.proof.hashes.len() as u64).consensus_encode(writer)?;
+        for hash in &self.proof.hashes {
+            len += hash.consensus_encode(writer)?;
+        }
+        len += VarInt(self.leaves.len() as u64).consensus_encode(writer)?;
+        for leaf in &self.leaves {
+            len += leaf.header_code.consensus_encode(writer)?;
+            len += leaf.amount.consensus_encode(writer)?;
+            len += leaf.spk_ty.consensus_encode(writer)?;
+        }
+        Ok(len)
+    }
+}
+
+impl Decodable for CompactBlockProof {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, consensus::encode::Error> {
+        let target_count = VarInt::consensus_decode(reader)?.0;
+        let mut targets = Vec::with_capacity(target_count as usize);
+        for _ in 0..target_count {
+            targets.push(VarInt::consensus_decode(reader)?);
+        }
+
+        let hash_count = VarInt::consensus_decode(reader)?.0;
+        let mut hashes = Vec::with_capacity(hash_count as usize);
+        for _ in 0..hash_count {
+            hashes.push(BlockHash::consensus_decode(reader)?);
+        }
+
+        let leaf_count = VarInt::consensus_decode(reader)?.0;
+        let mut leaves = Vec::with_capacity(leaf_count as usize);
+        for _ in 0..leaf_count {
+            leaves.push(CompactLeafData {
+                header_code: u32::consensus_decode(reader)?,
+                amount: u64::consensus_decode(reader)?,
+                spk_ty: ScriptPubkeyType::consensus_decode(reader)?,
+            });
+        }
+
+        Ok(Self {
+            proof: BatchProof { targets, hashes },
+            leaves,
+        })
+    }
 }
 
 /// UData contains data needed to prove the existence and validity of all inputs

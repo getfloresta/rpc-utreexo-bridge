@@ -5,9 +5,13 @@
 //! provide a trait that can be implemented by something, or at least talks to something
 //! that does.
 
+use std::str::FromStr;
+
+use anyhow::Context;
 use anyhow::Ok;
 use anyhow::Result;
 use bitcoin::block::Header;
+use bitcoin::consensus::deserialize;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
@@ -61,13 +65,35 @@ impl Blockchain for Client {
     }
 
     fn get_raw_transaction_info(&self, txid: &Txid) -> Result<TransactionInfo> {
-        let tx_data = <Self as RpcApi>::get_raw_transaction_info(self, txid, None)?;
-        let height = self.get_block_height(tx_data.blockhash.unwrap()).unwrap();
+        // Deserialize only the fields steady state needs. Bitcoin Core may add new verbose
+        // script classifications before bitcoincore-rpc-json learns their enum variants.
+        let value: serde_json::Value = self.call(
+            "getrawtransaction",
+            &[serde_json::json!(txid.to_string()), serde_json::json!(true)],
+        )?;
+        let transaction_hex = value
+            .get("hex")
+            .and_then(serde_json::Value::as_str)
+            .context("getrawtransaction response has no hex transaction")?;
+        let transaction: Transaction =
+            deserialize(&hex::decode(transaction_hex).context("invalid transaction hex")?)
+                .context("invalid transaction encoding")?;
+        let blockhash = value
+            .get("blockhash")
+            .and_then(serde_json::Value::as_str)
+            .map(BlockHash::from_str)
+            .transpose()
+            .context("invalid transaction block hash")?;
+        let height = match blockhash {
+            Some(block_hash) => self.get_block_height(block_hash)?,
+            None => 0,
+        };
+        let is_coinbase = transaction.is_coinbase();
         Ok(TransactionInfo {
-            tx: tx_data.transaction().unwrap(),
+            tx: transaction,
             height,
-            blockhash: tx_data.blockhash,
-            is_coinbase: tx_data.is_coinbase(),
+            blockhash,
+            is_coinbase,
         })
     }
 

@@ -147,6 +147,35 @@ explicitly. No sysctl changes are required; Linux will use otherwise-free RAM fo
 Avoid globally raising `vm.dirty_ratio`: it can starve the rest of the system and only postpones,
 rather than removes, the final writeback.
 
+### Sequential steady state
+
+After bootstrap, continue from the hintsfile stop height with the same forest and leaf map:
+
+```bash
+./target/release/bridge \
+    --network signet \
+    --steady-state /path/to/utxo.hints \
+    --forest-file /path/to/forest.dat \
+    --leaf-map-path /path/to/leaf-map
+```
+
+Bitcoin Core must be running with `txindex=1`. Steady state is intentionally single-threaded.
+For each RPC block it resolves every external input through the leaf map, fetches its creating
+transaction from Core, generates and verifies the batch proof, propagates deletions, appends
+eligible outputs, and verifies the resulting roots against a `rustreexo` stump update. Outputs
+created and spent in the same block never enter the forest.
+
+The map continues to hold stable bottom positions. Proof generation walks the spent flags to map
+those positions into the promoted sparse forest, including promotions above live branches.
+The runtime map is given 1 GiB of append headroom; older bootstrap maps are extended in place
+before they are opened.
+
+Post-hints proofs are appended to `$DATA_DIR/proofs` and indexed by block hash under
+`$DATA_DIR/proof-index`. Records contain only targets, proof hashes, and compact leaf data—Bitcoin
+blocks are fetched from Core and are not retained. A clean shutdown flushes the forest, map, and
+proof file. Chain rollback is not yet supported; steady state stops advancing if Core reports a
+tip below the retained proof height.
+
 ## Building with esplora backends
 
 You can use esplora backends to grab blocks and transactions. To do so, you'll need to enable the `esplora` feature when building the node:

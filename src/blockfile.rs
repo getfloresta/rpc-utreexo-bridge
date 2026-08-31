@@ -10,15 +10,16 @@ use std::fs::OpenOptions;
 use std::io::Seek;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::slice;
 
+use bitcoin::consensus::deserialize;
 use bitcoin::consensus::serialize;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use bitcoin::Script;
 use bitcoin::VarInt;
 use mmap::MapOption;
 use mmap::MemoryMap;
@@ -27,8 +28,8 @@ use rustreexo::accumulator::mem_forest::MemForest;
 use crate::block_index::BlockIndex;
 use crate::prover::BlockStorage;
 use crate::udata::BatchProof;
+use crate::udata::CompactBlockProof;
 use crate::udata::CompactLeafData;
-use crate::udata::ScriptPubkeyType;
 use crate::udata::UData;
 use crate::udata::UtreexoBlock;
 
@@ -108,20 +109,51 @@ impl BlockFile {
     pub unsafe fn read(&self, index: &BlockIndex) -> *mut u8 {
         self.mmap.data().wrapping_add(index.offset)
     }
+}
 
-    /// Returns what spk type this output is. We need this to build a compact leaf data.
-    fn get_spk_type(spk: &Script) -> ScriptPubkeyType {
-        if spk.is_p2pkh() {
-            ScriptPubkeyType::PubKeyHash
-        } else if spk.is_p2sh() {
-            ScriptPubkeyType::ScriptHash
-        } else if spk.is_p2wpkh() {
-            ScriptPubkeyType::WitnessV0PubKeyHash
-        } else if spk.is_p2wsh() {
-            ScriptPubkeyType::WitnessV0ScriptHash
-        } else {
-            ScriptPubkeyType::Other(spk.to_bytes().into_boxed_slice())
+/// An append-only file containing compact block proofs without Bitcoin blocks.
+pub struct ProofFile {
+    file: File,
+    writer_pos: usize,
+}
+
+impl ProofFile {
+    pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let writer_pos = file.seek(std::io::SeekFrom::End(0))? as usize;
+        Ok(Self { file, writer_pos })
+    }
+
+    pub fn append(&mut self, proof: &CompactBlockProof) -> std::io::Result<BlockIndex> {
+        self.file.seek(std::io::SeekFrom::End(0))?;
+        let buffer = serialize(proof);
+        self.file.write_all(&buffer)?;
+        let index = BlockIndex {
+            offset: self.writer_pos,
+            size: buffer.len(),
+        };
+        self.writer_pos += buffer.len();
+        Ok(index)
+    }
+
+    pub fn get(&self, index: &BlockIndex) -> Option<CompactBlockProof> {
+        let mut bytes = vec![0; index.size];
+        self.file
+            .read_exact_at(&mut bytes, index.offset as u64)
+            .ok()?;
+        deserialize(&bytes).ok()
+    }
+
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.file.sync_data()
     }
 }
 
@@ -143,18 +175,7 @@ impl BlockStorage for BlockFile {
                 .collect(),
         };
 
-        let leaves = leaves
-            .into_iter()
-            .map(|leaf| {
-                let header_code = (leaf.block_height << 1) | leaf.is_coinbase as u32;
-
-                CompactLeafData {
-                    header_code,
-                    amount: leaf.value,
-                    spk_ty: Self::get_spk_type(&leaf.pk_script),
-                }
-            })
-            .collect();
+        let leaves = leaves.iter().map(CompactLeafData::from).collect();
 
         let block = UtreexoBlock {
             block: block.clone(),

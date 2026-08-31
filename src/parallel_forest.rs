@@ -3,6 +3,7 @@
 //! Linux-only, parallel construction of a position-addressed Utreexo forest.
 
 use std::cell::UnsafeCell;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
@@ -31,6 +32,7 @@ use anyhow::Context;
 use anyhow::Result;
 use bitcoin::hashes::Hash;
 use bitcoin::Network;
+use bitcoin::OutPoint;
 use bitcoin::Txid;
 use bitcoinkernel::prelude::BlockHashExt;
 use bitcoinkernel::prelude::ScriptPubkeyExt;
@@ -57,12 +59,14 @@ use memmap2::MmapMut;
 use memmap2::MmapOptions;
 use rustreexo::accumulator::node_hash::AccumulatorHash;
 use rustreexo::accumulator::node_hash::BitcoinNodeHash;
+use rustreexo::accumulator::proof::Proof;
 
 const READY: u8 = 1 << 0;
 const SPENT: u8 = 1 << 1;
 const HEIGHT_CHUNK_SIZE: u64 = 4;
 const WRITING: u8 = 1 << 2;
 const DEFAULT_SPIN_ITERATIONS: usize = 512;
+const STEADY_LEAF_MAP_HEADROOM: u64 = 1 << 30;
 const BIP30_FIRST_TXID_91722: &str =
     "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468";
 const BIP30_FIRST_TXID_91812: &str =
@@ -333,6 +337,37 @@ impl FlatForest {
         Ok(forest)
     }
 
+    fn open(path: &Path, lock_pages: bool) -> Result<Self> {
+        if !cfg!(target_os = "linux") {
+            bail!("flat-forest steady state is supported only on Linux");
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open forest file {}", path.display()))?;
+        let byte_len = file.metadata()?.len();
+        if byte_len == 0 || byte_len % size_of::<ForestNode>() as u64 != 0 {
+            bail!(
+                "forest file {} has invalid byte length {byte_len}",
+                path.display()
+            );
+        }
+        let node_count = byte_len / size_of::<ForestNode>() as u64;
+        let map_len =
+            usize::try_from(byte_len).context("forest does not fit this address space")?;
+        let map = unsafe { MmapOptions::new().len(map_len).map_mut(&file) }
+            .with_context(|| format!("failed to map forest file {}", path.display()))?;
+        let mut forest = Self {
+            map,
+            _file: file,
+            node_count,
+            pages_locked: false,
+        };
+        forest.prepare_residency(lock_pages);
+        Ok(forest)
+    }
+
     fn prepare_residency(&mut self, lock_pages: bool) {
         let ptr = self.map.as_mut_ptr().cast::<libc::c_void>();
         let len = self.map.len();
@@ -395,6 +430,29 @@ impl FlatForest {
         let flags = READY | if value.spent { SPENT } else { 0 };
         node.flags.store(flags, Ordering::Release);
         Ok(())
+    }
+
+    fn overwrite(&self, position: u64, value: ForestNodeData) -> Result<()> {
+        let node = self.node(position)?;
+        let previous = node.flags.swap(WRITING, Ordering::AcqRel);
+        if previous & READY == 0 || previous & WRITING != 0 {
+            node.flags.store(previous, Ordering::Release);
+            bail!("forest position {position} cannot be overwritten from flags {previous:#04x}");
+        }
+        unsafe {
+            *node.hash.get() = value.hash;
+        }
+        let flags = READY | if value.spent { SPENT } else { 0 };
+        node.flags.store(flags, Ordering::Release);
+        Ok(())
+    }
+
+    fn store(&self, position: u64, value: ForestNodeData) -> Result<()> {
+        if self.try_read(position)?.is_some() {
+            self.overwrite(position, value)
+        } else {
+            self.write(position, value)
+        }
     }
 
     fn flush(&self) -> Result<()> {
@@ -668,7 +726,9 @@ fn create_leaf_map(path: &Path, leaves: u64, leaf_workers: usize) -> Result<Data
         .context("leaf worker count exceeds leaf map thread limit")?;
     let mut config = LeafMapConfig::new(Mode::Map, bucket_count, LEAF_MAP_KEY_SIZE);
     config.inline_value_size = LEAF_MAP_VALUE_SIZE;
-    config.body_capacity = aligned_leaf_map_capacity(leaves, 96)?;
+    config.body_capacity = aligned_leaf_map_capacity(leaves, 96)?
+        .checked_add(STEADY_LEAF_MAP_HEADROOM)
+        .context("leaf map steady-state reserve overflow")?;
     config.blob_capacity = 0;
     config.block_size = LEAF_MAP_BLOCK_SIZE;
     config.max_threads = max_threads;
@@ -681,6 +741,341 @@ fn leaf_map_key(txid: [u8; 32], vout: u32) -> [u8; LEAF_MAP_KEY_SIZE] {
     key[..32].copy_from_slice(&txid);
     key[32..].copy_from_slice(&vout.to_le_bytes());
     key
+}
+
+/// A single-threaded mutable view of a completed flat-forest bootstrap.
+pub struct SteadyStateForest {
+    forest: FlatForest,
+    leaf_map: Database,
+    leaves: u64,
+    forest_rows: u8,
+}
+
+impl SteadyStateForest {
+    pub fn open(forest_path: &Path, leaf_map_path: &Path, lock_pages: bool) -> Result<Self> {
+        let forest = FlatForest::open(forest_path, lock_pages)?;
+        let positional_size = forest
+            .node_count
+            .checked_add(1)
+            .context("forest position count overflow")?;
+        if positional_size < 2 || !positional_size.is_power_of_two() {
+            bail!(
+                "forest contains {} nodes, not a complete positional space",
+                forest.node_count
+            );
+        }
+        let forest_rows =
+            u8::try_from(positional_size.ilog2() - 1).context("forest height exceeds u8")?;
+        let bottom_capacity = 1u64
+            .checked_shl(u32::from(forest_rows))
+            .context("forest bottom capacity overflow")?;
+
+        // Bootstrap writes every bottom node before `leaves` and leaves the rest zeroed, so the
+        // exact count can be recovered without rescanning blocks or adding a file header.
+        let mut first = 0u64;
+        let mut end = bottom_capacity;
+        while first < end {
+            let middle = first + (end - first) / 2;
+            if forest.try_read(middle)?.is_some() {
+                first = middle + 1;
+            } else {
+                end = middle;
+            }
+        }
+        if first == 0 {
+            bail!("flat forest has no initialized leaves");
+        }
+
+        if Database::ensure_runtime_body_headroom(leaf_map_path, STEADY_LEAF_MAP_HEADROOM)
+            .with_context(|| format!("failed to grow leaf map {}", leaf_map_path.display()))?
+        {
+            info!(
+                "extended leaf map {} with {} bytes of steady-state headroom",
+                leaf_map_path.display(),
+                STEADY_LEAF_MAP_HEADROOM
+            );
+        }
+        let leaf_map = Database::open_runtime(leaf_map_path)
+            .with_context(|| format!("failed to open leaf map {}", leaf_map_path.display()))?;
+        Ok(Self {
+            forest,
+            leaf_map,
+            leaves: first,
+            forest_rows,
+        })
+    }
+
+    pub fn leaves(&self) -> u64 {
+        self.leaves
+    }
+
+    pub fn roots(&self) -> Result<Vec<BitcoinNodeHash>> {
+        let mut roots = Vec::with_capacity(self.leaves.count_ones() as usize);
+        for row in (0..=self.forest_rows).rev() {
+            if self.leaves & (1u64 << row) == 0 {
+                continue;
+            }
+            let position = root_position(self.leaves, row, self.forest_rows);
+            let node = self
+                .forest
+                .try_read(position)?
+                .ok_or_else(|| anyhow!("root position {position} is uninitialized"))?;
+            roots.push(BitcoinNodeHash::from(node.hash));
+        }
+        Ok(roots)
+    }
+
+    /// Returns the stable bottom-row position stored for an outpoint.
+    pub fn leaf_position(&self, outpoint: &OutPoint) -> Result<u64> {
+        let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
+        let value = self
+            .leaf_map
+            .get(&key)
+            .context("failed to query leaf map")?
+            .ok_or_else(|| anyhow!("outpoint {outpoint} is not in the leaf map"))?;
+        let value: [u8; LEAF_MAP_VALUE_SIZE] = value
+            .try_into()
+            .map_err(|value: Vec<u8>| anyhow!("leaf position has {} bytes", value.len()))?;
+        let position = u64::from_le_bytes(value);
+        if position >= self.leaves {
+            bail!(
+                "outpoint {outpoint} maps to position {position} beyond {} leaves",
+                self.leaves
+            );
+        }
+        let node = self
+            .forest
+            .try_read(position)?
+            .ok_or_else(|| anyhow!("leaf position {position} is uninitialized"))?;
+        if node.spent {
+            bail!("outpoint {outpoint} maps to spent position {position}");
+        }
+        Ok(position)
+    }
+
+    pub fn leaf_hash(&self, bottom_position: u64) -> Result<BitcoinNodeHash> {
+        let node = self
+            .forest
+            .try_read(bottom_position)?
+            .ok_or_else(|| anyhow!("leaf position {bottom_position} is uninitialized"))?;
+        if node.spent {
+            bail!("leaf position {bottom_position} is spent");
+        }
+        Ok(BitcoinNodeHash::from(node.hash))
+    }
+
+    /// Converts a stable bottom position into its position in the promoted, sparse forest.
+    pub fn proof_position(&self, bottom_position: u64) -> Result<u64> {
+        let mut original_position = bottom_position;
+        let mut branch_directions = Vec::new();
+        while !is_root_position(original_position, self.leaves, self.forest_rows) {
+            let sibling_position = original_position ^ 1;
+            let sibling = self
+                .forest
+                .try_read(sibling_position)?
+                .ok_or_else(|| anyhow!("sibling position {sibling_position} is uninitialized"))?;
+            if !sibling.spent {
+                branch_directions.push(original_position & 1 != 0);
+            }
+            original_position = parent(original_position, self.forest_rows);
+        }
+
+        let mut promoted_position = original_position;
+        for is_right in branch_directions.into_iter().rev() {
+            promoted_position =
+                left_child(promoted_position, self.forest_rows) + u64::from(is_right);
+        }
+        Ok(promoted_position)
+    }
+
+    fn containing_root(&self, position: u64) -> Result<(u64, u8)> {
+        let position_row = detect_row(position, self.forest_rows);
+        for root_row in position_row..=self.forest_rows {
+            if self.leaves & (1u64 << root_row) == 0 {
+                continue;
+            }
+            let mut ancestor = position;
+            for _ in position_row..root_row {
+                ancestor = parent(ancestor, self.forest_rows);
+            }
+            let root = root_position(self.leaves, root_row, self.forest_rows);
+            if ancestor == root {
+                return Ok((root, root_row));
+            }
+        }
+        bail!("position {position} is not below a populated root")
+    }
+
+    fn compressed_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
+        let (root, mut original_row) = self.containing_root(position)?;
+        let mut directions = Vec::new();
+        let mut logical_position = position;
+        while logical_position != root {
+            directions.push(logical_position & 1 != 0);
+            logical_position = parent(logical_position, self.forest_rows);
+        }
+
+        let mut original_position = root;
+        for is_right in directions.into_iter().rev() {
+            loop {
+                if original_row == 0 {
+                    bail!("compressed position {position} descends below the bottom row");
+                }
+                let left_position = left_child(original_position, self.forest_rows);
+                let left = self
+                    .forest
+                    .try_read(left_position)?
+                    .ok_or_else(|| anyhow!("left child {left_position} is uninitialized"))?;
+                let right = self
+                    .forest
+                    .try_read(left_position + 1)?
+                    .ok_or_else(|| anyhow!("right child {} is uninitialized", left_position + 1))?;
+                original_row -= 1;
+                match (left.spent, right.spent) {
+                    (true, true) => {
+                        bail!("compressed position {position} enters a fully spent subtree")
+                    }
+                    (true, false) => original_position = left_position + 1,
+                    (false, true) => original_position = left_position,
+                    (false, false) => {
+                        original_position = left_position + u64::from(is_right);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let node = self
+            .forest
+            .try_read(original_position)?
+            .ok_or_else(|| anyhow!("compressed node {original_position} is uninitialized"))?;
+        if node.spent {
+            bail!("compressed position {position} resolves to an empty subtree");
+        }
+        Ok(BitcoinNodeHash::from(node.hash))
+    }
+
+    pub fn prove(&self, targets: &[u64]) -> Result<Proof<BitcoinNodeHash>> {
+        let proof_positions = get_proof_positions(targets, self.leaves, self.forest_rows);
+        let hashes = proof_positions
+            .into_iter()
+            .map(|position| self.compressed_hash(position))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Proof::new_with_hash(targets.to_vec(), hashes))
+    }
+
+    pub fn delete(&mut self, deletions: &[(OutPoint, u64)]) -> Result<()> {
+        let mut positions = BTreeSet::new();
+        for (outpoint, position) in deletions {
+            let indexed = self.leaf_position(outpoint)?;
+            if indexed != *position {
+                bail!("outpoint {outpoint} moved from requested position {position} to {indexed}");
+            }
+            let node = self
+                .forest
+                .try_read(*position)?
+                .expect("leaf_position checked initialization");
+            self.forest.overwrite(
+                *position,
+                ForestNodeData {
+                    hash: node.hash,
+                    spent: true,
+                },
+            )?;
+            positions.insert(*position);
+        }
+
+        while !positions.is_empty() {
+            let parents: BTreeSet<u64> = positions
+                .iter()
+                .filter(|position| !is_root_position(**position, self.leaves, self.forest_rows))
+                .map(|position| parent(*position, self.forest_rows))
+                .collect();
+            for parent_position in &parents {
+                let left_position = left_child(*parent_position, self.forest_rows);
+                let left = self
+                    .forest
+                    .try_read(left_position)?
+                    .ok_or_else(|| anyhow!("left child {left_position} is uninitialized"))?;
+                let right = self
+                    .forest
+                    .try_read(left_position + 1)?
+                    .ok_or_else(|| anyhow!("right child {} is uninitialized", left_position + 1))?;
+                self.forest
+                    .overwrite(*parent_position, combine_children(left, right))?;
+            }
+            positions = parents;
+        }
+
+        for (outpoint, _) in deletions {
+            let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
+            if !self
+                .leaf_map
+                .delete(&key)
+                .context("failed to delete leaf-map entry")?
+            {
+                bail!("outpoint {outpoint} disappeared from the leaf map");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add(&mut self, additions: &[(OutPoint, BitcoinNodeHash)]) -> Result<()> {
+        let bottom_capacity = 1u64
+            .checked_shl(u32::from(self.forest_rows))
+            .context("forest bottom capacity overflow")?;
+        let final_leaves = self
+            .leaves
+            .checked_add(additions.len() as u64)
+            .context("leaf count overflow")?;
+        if final_leaves > bottom_capacity {
+            bail!("flat forest capacity {bottom_capacity} is exhausted by {final_leaves} leaves");
+        }
+
+        for (outpoint, hash) in additions {
+            let bottom_position = self.leaves;
+            self.forest.store(
+                bottom_position,
+                ForestNodeData {
+                    hash: **hash,
+                    spent: false,
+                },
+            )?;
+
+            let mut position = bottom_position;
+            let mut row = 0u8;
+            while self.leaves & (1u64 << row) != 0 {
+                let left_position = root_position(self.leaves, row, self.forest_rows);
+                let left = self
+                    .forest
+                    .try_read(left_position)?
+                    .ok_or_else(|| anyhow!("addition root {left_position} is uninitialized"))?;
+                let right = self
+                    .forest
+                    .try_read(position)?
+                    .ok_or_else(|| anyhow!("addition node {position} is uninitialized"))?;
+                position = parent(position, self.forest_rows);
+                self.forest.store(position, combine_children(left, right))?;
+                row += 1;
+            }
+
+            let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
+            if !self
+                .leaf_map
+                .put_new(&key, &bottom_position.to_le_bytes())
+                .context("failed to insert leaf-map entry")?
+            {
+                bail!("outpoint {outpoint} already exists in the leaf map");
+            }
+            self.leaves += 1;
+        }
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.forest.flush()?;
+        self.leaf_map.sync().context("failed to sync leaf map")
+    }
 }
 
 /// Build and persist a complete flat forest through the hintsfile's stop height.
@@ -1380,6 +1775,63 @@ fn tree_rows(leaves: u64) -> u8 {
     }
 }
 
+fn parent(position: u64, forest_rows: u8) -> u64 {
+    (position >> 1) | (1 << forest_rows)
+}
+
+fn left_child(position: u64, forest_rows: u8) -> u64 {
+    let mask = (2 << forest_rows) - 1;
+    (position << 1) & mask
+}
+
+fn detect_row(position: u64, forest_rows: u8) -> u8 {
+    let mut marker = 1 << forest_rows;
+    let mut row = 0;
+    while position & marker != 0 {
+        marker >>= 1;
+        row += 1;
+    }
+    row
+}
+
+fn root_position(leaves: u64, row: u8, forest_rows: u8) -> u64 {
+    let mask = (2 << forest_rows) - 1;
+    let before = leaves & (mask << (row + 1));
+    let shifted = (before >> row) | (mask << (forest_rows + 1 - row));
+    shifted & mask
+}
+
+fn is_root_position(position: u64, leaves: u64, forest_rows: u8) -> bool {
+    let row = detect_row(position, forest_rows);
+    leaves & (1 << row) != 0 && root_position(leaves, row, forest_rows) == position
+}
+
+fn get_proof_positions(targets: &[u64], leaves: u64, forest_rows: u8) -> Vec<u64> {
+    let mut proof_positions = BTreeSet::new();
+    let mut known = HashSet::with_capacity(targets.len() * 2);
+    let mut computed = targets.to_vec();
+    known.extend(targets.iter().copied());
+
+    let mut index = 0;
+    while index < computed.len() {
+        let position = computed[index];
+        if !is_root_position(position, leaves, forest_rows) {
+            let sibling = position ^ 1;
+            if !known.contains(&sibling) {
+                proof_positions.insert(sibling);
+            } else {
+                proof_positions.remove(&position);
+            }
+            let parent = parent(position, forest_rows);
+            if known.insert(parent) {
+                computed.push(parent);
+            }
+        }
+        index += 1;
+    }
+    proof_positions.into_iter().collect()
+}
+
 fn forest_capacity(forest_rows: u8) -> Result<u64> {
     u64::try_from((2u128 << forest_rows) - 1).context("forest position space exceeds u64")
 }
@@ -1414,6 +1866,8 @@ mod tests {
     use bitcoin::TxMerkleNode;
     use bitcoin::TxOut;
     use bitcoin::Witness;
+
+    use rustreexo::accumulator::stump::Stump;
 
     use super::*;
 
@@ -1634,6 +2088,47 @@ mod tests {
     }
 
     #[test]
+    fn proofs_read_hashes_from_promoted_sparse_positions() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30, 40, 50, 60, 70, 80])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            indices: BTreeMap::from([(1, vec![0, 1, 4, 5])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        {
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let outpoint = OutPoint {
+                txid: source.blocks[0].txdata[0].compute_txid(),
+                vout: 0,
+            };
+            let bottom = steady.leaf_position(&outpoint).unwrap();
+            let target = steady.proof_position(bottom).unwrap();
+            assert_eq!(target, 8);
+            let leaf_hash = steady.leaf_hash(bottom).unwrap();
+            let proof = steady.prove(&[target]).unwrap();
+            assert_eq!(proof.hashes.len(), 2);
+            assert_eq!(proof.hashes[0], steady.leaf_hash(1).unwrap());
+            let stump = Stump {
+                leaves: steady.leaves(),
+                roots: steady.roots().unwrap(),
+            };
+            assert!(stump.verify(&proof, &[leaf_hash]).unwrap());
+        }
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(leaf_map_path).unwrap();
+    }
+
+    #[test]
     fn builds_and_reopens_a_parallel_forest() {
         let path = temp_forest_path();
         let source = MockSource {
@@ -1712,6 +2207,58 @@ mod tests {
             assert_eq!(position(second_txid, 0), Some(3));
             assert_eq!(position(second_txid, 1), Some(4));
             assert_eq!(position(second_txid, 2), Some(5));
+        }
+        {
+            let first_txid = source.blocks[0].txdata[0].compute_txid();
+            let spent_outpoint = OutPoint {
+                txid: first_txid,
+                vout: 1,
+            };
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert_eq!(steady.leaves(), 6);
+            let bottom = steady.leaf_position(&spent_outpoint).unwrap();
+            assert_eq!(bottom, 1);
+            let target = steady.proof_position(bottom).unwrap();
+            assert_eq!(target, 8);
+            let deleted_hash = steady.leaf_hash(bottom).unwrap();
+            let proof = steady.prove(&[target]).unwrap();
+            let before = Stump {
+                leaves: steady.leaves(),
+                roots: steady.roots().unwrap(),
+            };
+            assert!(before.verify(&proof, &[deleted_hash]).unwrap());
+            let after_delete = before.modify(&[], &[deleted_hash], &proof).unwrap().0;
+            steady.delete(&[(spent_outpoint, bottom)]).unwrap();
+            assert_eq!(steady.roots().unwrap(), after_delete.roots);
+
+            let surviving_outpoint = OutPoint {
+                txid: source.blocks[1].txdata[0].compute_txid(),
+                vout: 0,
+            };
+            let surviving_bottom = steady.leaf_position(&surviving_outpoint).unwrap();
+            assert_eq!(surviving_bottom, 3);
+            let surviving_target = steady.proof_position(surviving_bottom).unwrap();
+            assert_eq!(surviving_target, 12);
+            let surviving_hash = steady.leaf_hash(surviving_bottom).unwrap();
+            let empty_sibling_proof = steady.prove(&[surviving_target]).unwrap();
+            assert!(after_delete
+                .verify(&empty_sibling_proof, &[surviving_hash])
+                .unwrap());
+
+            let added_outpoint = OutPoint {
+                txid: Txid::from_byte_array([9; 32]),
+                vout: 7,
+            };
+            let added_hash = BitcoinNodeHash::from([7; 32]);
+            let after_add = after_delete
+                .modify(&[added_hash], &[], &Proof::default())
+                .unwrap()
+                .0;
+            steady.add(&[(added_outpoint, added_hash)]).unwrap();
+            assert_eq!(steady.leaves(), 7);
+            assert_eq!(steady.leaf_position(&added_outpoint).unwrap(), 6);
+            assert_eq!(steady.roots().unwrap(), after_add.roots);
+            steady.sync().unwrap();
         }
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir_all(leaf_map_path).unwrap();

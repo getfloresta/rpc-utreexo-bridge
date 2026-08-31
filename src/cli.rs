@@ -33,15 +33,21 @@ pub struct CliArgs {
 
     /// Build a flat, memory-mapped forest through the stop height encoded by this hintsfile, then
     /// exit. This phase currently supports Linux only.
-    #[clap(long, value_name = "HINTS_FILE")]
+    #[clap(long, value_name = "HINTS_FILE", conflicts_with = "steady_state")]
     pub build_forest: Option<std::path::PathBuf>,
 
-    /// Output path for `--build-forest`. Defaults to `$DATA_DIR/forest.dat`.
-    #[clap(long, requires = "build_forest", value_name = "FOREST_FILE")]
+    /// Continue sequentially from a completed flat forest at this hintsfile's stop height.
+    #[clap(long, value_name = "HINTS_FILE", conflicts_with = "build_forest")]
+    pub steady_state: Option<std::path::PathBuf>,
+
+    /// Flat-forest path for bootstrap output or steady-state input.
+    /// Defaults to `$DATA_DIR/forest.dat`.
+    #[clap(long, value_name = "FOREST_FILE")]
     pub forest_file: Option<std::path::PathBuf>,
 
-    /// Output directory for the outpoint-to-bottom-row leaf map. Defaults to `$DATA_DIR/leaf-map`.
-    #[clap(long, requires = "build_forest", value_name = "LEAF_MAP_DIR")]
+    /// Outpoint-to-bottom-position map for bootstrap output or steady-state input.
+    /// Defaults to `$DATA_DIR/leaf-map`.
+    #[clap(long, value_name = "LEAF_MAP_DIR")]
     pub leaf_map_path: Option<std::path::PathBuf>,
 
     /// Number of concurrent block-fetching leaf workers.
@@ -57,7 +63,7 @@ pub struct CliArgs {
     pub forest_spin_iterations: Option<usize>,
 
     /// Do not attempt to lock touched forest pages in RAM.
-    #[clap(long, requires = "build_forest")]
+    #[clap(long)]
     pub forest_no_mlock: bool,
 
     /// The network we are operating on
