@@ -96,8 +96,14 @@ The leaf map defaults to `$DATA_DIR/leaf-map`. Its directory must not already ex
 `--forest-leaf-workers` and `--forest-chaser-workers` override the default half-CPU split.
 `--forest-spin-iterations` controls how long chasers spin before sleeping on the publication
 condition variable.
-Leaf fetchers take four-height chunks in round-robin order: each worker processes one adjacent
-chunk, jumps past the other workers' chunks, then repeats. No worker owns a fixed chain range.
+Leaf fetchers claim four-height chunks from a shared atomic allocator. Each acquisition returns
+the next adjacent chunk, so a worker that finishes early immediately passes the others and takes
+more work. No worker owns a fixed chain range.
+
+Every successful range acquisition is logged with its worker ID and inclusive heights. The final
+summary reports the range count, average range acquisition and processing times, average kernel
+block wait, average leaf-map and forest write times, and the number of chaser ranges that had to
+wait for their children.
 
 The builder first reads blocks once to determine deterministic leaf offsets, then reads them
 concurrently again through Core's kernel chainstate while writing leaves. Each leaf-fetching
