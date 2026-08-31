@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
 use anyhow::anyhow;
@@ -148,6 +150,78 @@ pub struct ForestBuildSummary {
     pub file_bytes: u64,
     pub pages_locked: bool,
     pub roots: Vec<ForestRoot>,
+    pub statistics: BuildStatistics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildStatistics {
+    pub ranges: u64,
+    pub average_range_lock_time: Duration,
+    pub average_range_processing_time: Duration,
+    pub kernel_blocks: u64,
+    pub average_kernel_block_wait: Duration,
+    pub index_writes: u64,
+    pub average_index_write_time: Duration,
+    pub forest_writes: u64,
+    pub average_forest_write_time: Duration,
+    pub chaser_range_waits: u64,
+}
+
+#[derive(Default)]
+struct TimingAccumulator {
+    total_nanos: AtomicU64,
+    samples: AtomicU64,
+}
+
+impl TimingAccumulator {
+    fn record(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, Duration) {
+        let samples = self.samples.load(Ordering::Relaxed);
+        let total_nanos = self.total_nanos.load(Ordering::Relaxed);
+        let average = if samples == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(total_nanos / samples)
+        };
+        (samples, average)
+    }
+}
+
+#[derive(Default)]
+struct BuildStats {
+    range_lock: TimingAccumulator,
+    range_processing: TimingAccumulator,
+    kernel_wait: TimingAccumulator,
+    index_write: TimingAccumulator,
+    forest_write: TimingAccumulator,
+    chaser_range_waits: AtomicU64,
+}
+
+impl BuildStats {
+    fn snapshot(&self) -> BuildStatistics {
+        let (ranges, average_range_lock_time) = self.range_lock.snapshot();
+        let (_, average_range_processing_time) = self.range_processing.snapshot();
+        let (kernel_blocks, average_kernel_block_wait) = self.kernel_wait.snapshot();
+        let (index_writes, average_index_write_time) = self.index_write.snapshot();
+        let (forest_writes, average_forest_write_time) = self.forest_write.snapshot();
+        BuildStatistics {
+            ranges,
+            average_range_lock_time,
+            average_range_processing_time,
+            kernel_blocks,
+            average_kernel_block_wait,
+            index_writes,
+            average_index_write_time,
+            forest_writes,
+            average_forest_write_time,
+            chaser_range_waits: self.chaser_range_waits.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -392,11 +466,13 @@ impl Availability {
         forest: &FlatForest,
         position: u64,
         spin_iterations: usize,
-    ) -> Result<ForestNodeData> {
+    ) -> Result<(ForestNodeData, bool)> {
+        let mut waited = false;
         for _ in 0..spin_iterations {
             if let Some(node) = forest.try_read(position)? {
-                return Ok(node);
+                return Ok((node, waited));
             }
+            waited = true;
             if self.aborted.load(Ordering::Acquire) {
                 bail!("forest construction aborted while waiting for position {position}");
             }
@@ -409,8 +485,9 @@ impl Availability {
             .map_err(|_| anyhow!("forest availability mutex poisoned"))?;
         loop {
             if let Some(node) = forest.try_read(position)? {
-                return Ok(node);
+                return Ok((node, waited));
             }
+            waited = true;
             if self.aborted.load(Ordering::Acquire) {
                 bail!("forest construction aborted while waiting for position {position}");
             }
@@ -425,12 +502,17 @@ impl Availability {
     }
 }
 
+struct BlockVisitResult {
+    leaves: u64,
+    kernel_wait: Duration,
+}
+
 trait BlockSource: Sync {
     fn visit_leaf_outputs(
         &self,
         height: u32,
         visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
-    ) -> Result<u64>;
+    ) -> Result<BlockVisitResult>;
 }
 
 pub struct KernelBlockSource {
@@ -520,9 +602,15 @@ impl BlockSource for KernelBlockSource {
         &self,
         height: u32,
         visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
-    ) -> Result<u64> {
+    ) -> Result<BlockVisitResult> {
+        let started = Instant::now();
         let block = self.block_at_height(height)?;
-        visit_kernel_leaf_outputs(height, &block, visitor)
+        let kernel_wait = started.elapsed();
+        let leaves = visit_kernel_leaf_outputs(height, &block, visitor)?;
+        Ok(BlockVisitResult {
+            leaves,
+            kernel_wait,
+        })
     }
 }
 
@@ -622,8 +710,9 @@ fn build_with_source<S: BlockSource, H: Hints>(
         bail!("hintsfile stop height must be greater than zero");
     }
 
+    let stats = Arc::new(BuildStats::default());
     info!("indexing leaf counts through height {stop_height}");
-    let leaf_counts = index_leaf_counts(source, stop_height, config.leaf_workers)?;
+    let leaf_counts = index_leaf_counts(source, stop_height, config.leaf_workers, &stats)?;
     let mut leaf_offsets = Vec::with_capacity(leaf_counts.len());
     let mut leaves = 0u64;
     for count in &leaf_counts {
@@ -669,6 +758,7 @@ fn build_with_source<S: BlockSource, H: Hints>(
         &availability,
         &leaf_map,
         &leaf_map_entries,
+        &stats,
     )?;
 
     let (initialized_nodes, roots) = validate_forest(&forest, leaves, forest_rows)?;
@@ -683,6 +773,20 @@ fn build_with_source<S: BlockSource, H: Hints>(
         Arc::try_unwrap(leaf_map).map_err(|_| anyhow!("leaf map still has active writers"))?;
     leaf_map.close().context("failed to close leaf map")?;
     info!("closed {leaf_map_entries} leaf positions without checkpointing");
+    let statistics = stats.snapshot();
+    info!(
+        "build stats: ranges={} avg_range_lock={:?} avg_range_processing={:?} kernel_blocks={} avg_kernel_wait={:?} index_writes={} avg_index_write={:?} forest_writes={} avg_forest_write={:?} chaser_range_waits={}",
+        statistics.ranges,
+        statistics.average_range_lock_time,
+        statistics.average_range_processing_time,
+        statistics.kernel_blocks,
+        statistics.average_kernel_block_wait,
+        statistics.index_writes,
+        statistics.average_index_write_time,
+        statistics.forest_writes,
+        statistics.average_forest_write_time,
+        statistics.chaser_range_waits,
+    );
     let file_bytes = file_nodes
         .checked_mul(size_of::<ForestNode>() as u64)
         .context("forest file size overflow")?;
@@ -694,6 +798,7 @@ fn build_with_source<S: BlockSource, H: Hints>(
         file_bytes,
         pages_locked,
         roots,
+        statistics,
     })
 }
 
@@ -711,6 +816,7 @@ fn index_leaf_counts<S: BlockSource>(
     source: &S,
     stop_height: u32,
     worker_count: usize,
+    stats: &BuildStats,
 ) -> Result<Vec<u64>> {
     let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
     let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
@@ -723,8 +829,9 @@ fn index_leaf_counts<S: BlockSource>(
                 while let Some(range) = ranges.acquire() {
                     counts.reserve(range.len());
                     for height in range {
-                        let count = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
-                        counts.push((height, count));
+                        let visit = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
+                        stats.kernel_wait.record(visit.kernel_wait);
+                        counts.push((height, visit.leaves));
                     }
                 }
                 Ok(counts)
@@ -793,6 +900,7 @@ fn run_builders<S: BlockSource, H: Hints>(
     availability: &Arc<Availability>,
     leaf_map: &Arc<Database>,
     leaf_map_entries: &Arc<AtomicU64>,
+    stats: &Arc<BuildStats>,
 ) -> Result<()> {
     thread::scope(|scope| {
         let leaf_worker_count = config
@@ -804,22 +912,19 @@ fn run_builders<S: BlockSource, H: Hints>(
         let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
 
         for worker in 0..config.chaser_workers {
-            let forest = Arc::clone(forest);
-            let availability = Arc::clone(availability);
-            let spin_iterations = config.spin_iterations;
-            let worker_count = config.chaser_workers;
+            let context = ChaserContext {
+                worker_count: config.chaser_workers,
+                leaves,
+                forest_rows,
+                spin_iterations: config.spin_iterations,
+                forest: Arc::clone(forest),
+                availability: Arc::clone(availability),
+                stats: Arc::clone(stats),
+            };
             chaser_handles.push(scope.spawn(move || {
-                let result = run_chaser(
-                    worker,
-                    worker_count,
-                    leaves,
-                    forest_rows,
-                    spin_iterations,
-                    &forest,
-                    &availability,
-                );
+                let result = run_chaser(worker, &context);
                 if result.is_err() {
-                    availability.abort();
+                    context.availability.abort();
                 }
                 result
             }));
@@ -831,16 +936,28 @@ fn run_builders<S: BlockSource, H: Hints>(
                 availability: Arc::clone(availability),
                 leaf_map: Arc::clone(leaf_map),
                 leaf_map_entries: Arc::clone(leaf_map_entries),
+                stats: Arc::clone(stats),
             };
             let ranges = Arc::clone(&ranges);
             leaf_handles.push(scope.spawn(move || {
                 let result = (|| {
-                    while let Some(range) = ranges.acquire() {
+                    loop {
+                        let lock_started = Instant::now();
+                        let Some(range) = ranges.acquire() else {
+                            break;
+                        };
+                        outputs.stats.range_lock.record(lock_started.elapsed());
+                        info!(
+                            "leaf worker {worker} acquired height range {}..={}",
+                            range.start,
+                            range.end - 1
+                        );
                         let writer = outputs
                             .leaf_map
                             .write_only()
                             .context("failed to create range leaf-map writer")?;
-                        fill_leaf_range(
+                        let processing_started = Instant::now();
+                        let processed = fill_leaf_range(
                             source,
                             hints,
                             range,
@@ -848,7 +965,12 @@ fn run_builders<S: BlockSource, H: Hints>(
                             leaf_offsets,
                             &outputs,
                             &writer,
-                        )?;
+                        );
+                        outputs
+                            .stats
+                            .range_processing
+                            .record(processing_started.elapsed());
+                        processed?;
                     }
                     Ok(())
                 })();
@@ -893,6 +1015,7 @@ struct LeafBuildOutputs {
     availability: Arc<Availability>,
     leaf_map: Arc<Database>,
     leaf_map_entries: Arc<AtomicU64>,
+    stats: Arc<BuildStats>,
 }
 
 fn fill_leaf_range<S: BlockSource, H: Hints>(
@@ -943,15 +1066,27 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
                 leaf.script_pubkey,
             );
             let bottom_position = block_offset + local_position;
-            outputs
+            let forest_write_started = Instant::now();
+            let forest_write = outputs
                 .forest
-                .write(bottom_position, ForestNodeData { hash: *hash, spent })?;
+                .write(bottom_position, ForestNodeData { hash: *hash, spent });
+            outputs
+                .stats
+                .forest_write
+                .record(forest_write_started.elapsed());
+            forest_write?;
             if !spent {
                 let key = leaf_map_key(leaf.txid, leaf.vout);
                 let value: [u8; LEAF_MAP_VALUE_SIZE] = bottom_position.to_le_bytes();
-                writer
+                let index_write_started = Instant::now();
+                let indexed = writer
                     .put_unique(&key, &value)
-                    .context("failed to index unique leaf position")?;
+                    .context("failed to index unique leaf position");
+                outputs
+                    .stats
+                    .index_write
+                    .record(index_write_started.elapsed());
+                indexed?;
                 outputs.leaf_map_entries.fetch_add(1, Ordering::Relaxed);
             }
             local_position += 1;
@@ -962,9 +1097,11 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             }
             Ok(())
         })?;
-        if visited != expected_count || local_position != expected_count {
+        outputs.stats.kernel_wait.record(visited.kernel_wait);
+        if visited.leaves != expected_count || local_position != expected_count {
             bail!(
-                "leaf count changed at height {height}: indexed {expected_count}, visited {visited}, built {local_position}"
+                "leaf count changed at height {height}: indexed {expected_count}, visited {}, built {local_position}",
+                visited.leaves
             );
         }
         if hint_position != unspent.len() {
@@ -998,15 +1135,24 @@ fn combine_children(left: ForestNodeData, right: ForestNodeData) -> ForestNodeDa
     }
 }
 
-fn run_chaser(
-    worker: usize,
+struct ChaserContext {
     worker_count: usize,
     leaves: u64,
     forest_rows: u8,
     spin_iterations: usize,
-    forest: &FlatForest,
-    availability: &Availability,
-) -> Result<()> {
+    forest: Arc<FlatForest>,
+    availability: Arc<Availability>,
+    stats: Arc<BuildStats>,
+}
+
+fn run_chaser(worker: usize, context: &ChaserContext) -> Result<()> {
+    let worker_count = context.worker_count;
+    let leaves = context.leaves;
+    let forest_rows = context.forest_rows;
+    let spin_iterations = context.spin_iterations;
+    let forest = &context.forest;
+    let availability = &context.availability;
+    let stats = &context.stats;
     let min_parent_batch = parents_per_two_child_pages();
     for row in 0..forest_rows {
         let child_count = leaves >> row;
@@ -1022,14 +1168,20 @@ fn run_chaser(
         while chunk < chunk_count {
             let parent_range = deterministic_chunk(parent_count, min_parent_batch, chunk)?;
             let last_child = child_start + parent_range.end * 2 - 1;
-            availability.read_when_ready(forest, last_child, spin_iterations)?;
+            let (_, mut range_waited) =
+                availability.read_when_ready(forest, last_child, spin_iterations)?;
 
             for parent_offset in parent_range {
                 let left_position = child_start + parent_offset * 2;
-                let left = availability.read_when_ready(forest, left_position, spin_iterations)?;
-                let right =
+                let (left, left_waited) =
+                    availability.read_when_ready(forest, left_position, spin_iterations)?;
+                let (right, right_waited) =
                     availability.read_when_ready(forest, left_position + 1, spin_iterations)?;
+                range_waited |= left_waited || right_waited;
                 forest.write(parent_start + parent_offset, combine_children(left, right))?;
+            }
+            if range_waited {
+                stats.chaser_range_waits.fetch_add(1, Ordering::Relaxed);
             }
             availability.publish()?;
             chunk = chunk
@@ -1276,7 +1428,7 @@ mod tests {
             &self,
             height: u32,
             visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
-        ) -> Result<u64> {
+        ) -> Result<BlockVisitResult> {
             let block = self
                 .blocks
                 .get((height - 1) as usize)
@@ -1330,7 +1482,10 @@ mod tests {
                     count += 1;
                 }
             }
-            Ok(count)
+            Ok(BlockVisitResult {
+                leaves: count,
+                kernel_wait: Duration::ZERO,
+            })
         }
     }
 
@@ -1500,6 +1655,10 @@ mod tests {
         assert_eq!(summary.initialized_nodes, 10);
         assert_eq!(summary.file_nodes, 15);
         assert_eq!(summary.leaf_map_entries, 4);
+        assert_eq!(summary.statistics.ranges, 1);
+        assert_eq!(summary.statistics.kernel_blocks, 4);
+        assert_eq!(summary.statistics.index_writes, 4);
+        assert_eq!(summary.statistics.forest_writes, 6);
         assert_eq!(summary.roots.len(), 2);
         assert_eq!(summary.roots[0].position, 12);
         assert_eq!(summary.roots[1].position, 10);
