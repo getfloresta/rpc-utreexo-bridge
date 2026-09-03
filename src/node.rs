@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Read;
 use std::io::Write;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::Receiver;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use bip324::GarbageResult;
 use bip324::Handshake;
@@ -66,6 +68,10 @@ pub const FILTER_TYPE_UTREEXO: u8 = 1;
 const WORKERS_PER_CLUSTER: usize = 4;
 const HANDSHAKE_WORKERS: usize = 4;
 const HANDSHAKE_QUEUE_SIZE: usize = 64;
+const MAX_PEERS: usize = 64;
+const MAX_BANNED_PEERS: usize = 4_096;
+const MAX_MESSAGES_PER_SECOND: u32 = 100;
+const RATE_LIMIT_VIOLATIONS: u8 = 3;
 const EVENT_CAPACITY: usize = 1_024;
 const READ_BUFFER_SIZE: usize = 64 * 1_024;
 const MAX_PACKET_SIZE: usize = 4_000_014;
@@ -75,7 +81,244 @@ const BIP324_KEY_SIZE: usize = 64;
 const UTXO_PROOF_INVENTORY_TYPE: u32 = 0x41000002;
 const NODE_UTREEXO: u64 = 1 << 24;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+type SharedPeerRegistry = Arc<Mutex<PeerRegistry>>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NetworkPrefix {
+    V4([u8; 2]),
+    V6([u8; 4]),
+}
+
+impl NetworkPrefix {
+    fn from_address(address: IpAddr) -> Self {
+        match Self::normalize(address) {
+            IpAddr::V4(address) => {
+                let octets = address.octets();
+                Self::V4([octets[0], octets[1]])
+            }
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                Self::V6([octets[0], octets[1], octets[2], octets[3]])
+            }
+        }
+    }
+
+    fn normalize(address: IpAddr) -> IpAddr {
+        match address {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(address)),
+            address => address,
+        }
+    }
+}
+
+struct PeerRecord {
+    address: IpAddr,
+    connected_at: Instant,
+    prefix: NetworkPrefix,
+    worker: usize,
+}
+
+enum Admission {
+    Accepted {
+        peer_id: usize,
+    },
+    Replaced {
+        evicted_peer: usize,
+        evicted_worker: usize,
+        peer_id: usize,
+    },
+    RejectedBanned,
+    RejectedCapacity,
+}
+
+struct PeerRegistry {
+    banned: HashMap<IpAddr, Instant>,
+    max_peers: usize,
+    next_peer: usize,
+    peers: HashMap<usize, PeerRecord>,
+}
+
+impl PeerRegistry {
+    fn new(max_peers: usize) -> Self {
+        Self {
+            banned: HashMap::new(),
+            max_peers,
+            next_peer: 0,
+            peers: HashMap::new(),
+        }
+    }
+
+    fn lock(registry: &SharedPeerRegistry) -> std::sync::MutexGuard<'_, Self> {
+        match registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => {
+                warn!("Recovering poisoned P2P peer registry");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn is_banned(&mut self, address: IpAddr, now: Instant) -> bool {
+        let address = NetworkPrefix::normalize(address);
+        match self.banned.get(&address).copied() {
+            Some(expires) if expires > now => true,
+            Some(_) => {
+                self.banned.remove(&address);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn admit(&mut self, address: IpAddr, worker: usize, now: Instant) -> Admission {
+        let address = NetworkPrefix::normalize(address);
+        if self.is_banned(address, now) {
+            return Admission::RejectedBanned;
+        }
+
+        if self.peers.len() < self.max_peers {
+            let peer_id = self.insert(address, worker, now);
+            return Admission::Accepted { peer_id };
+        }
+
+        let incoming_prefix = NetworkPrefix::from_address(address);
+        if self
+            .peers
+            .values()
+            .any(|peer| peer.prefix == incoming_prefix)
+        {
+            return Admission::RejectedCapacity;
+        }
+
+        let mut prefix_counts = HashMap::new();
+        for peer in self.peers.values() {
+            let count = prefix_counts.entry(peer.prefix).or_insert(0usize);
+            *count = count.saturating_add(1);
+        }
+        let Some((evicted_prefix, count)) =
+            prefix_counts.into_iter().max_by_key(|(_, count)| *count)
+        else {
+            return Admission::RejectedCapacity;
+        };
+        if count <= 1 {
+            return Admission::RejectedCapacity;
+        }
+
+        let Some((&evicted_peer, evicted_record)) = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.prefix == evicted_prefix)
+            .min_by_key(|(_, peer)| peer.connected_at)
+        else {
+            return Admission::RejectedCapacity;
+        };
+        let evicted_worker = evicted_record.worker;
+        self.peers.remove(&evicted_peer);
+        let peer_id = self.insert(address, worker, now);
+        Admission::Replaced {
+            evicted_peer,
+            evicted_worker,
+            peer_id,
+        }
+    }
+
+    fn insert(&mut self, address: IpAddr, worker: usize, now: Instant) -> usize {
+        let peer_id = self.allocate_peer_id();
+        self.peers.insert(
+            peer_id,
+            PeerRecord {
+                address,
+                connected_at: now,
+                prefix: NetworkPrefix::from_address(address),
+                worker,
+            },
+        );
+        peer_id
+    }
+
+    fn allocate_peer_id(&mut self) -> usize {
+        loop {
+            let peer_id = self.next_peer;
+            self.next_peer = self.next_peer.wrapping_add(1);
+            if !self.peers.contains_key(&peer_id) {
+                return peer_id;
+            }
+        }
+    }
+
+    fn remove(&mut self, peer_id: usize) {
+        self.peers.remove(&peer_id);
+    }
+
+    fn remove_worker(&mut self, worker: usize) {
+        self.peers.retain(|_, peer| peer.worker != worker);
+    }
+
+    fn ban(&mut self, peer_id: usize, now: Instant) -> Option<IpAddr> {
+        let peer = self.peers.remove(&peer_id)?;
+        self.banned.retain(|_, expires| *expires > now);
+        if self.banned.len() >= MAX_BANNED_PEERS {
+            if let Some(address) = self
+                .banned
+                .iter()
+                .min_by_key(|(_, expires)| *expires)
+                .map(|(address, _)| *address)
+            {
+                self.banned.remove(&address);
+            }
+        }
+        let expires = now.checked_add(BAN_DURATION).unwrap_or(now);
+        self.banned.insert(peer.address, expires);
+        Some(peer.address)
+    }
+}
+
+enum RateLimitDecision {
+    Allow,
+    Drop,
+    Ban,
+}
+
+struct MessageRateLimiter {
+    messages: u32,
+    violations: u8,
+    window_started: Instant,
+}
+
+impl MessageRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            messages: 0,
+            violations: 0,
+            window_started: now,
+        }
+    }
+
+    fn check(&mut self, now: Instant) -> RateLimitDecision {
+        if now.duration_since(self.window_started) >= Duration::from_secs(1) {
+            self.messages = 0;
+            self.violations = 0;
+            self.window_started = now;
+        }
+        self.messages = self.messages.saturating_add(1);
+        if self.messages <= MAX_MESSAGES_PER_SECOND {
+            return RateLimitDecision::Allow;
+        }
+
+        self.violations = self.violations.saturating_add(1);
+        if self.violations >= RATE_LIMIT_VIOLATIONS {
+            RateLimitDecision::Ban
+        } else {
+            RateLimitDecision::Drop
+        }
+    }
+}
 
 /// Data required by peers to answer requests.
 #[derive(Clone)]
@@ -136,7 +379,8 @@ impl Node {
         block_notifier: Receiver<BlockHash>,
     ) -> Result<(), NodeError> {
         let listener = TcpListener::bind(address).map_err(NodeError::Bind)?;
-        let workers = Self::create_workers(&worker_context)?;
+        let registry = Arc::new(Mutex::new(PeerRegistry::new(MAX_PEERS)));
+        let workers = Self::create_workers(&worker_context, &registry)?;
         let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let handshake_tx = Self::create_handshake_workers(worker_context.magic, completed_tx)?;
         let acceptor = Acceptor {
@@ -144,8 +388,8 @@ impl Node {
             completed_handshakes: completed_rx,
             handshake_workers: handshake_tx,
             listener,
-            next_peer: 0,
             next_worker: 0,
+            registry,
             workers,
         };
 
@@ -161,12 +405,15 @@ impl Node {
         Ok(())
     }
 
-    fn create_workers(context: &WorkerContext) -> Result<Vec<Sender<WorkerMessage>>, NodeError> {
+    fn create_workers(
+        context: &WorkerContext,
+        registry: &SharedPeerRegistry,
+    ) -> Result<Vec<Sender<WorkerMessage>>, NodeError> {
         let mut workers = Vec::with_capacity(WORKERS_PER_CLUSTER);
         for id in 0..WORKERS_PER_CLUSTER {
             let (sender, receiver) = std::sync::mpsc::channel();
-            let worker =
-                Worker::new(id, context.clone(), receiver).map_err(NodeError::WorkerPoll)?;
+            let worker = Worker::new(id, context.clone(), receiver, registry.clone())
+                .map_err(NodeError::WorkerPoll)?;
             std::thread::Builder::new()
                 .name(format!("bridge-p2p-worker-{id}"))
                 .spawn(move || {
@@ -237,14 +484,19 @@ impl HandshakeWorker {
             };
 
             let address = job.address;
-            match Self::perform(job, self.magic) {
-                Ok(connection) => {
+            let result =
+                std::panic::catch_unwind(AssertUnwindSafe(|| Self::perform(job, self.magic)));
+            match result {
+                Ok(Ok(connection)) => {
                     if self.completed.send(connection).is_err() {
                         return;
                     }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     debug!("P2PV2 handshake failed for {address}: {error}");
+                }
+                Err(_) => {
+                    warn!("Contained panic from P2PV2 handshake at {address}");
                 }
             }
         }
@@ -361,6 +613,7 @@ enum WorkerMessage {
         connection: Box<HandshakenConnection>,
     },
     NewBlock(BlockHash),
+    Disconnect(usize),
 }
 
 struct PeerConnection {
@@ -378,6 +631,7 @@ struct Worker {
     next_token: usize,
     peers: HashMap<Token, PeerConnection>,
     poller: mio::Poll,
+    registry: SharedPeerRegistry,
 }
 
 impl Worker {
@@ -385,6 +639,7 @@ impl Worker {
         id: usize,
         context: WorkerContext,
         messages: Receiver<WorkerMessage>,
+        registry: SharedPeerRegistry,
     ) -> std::io::Result<Self> {
         Ok(Self {
             context,
@@ -394,6 +649,7 @@ impl Worker {
             next_token: 0,
             peers: HashMap::new(),
             poller: mio::Poll::new()?,
+            registry,
         })
     }
 
@@ -416,11 +672,15 @@ impl Worker {
             match self.messages.try_recv() {
                 Ok(WorkerMessage::NewConnection { id, connection }) => {
                     if let Err(error) = self.add_peer(id, connection) {
+                        PeerRegistry::lock(&self.registry).remove(id);
                         debug!("Worker {} rejected peer {id}: {error}", self.id);
                     }
                 }
                 Ok(WorkerMessage::NewBlock(block_hash)) => {
                     self.broadcast_block(block_hash);
+                }
+                Ok(WorkerMessage::Disconnect(id)) => {
+                    self.disconnect_peer(id);
                 }
                 Err(TryRecvError::Empty) => return Ok(true),
                 Err(TryRecvError::Disconnected) => return Ok(false),
@@ -480,6 +740,16 @@ impl Worker {
             }
         }
         None
+    }
+
+    fn disconnect_peer(&mut self, id: usize) {
+        let token = self
+            .peers
+            .iter()
+            .find_map(|(token, peer)| (peer.id == id).then_some(*token));
+        if let Some(token) = token {
+            self.remove_peer(token, &PeerError::Evicted);
+        }
     }
 
     fn broadcast_block(&mut self, block_hash: BlockHash) {
@@ -578,12 +848,34 @@ impl Worker {
                 connection.id, connection.address, error
             );
         }
+        let banned_address =
+            Self::record_disconnect(&self.registry, connection.id, reason, Instant::now());
+        if let Some(address) = banned_address {
+            warn!(
+                "Banning P2PV2 peer {} at {} for excessive messages",
+                connection.id, address
+            );
+        }
         debug!(
             "P2PV2 peer {} at {} disconnected: {}",
             connection.id, connection.address, reason
         );
     }
 
+    fn record_disconnect(
+        registry: &SharedPeerRegistry,
+        peer_id: usize,
+        reason: &PeerError,
+        now: Instant,
+    ) -> Option<IpAddr> {
+        let mut registry = PeerRegistry::lock(registry);
+        if matches!(reason, PeerError::RateLimitExceeded) {
+            registry.ban(peer_id, now)
+        } else {
+            registry.remove(peer_id);
+            None
+        }
+    }
     fn protect_peer<T>(operation: impl FnOnce() -> Result<T, PeerError>) -> Result<T, PeerError> {
         match std::panic::catch_unwind(AssertUnwindSafe(operation)) {
             Ok(result) => result,
@@ -597,8 +889,8 @@ struct Acceptor {
     completed_handshakes: Receiver<HandshakenConnection>,
     handshake_workers: SyncSender<HandshakeJob>,
     listener: TcpListener,
-    next_peer: usize,
     next_worker: usize,
+    registry: SharedPeerRegistry,
     workers: Vec<Sender<WorkerMessage>>,
 }
 
@@ -639,6 +931,10 @@ impl Acceptor {
                     return;
                 }
             };
+            if PeerRegistry::lock(&self.registry).is_banned(address.ip(), Instant::now()) {
+                debug!("Rejecting banned P2P peer at {address}");
+                continue;
+            }
             let job = HandshakeJob {
                 address,
                 stream: stream.into(),
@@ -669,21 +965,60 @@ impl Acceptor {
                     return;
                 }
             };
-            let Some(worker) = self.workers.get(self.next_worker) else {
+            if self.workers.is_empty() {
                 error!("No P2P worker is available");
                 return;
-            };
-            let id = self.next_peer;
-            self.next_peer = self.next_peer.wrapping_add(1);
+            }
+            let worker_id = self.next_worker % self.workers.len();
             self.next_worker = (self.next_worker + 1) % self.workers.len();
+            let admission = PeerRegistry::lock(&self.registry).admit(
+                connection.address.ip(),
+                worker_id,
+                Instant::now(),
+            );
+            let peer_id = match admission {
+                Admission::Accepted { peer_id } => peer_id,
+                Admission::Replaced {
+                    evicted_peer,
+                    evicted_worker,
+                    peer_id,
+                } => {
+                    if let Some(worker) = self.workers.get(evicted_worker) {
+                        if worker
+                            .send(WorkerMessage::Disconnect(evicted_peer))
+                            .is_err()
+                        {
+                            warn!("P2P worker {evicted_worker} stopped");
+                            PeerRegistry::lock(&self.registry).remove_worker(evicted_worker);
+                        }
+                    }
+                    peer_id
+                }
+                Admission::RejectedBanned => {
+                    debug!("Rejecting banned P2P peer at {}", connection.address);
+                    continue;
+                }
+                Admission::RejectedCapacity => {
+                    debug!(
+                        "Rejecting P2P peer at {}: peer capacity reached",
+                        connection.address
+                    );
+                    continue;
+                }
+            };
+            let Some(worker) = self.workers.get(worker_id) else {
+                PeerRegistry::lock(&self.registry).remove(peer_id);
+                continue;
+            };
             if worker
                 .send(WorkerMessage::NewConnection {
-                    id,
+                    id: peer_id,
                     connection: Box::new(connection),
                 })
                 .is_err()
             {
-                warn!("P2P worker stopped before accepting peer {id}");
+                warn!("P2P worker stopped before accepting peer {peer_id}");
+                PeerRegistry::lock(&self.registry).remove_worker(worker_id);
             }
         }
     }
@@ -695,13 +1030,12 @@ impl Acceptor {
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => return,
             };
-            self.workers
-                .retain(|worker| worker.send(WorkerMessage::NewBlock(block_hash)).is_ok());
-            if self.workers.is_empty() {
-                error!("All P2P workers stopped");
-                return;
+            for (worker_id, worker) in self.workers.iter().enumerate() {
+                if worker.send(WorkerMessage::NewBlock(block_hash)).is_err() {
+                    warn!("P2P worker {worker_id} stopped");
+                    PeerRegistry::lock(&self.registry).remove_worker(worker_id);
+                }
             }
-            self.next_worker %= self.workers.len();
         }
     }
 }
@@ -711,6 +1045,7 @@ struct Peer {
     inbound: InboundCipher,
     outbound: OutboundCipher,
     packet_size: Option<usize>,
+    rate_limiter: MessageRateLimiter,
     read_buffer: Vec<u8>,
     read_position: usize,
     write_buffer: Vec<u8>,
@@ -725,6 +1060,7 @@ impl Peer {
             inbound,
             outbound,
             packet_size: None,
+            rate_limiter: MessageRateLimiter::new(Instant::now()),
             read_buffer: initial_bytes,
             read_position: 0,
             write_buffer: Vec::new(),
@@ -751,6 +1087,7 @@ impl Peer {
     }
 
     fn process_messages(&mut self) -> Result<(), PeerError> {
+        let now = Instant::now();
         loop {
             if self.packet_size.is_none() {
                 let length_end = self.read_position + bip324::NUM_LENGTH_BYTES;
@@ -780,7 +1117,13 @@ impl Peer {
                 .inbound
                 .decrypt_in_place(&mut self.read_buffer[self.read_position..packet_end], None)?;
             let request = if packet_type == PacketType::Genuine {
-                Some(V2Codec::decode(&message[1..])?)
+                match self.rate_limiter.check(now) {
+                    RateLimitDecision::Allow => Some(V2Codec::decode(&message[1..])?),
+                    RateLimitDecision::Drop => None,
+                    RateLimitDecision::Ban => {
+                        return Err(PeerError::RateLimitExceeded);
+                    }
+                }
             } else {
                 None
             };
@@ -1198,6 +1541,7 @@ impl V2Codec {
 enum PeerError {
     Decode(bitcoin::consensus::encode::Error),
     Disconnected,
+    Evicted,
     HeadersContainTransactions,
     Io(std::io::Error),
     MessageTooLarge(usize),
@@ -1207,6 +1551,7 @@ enum PeerError {
     Panicked,
     PoisonedProofBackend,
     Protocol(bip324::Error),
+    RateLimitExceeded,
     Storage(kv::Error),
     TooManyHeaders(u64),
     UnknownShortId(u8),
@@ -1218,6 +1563,7 @@ impl Display for PeerError {
         match self {
             Self::Decode(error) => write!(formatter, "message decode error: {error}"),
             Self::Disconnected => formatter.write_str("connection closed"),
+            Self::Evicted => formatter.write_str("evicted to preserve peer prefix diversity"),
             Self::HeadersContainTransactions => {
                 formatter.write_str("headers message contains a nonzero transaction count")
             }
@@ -1231,6 +1577,7 @@ impl Display for PeerError {
             Self::Panicked => formatter.write_str("peer operation panicked"),
             Self::PoisonedProofBackend => formatter.write_str("proof backend lock is poisoned"),
             Self::Protocol(error) => write!(formatter, "BIP 324 error: {error}"),
+            Self::RateLimitExceeded => formatter.write_str("peer exceeded the message rate limit"),
             Self::Storage(error) => write!(formatter, "peer storage error: {error}"),
             Self::TooManyHeaders(count) => {
                 write!(formatter, "headers message contains {count} headers")
@@ -1331,5 +1678,142 @@ mod tests {
         assert!(services.has(ServiceFlags::P2P_V2));
         assert!(services.has(ServiceFlags::WITNESS));
         assert!(services.has(ServiceFlags::from(NODE_UTREEXO)));
+    }
+
+    #[test]
+    fn message_rate_limiter_drops_then_bans_excess_messages() {
+        let now = Instant::now();
+        let mut limiter = MessageRateLimiter::new(now);
+        for _ in 0..MAX_MESSAGES_PER_SECOND {
+            assert!(matches!(limiter.check(now), RateLimitDecision::Allow));
+        }
+        for _ in 1..RATE_LIMIT_VIOLATIONS {
+            assert!(matches!(limiter.check(now), RateLimitDecision::Drop));
+        }
+        assert!(matches!(limiter.check(now), RateLimitDecision::Ban));
+        assert!(matches!(
+            limiter.check(now + Duration::from_secs(1)),
+            RateLimitDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn network_prefix_uses_ipv4_16_and_ipv6_32() {
+        let first_v4: IpAddr = "10.20.1.1".parse().expect("valid IPv4 address");
+        let same_v4: IpAddr = "10.20.255.1".parse().expect("valid IPv4 address");
+        let other_v4: IpAddr = "10.21.1.1".parse().expect("valid IPv4 address");
+        assert_eq!(
+            NetworkPrefix::from_address(first_v4),
+            NetworkPrefix::from_address(same_v4)
+        );
+        assert_ne!(
+            NetworkPrefix::from_address(first_v4),
+            NetworkPrefix::from_address(other_v4)
+        );
+
+        let first_v6: IpAddr = "2001:db8:1::1".parse().expect("valid IPv6 address");
+        let same_v6: IpAddr = "2001:db8:ffff::1".parse().expect("valid IPv6 address");
+        let other_v6: IpAddr = "2001:db9::1".parse().expect("valid IPv6 address");
+        assert_eq!(
+            NetworkPrefix::from_address(first_v6),
+            NetworkPrefix::from_address(same_v6)
+        );
+        assert_ne!(
+            NetworkPrefix::from_address(first_v6),
+            NetworkPrefix::from_address(other_v6)
+        );
+    }
+
+    #[test]
+    fn full_registry_evicts_oldest_peer_from_duplicate_prefix() {
+        let now = Instant::now();
+        let mut registry = PeerRegistry::new(3);
+        let first = match registry.admit("10.20.1.1".parse().expect("valid peer address"), 0, now) {
+            Admission::Accepted { peer_id } => peer_id,
+            _ => panic!("first peer should be admitted"),
+        };
+        let second = match registry.admit(
+            "10.20.2.1".parse().expect("valid peer address"),
+            1,
+            now + Duration::from_millis(1),
+        ) {
+            Admission::Accepted { peer_id } => peer_id,
+            _ => panic!("second peer should be admitted"),
+        };
+        let third = match registry.admit(
+            "11.20.1.1".parse().expect("valid peer address"),
+            2,
+            now + Duration::from_millis(2),
+        ) {
+            Admission::Accepted { peer_id } => peer_id,
+            _ => panic!("third peer should be admitted"),
+        };
+        let replacement = registry.admit(
+            "12.20.1.1".parse().expect("valid peer address"),
+            3,
+            now + Duration::from_millis(3),
+        );
+
+        let replacement = match replacement {
+            Admission::Replaced {
+                evicted_peer,
+                evicted_worker,
+                peer_id,
+            } => {
+                assert_eq!(evicted_peer, first);
+                assert_eq!(evicted_worker, 0);
+                peer_id
+            }
+            _ => panic!("new prefix should replace a duplicate-prefix peer"),
+        };
+        assert!(!registry.peers.contains_key(&first));
+        assert!(registry.peers.contains_key(&second));
+        assert!(registry.peers.contains_key(&third));
+        assert!(registry.peers.contains_key(&replacement));
+    }
+
+    #[test]
+    fn full_diverse_registry_rejects_peer_without_useful_eviction() {
+        let now = Instant::now();
+        let mut registry = PeerRegistry::new(2);
+        for address in ["10.20.1.1", "11.20.1.1"] {
+            assert!(matches!(
+                registry.admit(address.parse().expect("valid peer address"), 0, now,),
+                Admission::Accepted { .. }
+            ));
+        }
+        assert!(matches!(
+            registry.admit("12.20.1.1".parse().expect("valid peer address"), 0, now,),
+            Admission::RejectedCapacity
+        ));
+    }
+
+    #[test]
+    fn rate_limit_disconnect_keeps_ban_until_expiry() {
+        let now = Instant::now();
+        let address = "10.20.1.1".parse().expect("valid peer address");
+        let registry = Arc::new(Mutex::new(PeerRegistry::new(1)));
+        let peer_id = match PeerRegistry::lock(&registry).admit(address, 0, now) {
+            Admission::Accepted { peer_id } => peer_id,
+            _ => panic!("peer should be admitted"),
+        };
+        assert_eq!(
+            Worker::record_disconnect(&registry, peer_id, &PeerError::RateLimitExceeded, now,),
+            Some(address)
+        );
+
+        let mut registry = PeerRegistry::lock(&registry);
+        assert!(registry.is_banned(address, now));
+        assert!(matches!(
+            registry.admit(address, 0, now),
+            Admission::RejectedBanned
+        ));
+        assert!(!registry.is_banned(address, now + BAN_DURATION + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn peer_panic_is_contained_by_worker() {
+        let result: Result<(), PeerError> = Worker::protect_peer(|| panic!("malicious peer panic"));
+        assert!(matches!(result, Err(PeerError::Panicked)));
     }
 }
