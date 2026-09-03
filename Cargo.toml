@@ -14,6 +14,7 @@ categories = ["bitcoin", "tools"]
 
 [dependencies]
 bitcoin = { version = "0.32.4", features = ["serde"] }
+bip324 = "0.11.0"
 bitcoincore-rpc = "0.19"
 bitcoin_hashes = "0.11"
 rustreexo = { version = "0.4.0", features = ["with-serde"] }
