@@ -19,9 +19,9 @@
 //! ignored without invoking their potentially allocation-heavy Bitcoin
 //! decoders.
 //!
-//! Proof requests read either legacy block-plus-proof records or compact-only
-//! proof records through [`ProofBackend`]. Compact-only storage cannot answer
-//! block downloads; those requests receive `notfound`.
+//! Proof requests read compact-only records through [`ProofBackend`]. Bitcoin
+//! blocks are not retained; block downloads receive `notfound`. Headers come
+//! from the positioned header index, chain cache, or configured RPC source.
 //!
 //! # Admission and failure isolation
 //!
@@ -54,7 +54,6 @@ use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -70,6 +69,7 @@ use bip324::Role;
 use bip324::SentKey;
 use bip324::SentVersion;
 use bip324::VersionResult;
+use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
@@ -97,9 +97,10 @@ use self_cell::self_cell;
 
 use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
-use crate::blockfile::BlockFile;
 use crate::blockfile::ProofFile;
+use crate::chaininterface::Blockchain;
 use crate::chainview::ChainView;
+use crate::header_index::HeaderIndex;
 use crate::udata::CompactBlockProof;
 use crate::udata::CompactLeafData;
 
@@ -456,28 +457,14 @@ impl MessageRateLimiter {
 /// Storage used to answer BIP 183 proof requests.
 #[derive(Clone)]
 pub enum ProofBackend {
-    /// Legacy records containing both Bitcoin blocks and their proofs.
-    LegacyBlocks(Arc<RwLock<BlockFile>>),
     /// Compact proof records retained after the hintsfile boundary.
-    CompactProofs(Arc<RwLock<ProofFile>>),
+    CompactProofs(Arc<ProofFile>),
 }
 
 impl ProofBackend {
-    fn get(&self, index: BlockIndex) -> Result<Option<CompactBlockProof>, PeerError> {
+    fn get(&self, index: BlockIndex) -> Option<CompactBlockProof> {
         match self {
-            Self::LegacyBlocks(blocks) => {
-                let blocks = blocks.read().map_err(|_| PeerError::PoisonedProofBackend)?;
-                Ok(blocks.get_block(index).and_then(|block| {
-                    block.udata.map(|udata| CompactBlockProof {
-                        proof: udata.proof,
-                        leaves: udata.leaves,
-                    })
-                }))
-            }
-            Self::CompactProofs(proofs) => {
-                let proofs = proofs.read().map_err(|_| PeerError::PoisonedProofBackend)?;
-                Ok(proofs.get(&index))
-            }
+            Self::CompactProofs(proofs) => proofs.get(&index),
         }
     }
 }
@@ -485,7 +472,7 @@ impl ProofBackend {
 /// Data required by peers to answer requests.
 #[derive(Clone)]
 pub struct WorkerContext {
-    /// Compact-only proofs or legacy block-plus-proof records served to peers.
+    /// Compact proof records served to peers.
     pub proof_backend: ProofBackend,
 
     /// The index used to locate records in the selected proof backend.
@@ -493,6 +480,15 @@ pub struct WorkerContext {
 
     /// Cached active-chain metadata and headers.
     pub chainview: Arc<ChainView>,
+
+    /// Positioned active-chain headers, including history before proof generation.
+    pub header_index: Option<Arc<HeaderIndex>>,
+
+    /// RPC fallback for headers missing from local storage.
+    pub header_source: Option<Arc<dyn Blockchain>>,
+
+    /// Forest rows for records written before per-entry target metadata.
+    pub proof_forest_rows: Option<u8>,
 
     /// Network magic used by the encrypted transport.
     pub magic: Magic,
@@ -1540,13 +1536,14 @@ impl Peer {
                 );
                 self.send_message(NetworkMessage::Version(VersionMessage {
                     version: 70016,
-                    services: Self::advertised_services(&self.context.proof_backend),
+                    services: Self::advertised_services(),
                     timestamp: version.timestamp.saturating_add(1),
                     receiver: version.sender.clone(),
                     sender: version.receiver,
                     nonce: version.nonce.wrapping_add(100),
                     user_agent: "/bridge:0.1.3/".to_string(),
-                    start_height: self.context.proof_index.load_height() as i32,
+                    start_height: i32::try_from(self.context.proof_index.load_height()?)
+                        .unwrap_or(i32::MAX),
                     relay: false,
                 }))?;
                 self.send_message(NetworkMessage::Verack)?;
@@ -1569,28 +1566,8 @@ impl Peer {
         if inventory.len() > MAX_GETDATA_ITEMS as usize {
             return Err(PeerError::TooManyInventoryItems(inventory.len() as u64));
         }
-        let mut not_found = Vec::new();
-        for item in inventory {
-            if let Inventory::WitnessBlock(block_hash) = item {
-                let Some(index) = self.context.proof_index.get_index(block_hash) else {
-                    not_found.push(Inventory::WitnessBlock(block_hash));
-                    continue;
-                };
-                let block = match &self.context.proof_backend {
-                    ProofBackend::LegacyBlocks(blocks) => blocks
-                        .read()
-                        .map_err(|_| PeerError::PoisonedProofBackend)?
-                        .get_block(index),
-                    ProofBackend::CompactProofs(_) => None,
-                };
-                match block {
-                    Some(block) => self.send_message(NetworkMessage::Block(block.into()))?,
-                    None => not_found.push(Inventory::WitnessBlock(block_hash)),
-                }
-            }
-        }
-        if !not_found.is_empty() {
-            self.send_message(NetworkMessage::NotFound(not_found))?;
+        if !inventory.is_empty() {
+            self.send_message(NetworkMessage::NotFound(inventory))?;
         }
         Ok(())
     }
@@ -1601,12 +1578,18 @@ impl Peer {
         {
             return Err(PeerError::ProofBitmapTooLarge);
         }
-        let Some(index) = self.context.proof_index.get_index(request.block_hash) else {
+        let Some(index) = self.context.proof_index.get_index(request.block_hash)? else {
             return Ok(());
         };
-        let Some(stored_proof) = self.context.proof_backend.get(index)? else {
+        let proof_forest_rows = index.proof_forest_rows.or(self.context.proof_forest_rows);
+        let Some(mut stored_proof) = self.context.proof_backend.get(index) else {
             return Ok(());
         };
+        if let Some(forest_rows) = proof_forest_rows {
+            for target in &mut stored_proof.proof.targets {
+                target.0 = translate_position_to_wire(target.0, forest_rows);
+            }
+        }
         let proof = UtreexoProof {
             block_hash: request.block_hash,
             proof_hashes: if request.include_all {
@@ -1642,47 +1625,142 @@ impl Peer {
         &self,
         request: &GetHeadersMessage,
     ) -> Result<Vec<bitcoin::block::Header>, PeerError> {
-        if request.locator_hashes.len() > MAX_LOCATOR_HASHES as usize {
-            return Err(PeerError::TooManyLocatorHashes(
-                request.locator_hashes.len() as u64,
-            ));
-        }
-        let mut common_height = 0;
-        for block_hash in &request.locator_hashes {
-            if let Some(height) = self.context.chainview.get_height(*block_hash)? {
-                common_height = height;
-                break;
-            }
-        }
-
-        let start = common_height.saturating_add(1);
-        let end = start.saturating_add(MAX_HEADERS as u32);
-        let mut headers = Vec::with_capacity(MAX_HEADERS as usize);
-        for height in start..end {
-            let Some(block_hash) = self.context.chainview.get_block_hash(height)? else {
-                break;
-            };
-            let Some(header) = self.context.chainview.get_block(block_hash)? else {
-                break;
-            };
-            headers.push(deserialize(&header)?);
-            if request.stop_hash != BlockHash::all_zeros() && request.stop_hash == block_hash {
-                break;
-            }
-        }
-        Ok(headers)
+        headers_for_request(
+            &self.context.chainview,
+            self.context.header_index.as_deref(),
+            self.context.header_source.as_deref(),
+            request,
+        )
     }
 
-    fn advertised_services(backend: &ProofBackend) -> ServiceFlags {
-        let services =
-            ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO);
-        match backend {
-            ProofBackend::LegacyBlocks(_) => {
-                services | ServiceFlags::NETWORK_LIMITED | ServiceFlags::NETWORK
-            }
-            ProofBackend::CompactProofs(_) => services,
+    fn advertised_services() -> ServiceFlags {
+        ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO)
+    }
+}
+
+/// Convert row-relative flat-forest positions to the 63-row BIP 183 wire forest.
+fn translate_position_to_wire(position: u64, forest_rows: u8) -> u64 {
+    let mut marker = 1u64 << forest_rows;
+    let mut row = 0u8;
+    while position & marker != 0 {
+        marker >>= 1;
+        row += 1;
+    }
+    if row == 0 {
+        return position;
+    }
+    let row_start = |rows: u8| {
+        u64::try_from((2u128 << rows) - (2u128 << (rows - row)))
+            .expect("63-row forest positions fit in u64")
+    };
+    position - row_start(forest_rows) + row_start(63)
+}
+
+fn headers_for_request(
+    chainview: &ChainView,
+    header_index: Option<&HeaderIndex>,
+    header_source: Option<&dyn Blockchain>,
+    request: &GetHeadersMessage,
+) -> Result<Vec<Header>, PeerError> {
+    if request.locator_hashes.len() > MAX_LOCATOR_HASHES as usize {
+        return Err(PeerError::TooManyLocatorHashes(
+            request.locator_hashes.len() as u64,
+        ));
+    }
+    let common_height = active_locator_height(
+        chainview,
+        header_index,
+        header_source,
+        &request.locator_hashes,
+    )?;
+    let start = common_height.saturating_add(1);
+    let end = match header_source {
+        Some(source) => u32::try_from(source.get_block_count()?)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+            .min(start.saturating_add(MAX_HEADERS as u32)),
+        None => start.saturating_add(MAX_HEADERS as u32),
+    };
+    let mut headers = Vec::with_capacity(end.saturating_sub(start) as usize);
+    for height in start..end {
+        let Some((block_hash, header)) =
+            header_at_height(chainview, header_index, header_source, height)?
+        else {
+            break;
+        };
+        headers.push(header);
+        if request.stop_hash != BlockHash::all_zeros() && request.stop_hash == block_hash {
+            break;
         }
     }
+    Ok(headers)
+}
+
+fn active_locator_height(
+    chainview: &ChainView,
+    header_index: Option<&HeaderIndex>,
+    header_source: Option<&dyn Blockchain>,
+    locator_hashes: &[BlockHash],
+) -> Result<u32, PeerError> {
+    for block_hash in locator_hashes {
+        if let Some(index) = header_index {
+            if let Some(height) = index.get_height(*block_hash)? {
+                return Ok(height);
+            }
+        }
+        if let Some(height) = chainview.get_height(*block_hash)? {
+            return Ok(height);
+        }
+        let Some(source) = header_source else {
+            continue;
+        };
+        let Ok(height) = source.get_block_height(*block_hash) else {
+            continue;
+        };
+        let Ok(active_hash) = source.get_block_hash(height as u64) else {
+            continue;
+        };
+        if active_hash == *block_hash {
+            let header = source.get_block_header(*block_hash)?;
+            if let Some(index) = header_index {
+                index.put(height, &header)?;
+            }
+            chainview.save_height(*block_hash, height)?;
+            chainview.save_block_hash(height, *block_hash)?;
+            return Ok(height);
+        }
+    }
+    Ok(0)
+}
+
+fn header_at_height(
+    chainview: &ChainView,
+    header_index: Option<&HeaderIndex>,
+    header_source: Option<&dyn Blockchain>,
+    height: u32,
+) -> Result<Option<(BlockHash, Header)>, PeerError> {
+    if let Some(index) = header_index {
+        if let Some(header) = index.get_by_height(height)? {
+            return Ok(Some((header.block_hash(), header)));
+        }
+    }
+    if let Some(block_hash) = chainview.get_block_hash(height)? {
+        if let Some(header) = chainview.get_block(block_hash)? {
+            return Ok(Some((block_hash, deserialize(&header)?)));
+        }
+    }
+    let Some(source) = header_source else {
+        return Ok(None);
+    };
+    let block_hash = source.get_block_hash(height as u64)?;
+    let header = source.get_block_header(block_hash)?;
+    if let Some(index) = header_index {
+        index.put(height, &header)?;
+    }
+    chainview.save_block_hash(height, block_hash)?;
+    chainview.save_height(block_hash, height)?;
+    chainview.save_header(block_hash, bitcoin::consensus::serialize(&header))?;
+    Ok(Some((block_hash, header)))
 }
 
 /// BIP 183 `getuproof` request carried under P2PV2 short message ID 30.
@@ -2032,10 +2110,10 @@ enum PeerError {
     MissingShortId,
     NoPeerToken,
     Panicked,
-    PoisonedProofBackend,
     ProofBitmapTooLarge,
     Protocol(bip324::Error),
     RateLimitExceeded,
+    Rpc(anyhow::Error),
     Storage(kv::Error),
     TooManyInventoryItems(u64),
     TooManyLocatorHashes(u64),
@@ -2068,10 +2146,10 @@ impl Display for PeerError {
             Self::MissingShortId => formatter.write_str("P2PV2 message has no short ID"),
             Self::NoPeerToken => formatter.write_str("no peer token is available"),
             Self::Panicked => formatter.write_str("peer operation panicked"),
-            Self::PoisonedProofBackend => formatter.write_str("proof backend lock is poisoned"),
             Self::ProofBitmapTooLarge => formatter.write_str("BIP 183 proof bitmap is too large"),
             Self::Protocol(error) => write!(formatter, "BIP 324 error: {error}"),
             Self::RateLimitExceeded => formatter.write_str("peer exceeded the message rate limit"),
+            Self::Rpc(error) => write!(formatter, "header RPC error: {error:#}"),
             Self::Storage(error) => write!(formatter, "peer storage error: {error}"),
             Self::TooManyInventoryItems(count) => {
                 write!(
@@ -2123,6 +2201,12 @@ impl From<std::io::Error> for PeerError {
     }
 }
 
+impl From<anyhow::Error> for PeerError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Rpc(error)
+    }
+}
+
 impl From<kv::Error> for PeerError {
     fn from(error: kv::Error) -> Self {
         Self::Storage(error)
@@ -2140,10 +2224,166 @@ mod tests {
 
     use crate::udata::BatchProof;
     use crate::udata::ScriptPubkeyType;
-    use crate::udata::UData;
-    use crate::udata::UtreexoBlock;
 
     use super::*;
+
+    struct HeaderSource {
+        headers: Vec<Header>,
+        side_hash: BlockHash,
+    }
+
+    impl Blockchain for HeaderSource {
+        fn get_block(&self, _block_hash: BlockHash) -> anyhow::Result<bitcoin::Block> {
+            anyhow::bail!("unexpected get_block")
+        }
+
+        fn get_block_hash(&self, height: u64) -> anyhow::Result<BlockHash> {
+            self.headers
+                .get(height as usize)
+                .map(Header::block_hash)
+                .ok_or_else(|| anyhow::anyhow!("unknown height {height}"))
+        }
+
+        fn get_block_height(&self, block_hash: BlockHash) -> anyhow::Result<u32> {
+            if block_hash == self.side_hash {
+                return Ok(2);
+            }
+            self.headers
+                .iter()
+                .position(|header| header.block_hash() == block_hash)
+                .map(|height| height as u32)
+                .ok_or_else(|| anyhow::anyhow!("unknown block {block_hash}"))
+        }
+
+        fn get_block_header(&self, block_hash: BlockHash) -> anyhow::Result<Header> {
+            self.headers
+                .iter()
+                .find(|header| header.block_hash() == block_hash)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unknown block {block_hash}"))
+        }
+
+        fn get_block_count(&self) -> anyhow::Result<u64> {
+            Ok(self.headers.len() as u64 - 1)
+        }
+
+        fn get_raw_transaction_info(
+            &self,
+            _txid: &bitcoin::Txid,
+        ) -> anyhow::Result<crate::chaininterface::TransactionInfo> {
+            anyhow::bail!("unexpected get_raw_transaction_info")
+        }
+
+        fn get_mtp(&self, _block_hash: BlockHash) -> anyhow::Result<u32> {
+            anyhow::bail!("unexpected get_mtp")
+        }
+    }
+
+    fn header_chain(length: usize) -> Vec<Header> {
+        let mut headers = vec![bitcoin::constants::genesis_block(bitcoin::Network::Signet).header];
+        while headers.len() < length {
+            let previous = *headers.last().unwrap();
+            headers.push(Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: headers.len() as u32,
+            });
+        }
+        headers
+    }
+
+    #[test]
+    fn serves_active_locator_headers_through_stop_hash_and_caches_them() {
+        let headers = header_chain(8);
+        let side_hash = BlockHash::from_byte_array([9; 32]);
+        let source = HeaderSource {
+            headers: headers.clone(),
+            side_hash,
+        };
+        let root =
+            std::env::temp_dir().join(format!("bridge-node-active-locator-{}", std::process::id()));
+        let mut context = test_worker_context(&root);
+        context.header_source = Some(Arc::new(source));
+        let mut peer = Peer::new(context).unwrap();
+        let request = GetHeadersMessage::new(
+            vec![side_hash, headers[2].block_hash()],
+            headers[5].block_hash(),
+        );
+        let served = peer.headers_for_request(&request).unwrap();
+        assert_eq!(served, headers[3..=5]);
+        assert_eq!(
+            peer.context.chainview.get_block_hash(5).unwrap(),
+            Some(headers[5].block_hash())
+        );
+
+        peer.context.header_source = None;
+        assert_eq!(peer.headers_for_request(&request).unwrap(), served);
+        drop(peer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn serves_headers_from_positioned_header_index_without_rpc() {
+        let headers = header_chain(8);
+        let root =
+            std::env::temp_dir().join(format!("bridge-node-header-index-{}", std::process::id()));
+        let mut context = test_worker_context(&root);
+        let index =
+            HeaderIndex::create(&root.join("headers.dat"), &root.join("hashes"), 7, 1).unwrap();
+        for (height, header) in headers.iter().enumerate() {
+            index.put(height as u32, header).unwrap();
+        }
+        index.sync().unwrap();
+        context.header_index = Some(Arc::new(index));
+        let peer = Peer::new(context).unwrap();
+        let request =
+            GetHeadersMessage::new(vec![headers[2].block_hash()], headers[5].block_hash());
+        assert_eq!(peer.headers_for_request(&request).unwrap(), headers[3..=5]);
+        drop(peer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn header_requests_remain_bounded_with_rpc_fallback() {
+        let headers = header_chain(MAX_HEADERS as usize + 2);
+        let root =
+            std::env::temp_dir().join(format!("bridge-node-header-bounds-{}", std::process::id()));
+        let mut context = test_worker_context(&root);
+        context.header_source = Some(Arc::new(HeaderSource {
+            headers: headers.clone(),
+            side_hash: BlockHash::all_zeros(),
+        }));
+        let peer = Peer::new(context).unwrap();
+        let oversized = GetHeadersMessage::new(
+            vec![headers[0].block_hash(); MAX_LOCATOR_HASHES as usize + 1],
+            BlockHash::all_zeros(),
+        );
+        assert!(matches!(
+            peer.headers_for_request(&oversized),
+            Err(PeerError::TooManyLocatorHashes(_))
+        ));
+        let request = GetHeadersMessage::new(vec![headers[0].block_hash()], BlockHash::all_zeros());
+        assert_eq!(
+            peer.headers_for_request(&request).unwrap(),
+            headers[1..=MAX_HEADERS as usize]
+        );
+        drop(peer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flat_forest_targets_translate_to_wire_positions() {
+        assert_eq!(translate_position_to_wire(3, 3), 3);
+        assert_eq!(translate_position_to_wire(9, 3), (1u64 << 63) + 1);
+        assert_eq!(translate_position_to_wire(12, 3), 3u64 << 62);
+        assert_eq!(
+            translate_position_to_wire((1u64 << 63) + 1, 63),
+            (1u64 << 63) + 1
+        );
+    }
 
     #[test]
     fn p2pv2_codec_handles_supported_inbound_and_outbound_bip183_messages() {
@@ -2302,13 +2542,16 @@ mod tests {
             .expect("open test database")
         };
         WorkerContext {
-            proof_backend: ProofBackend::LegacyBlocks(Arc::new(RwLock::new(
-                BlockFile::new(root.join("blocks.dat"), 1024 * 1024).expect("open test block file"),
-            ))),
+            proof_backend: ProofBackend::CompactProofs(Arc::new(
+                ProofFile::new(root.join("proofs.dat")).expect("open test proof file"),
+            )),
             proof_index: Arc::new(BlocksIndex {
                 database: store("index"),
             }),
             chainview: Arc::new(ChainView::new(store("chainview"))),
+            header_index: None,
+            header_source: None,
+            proof_forest_rows: None,
             magic: Magic::REGTEST,
         }
     }
@@ -2366,16 +2609,12 @@ mod tests {
     }
 
     #[test]
-    fn slow_and_malformed_peers_do_not_block_bip183_proof_service() {
-        exercise_proof_service(false);
-    }
-
-    #[test]
     fn slow_and_malformed_peers_do_not_block_compact_bip183_proof_service() {
-        exercise_proof_service(true);
+        exercise_proof_service(None);
+        exercise_proof_service(Some(3));
     }
 
-    fn exercise_proof_service(compact: bool) {
+    fn exercise_proof_service(entry_forest_rows: Option<u8>) {
         let storage = std::env::temp_dir().join(format!(
             "bridge-worker-test-{}-{}",
             std::process::id(),
@@ -2385,18 +2624,14 @@ mod tests {
                 .as_nanos()
         ));
         let mut context = test_worker_context(&storage);
-        if compact {
-            context.proof_backend = ProofBackend::CompactProofs(Arc::new(RwLock::new(
-                ProofFile::new(storage.join("proofs.dat")).expect("open test proof file"),
-            )));
-        }
-        let services = Peer::advertised_services(&context.proof_backend);
+        context.proof_forest_rows = Some(4);
+        let services = Peer::advertised_services();
         assert!(services.has(ServiceFlags::P2P_V2));
         assert!(services.has(ServiceFlags::WITNESS));
         assert!(services.has(ServiceFlags::from(1 << 12)));
         assert!(!services.has(ServiceFlags::from(1 << 24)));
-        assert_eq!(services.has(ServiceFlags::NETWORK), !compact);
-        assert_eq!(services.has(ServiceFlags::NETWORK_LIMITED), !compact);
+        assert!(!services.has(ServiceFlags::NETWORK));
+        assert!(!services.has(ServiceFlags::NETWORK_LIMITED));
         let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         let block_hash = block.block_hash();
         let proof_hash = BlockHash::from_byte_array([1; 32]);
@@ -2405,39 +2640,28 @@ mod tests {
             amount: 5_000,
             spk_ty: ScriptPubkeyType::PubKeyHash,
         };
-        let stored_block = UtreexoBlock {
-            block,
-            udata: Some(UData {
-                remember_idx: Vec::new(),
-                proof: BatchProof {
-                    targets: vec![VarInt(7)],
-                    hashes: vec![proof_hash],
-                },
-                leaves: vec![leaf.clone()],
-            }),
+        let stored_proof = CompactBlockProof {
+            proof: BatchProof {
+                targets: vec![VarInt(9)],
+                hashes: vec![proof_hash],
+            },
+            leaves: vec![leaf.clone()],
         };
-        let index = match &context.proof_backend {
-            ProofBackend::LegacyBlocks(blocks) => blocks
-                .write()
-                .expect("lock test block file")
-                .append(&stored_block),
-            ProofBackend::CompactProofs(proofs) => {
-                let udata = stored_block.udata.expect("test block has a proof");
-                proofs
-                    .write()
-                    .expect("lock test proof file")
-                    .append(&CompactBlockProof {
-                        proof: udata.proof,
-                        leaves: udata.leaves,
-                    })
-                    .expect("append compact proof")
-            }
-        };
-        context.proof_index.append(index, block_hash);
+        let ProofBackend::CompactProofs(proofs) = &context.proof_backend;
+        let mut index = proofs.append(&stored_proof).expect("append compact proof");
+        index.proof_forest_rows = entry_forest_rows;
+        context
+            .proof_index
+            .append(index, block_hash)
+            .expect("index compact proof");
         let expected_proof = UtreexoProof {
             block_hash,
             proof_hashes: vec![proof_hash],
-            target_locations: vec![VarInt(7)],
+            target_locations: vec![VarInt(if entry_forest_rows.is_some() {
+                (1u64 << 63) + 1
+            } else {
+                9
+            })],
             leaf_data: vec![leaf],
         };
 
@@ -2568,19 +2792,11 @@ mod tests {
             .contents()
             .split_first()
             .expect("block response short ID");
-        if compact {
-            assert_eq!(*short_id, 17);
-            assert_eq!(
-                deserialize::<Vec<Inventory>>(payload).expect("decode notfound"),
-                vec![Inventory::WitnessBlock(block_hash)]
-            );
-        } else {
-            assert_eq!(*short_id, 2);
-            assert_eq!(
-                deserialize::<bitcoin::Block>(payload).expect("decode block"),
-                bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
-            );
-        }
+        assert_eq!(*short_id, 17);
+        assert_eq!(
+            deserialize::<Vec<Inventory>>(payload).expect("decode notfound"),
+            vec![Inventory::WitnessBlock(block_hash)]
+        );
 
         drop(protocol);
         drop(malicious_protocol);
@@ -2779,4 +2995,3 @@ mod tests {
         assert!(matches!(result, Err(PeerError::Panicked)));
     }
 }
-

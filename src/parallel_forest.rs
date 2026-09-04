@@ -3,14 +3,18 @@
 //! Linux-only, parallel construction of a position-addressed Utreexo forest.
 
 use std::cell::UnsafeCell;
+use std::collections::hash_map::Entry;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::mem::size_of;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -25,16 +29,27 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::forest_journal::ForestJournal;
+use crate::forest_journal::JournalEntry;
+use crate::forest_journal::JournalForestDelta;
+use crate::forest_journal::JournalIndexDelta;
+use crate::forest_journal::JournalNodeState;
+use crate::header_index::HeaderBuildWriter;
+use crate::header_index::HeaderIndex;
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
+use ahash::AHashMap;
+use ahash::AHashSet;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::OutPoint;
 use bitcoin::Txid;
 use bitcoinkernel::prelude::BlockHashExt;
+use bitcoinkernel::prelude::BlockHeaderExt;
 use bitcoinkernel::prelude::ScriptPubkeyExt;
 use bitcoinkernel::prelude::TransactionExt;
 use bitcoinkernel::prelude::TxInExt;
@@ -46,20 +61,25 @@ use bitcoinkernel::ChainType;
 use bitcoinkernel::ChainstateManager;
 use bitcoinkernel::Context as KernelContext;
 use bitcoinkernel::ContextBuilder;
+use bridge::prefixed_hints::BridgeHints;
 use db_experiment::Config as LeafMapConfig;
 use db_experiment::Database;
 use db_experiment::Mode;
 use db_experiment::WriteOnlyWriter;
-use hintsfile::Hintsfile;
+use log::debug;
 use log::info;
 use log::warn;
 #[cfg(test)]
 use memmap2::Mmap;
 use memmap2::MmapMut;
 use memmap2::MmapOptions;
-use rustreexo::accumulator::node_hash::AccumulatorHash;
-use rustreexo::accumulator::node_hash::BitcoinNodeHash;
-use rustreexo::accumulator::proof::Proof;
+use memmap2::RemapOptions;
+use rayon::prelude::*;
+use rustreexo::node_hash::AccumulatorHash;
+use rustreexo::node_hash::BitcoinNodeHash;
+#[cfg(test)]
+use rustreexo::proof::Proof;
+const MIN_PARALLEL_PLANNING_NODES: usize = 128;
 
 const READY: u8 = 1 << 0;
 const SPENT: u8 = 1 << 1;
@@ -67,6 +87,10 @@ const HEIGHT_CHUNK_SIZE: u64 = 4;
 const WRITING: u8 = 1 << 2;
 const DEFAULT_SPIN_ITERATIONS: usize = 512;
 const STEADY_LEAF_MAP_HEADROOM: u64 = 1 << 30;
+const RESIZE_MARKER_MAGIC: &[u8; 8] = b"FRSIZE01";
+const RESIZE_MARKER_LEN: usize = RESIZE_MARKER_MAGIC.len() + 3;
+const RESIZE_STAGE_COPYING: u8 = 0;
+const RESIZE_STAGE_CLEARING: u8 = 1;
 const BIP30_FIRST_TXID_91722: &str =
     "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468";
 const BIP30_FIRST_TXID_91812: &str =
@@ -84,6 +108,7 @@ struct LeafOutput<'a> {
     txid: [u8; 32],
     vout: u32,
     is_coinbase: bool,
+    force_unindexed: bool,
     value: u64,
     script_pubkey: &'a [u8],
 }
@@ -111,6 +136,9 @@ pub struct ForestNodeData {
 pub struct ParallelForestConfig {
     pub forest_path: PathBuf,
     pub leaf_map_path: PathBuf,
+    pub header_file_path: PathBuf,
+    pub header_index_path: PathBuf,
+    pub minimum_leaf_capacity: Option<u64>,
     pub leaf_workers: usize,
     pub chaser_workers: usize,
     pub spin_iterations: usize,
@@ -120,6 +148,8 @@ pub struct ParallelForestConfig {
 impl ParallelForestConfig {
     pub fn new(forest_path: PathBuf) -> Self {
         let leaf_map_path = forest_path.with_extension("leaf-map");
+        let header_file_path = forest_path.with_extension("headers");
+        let header_index_path = forest_path.with_extension("header-index");
         let threads = thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -129,6 +159,9 @@ impl ParallelForestConfig {
             forest_path,
             leaf_map_path,
             leaf_workers,
+            header_file_path,
+            header_index_path,
+            minimum_leaf_capacity: None,
             chaser_workers,
             spin_iterations: DEFAULT_SPIN_ITERATIONS,
             lock_pages: true,
@@ -274,9 +307,99 @@ impl FlatForestReader {
 
 struct FlatForest {
     map: MmapMut,
-    _file: File,
+    file: File,
+    path: PathBuf,
     node_count: u64,
+    lock_pages: bool,
     pages_locked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeMarker {
+    old_rows: u8,
+    new_rows: u8,
+    stage: u8,
+}
+
+fn resize_marker_path(forest_path: &Path) -> PathBuf {
+    forest_path.with_extension("resize")
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .with_context(|| format!("failed to open directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", parent.display()))
+}
+
+fn read_resize_marker(forest_path: &Path) -> Result<Option<ResizeMarker>> {
+    let marker_path = resize_marker_path(forest_path);
+    let bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", marker_path.display()));
+        }
+    };
+    if bytes.len() != RESIZE_MARKER_LEN
+        || &bytes[..RESIZE_MARKER_MAGIC.len()] != RESIZE_MARKER_MAGIC
+    {
+        bail!("invalid forest resize marker {}", marker_path.display());
+    }
+    let marker = ResizeMarker {
+        old_rows: bytes[RESIZE_MARKER_MAGIC.len()],
+        new_rows: bytes[RESIZE_MARKER_MAGIC.len() + 1],
+        stage: bytes[RESIZE_MARKER_MAGIC.len() + 2],
+    };
+    if marker.new_rows <= marker.old_rows
+        || !matches!(marker.stage, RESIZE_STAGE_COPYING | RESIZE_STAGE_CLEARING)
+    {
+        bail!("invalid forest resize state in {}", marker_path.display());
+    }
+    Ok(Some(marker))
+}
+
+fn write_resize_marker(forest_path: &Path, marker: ResizeMarker) -> Result<()> {
+    let marker_path = resize_marker_path(forest_path);
+    let mut bytes = Vec::with_capacity(RESIZE_MARKER_LEN);
+    bytes.extend_from_slice(RESIZE_MARKER_MAGIC);
+    bytes.extend_from_slice(&[marker.old_rows, marker.new_rows, marker.stage]);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)
+        .with_context(|| format!("failed to create {}", marker_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write {}", marker_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", marker_path.display()))?;
+    sync_parent_directory(&marker_path)
+}
+
+fn update_resize_marker_stage(forest_path: &Path, stage: u8) -> Result<()> {
+    let marker_path = resize_marker_path(forest_path);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&marker_path)
+        .with_context(|| format!("failed to open {}", marker_path.display()))?;
+    FileExt::write_all_at(&file, &[stage], (RESIZE_MARKER_MAGIC.len() + 2) as u64)
+        .with_context(|| format!("failed to update {}", marker_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", marker_path.display()))
+}
+
+fn forest_rows_from_node_count(node_count: u64) -> Result<u8> {
+    let positional_size = node_count
+        .checked_add(1)
+        .context("forest position count overflow")?;
+    if positional_size < 2 || !positional_size.is_power_of_two() {
+        bail!("forest contains {node_count} nodes, not a complete positional space");
+    }
+    u8::try_from(positional_size.ilog2() - 1).context("forest height exceeds u8")
 }
 
 // Each position has exactly one writer. `ForestNode::flags` publishes the non-atomic hash bytes
@@ -299,6 +422,20 @@ impl FlatForest {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create forest directory {}", parent.display())
             })?;
+        }
+
+        let resize_marker = resize_marker_path(path);
+        match std::fs::remove_file(&resize_marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove stale forest resize marker {}",
+                        resize_marker.display()
+                    )
+                });
+            }
         }
 
         let byte_len = node_count
@@ -329,8 +466,10 @@ impl FlatForest {
             .context("failed to map forest file")?;
         let mut forest = Self {
             map,
-            _file: file,
+            file,
+            path: path.to_path_buf(),
             node_count,
+            lock_pages,
             pages_locked: false,
         };
         forest.prepare_residency(lock_pages);
@@ -360,12 +499,218 @@ impl FlatForest {
             .with_context(|| format!("failed to map forest file {}", path.display()))?;
         let mut forest = Self {
             map,
-            _file: file,
+            file,
+            path: path.to_path_buf(),
             node_count,
+            lock_pages,
             pages_locked: false,
         };
+        forest.resume_resize_if_needed()?;
         forest.prepare_residency(lock_pages);
         Ok(forest)
+    }
+
+    fn resume_resize_if_needed(&mut self) -> Result<()> {
+        let Some(marker) = read_resize_marker(&self.path)? else {
+            return Ok(());
+        };
+        self.resume_resize(marker)
+    }
+
+    fn resize_to_rows(&mut self, new_rows: u8) -> Result<()> {
+        self.resume_resize_if_needed()?;
+        let old_rows = forest_rows_from_node_count(self.node_count)?;
+        if new_rows <= old_rows {
+            self.prepare_residency(self.lock_pages);
+            return Ok(());
+        }
+        let marker = ResizeMarker {
+            old_rows,
+            new_rows,
+            stage: RESIZE_STAGE_COPYING,
+        };
+        write_resize_marker(&self.path, marker)?;
+        self.resume_resize(marker)?;
+        self.prepare_residency(self.lock_pages);
+        Ok(())
+    }
+
+    fn resume_resize(&mut self, mut marker: ResizeMarker) -> Result<()> {
+        let old_node_count = forest_capacity(marker.old_rows)?;
+        let new_node_count = forest_capacity(marker.new_rows)?;
+        let valid_node_count = match marker.stage {
+            RESIZE_STAGE_COPYING => {
+                self.node_count == old_node_count || self.node_count == new_node_count
+            }
+            RESIZE_STAGE_CLEARING => self.node_count == new_node_count,
+            _ => false,
+        };
+        if !valid_node_count {
+            bail!(
+                "forest resize {} -> {} rows at stage {} found unexpected node count {}",
+                marker.old_rows,
+                marker.new_rows,
+                marker.stage,
+                self.node_count
+            );
+        }
+
+        if marker.stage == RESIZE_STAGE_COPYING {
+            self.grow_mapping(old_node_count, new_node_count)?;
+            self.copy_internal_rows(marker.old_rows, marker.new_rows)?;
+            self.map
+                .flush()
+                .context("failed to flush relocated forest rows")?;
+            self.file
+                .sync_data()
+                .context("failed to sync relocated forest rows")?;
+            update_resize_marker_stage(&self.path, RESIZE_STAGE_CLEARING)?;
+            marker.stage = RESIZE_STAGE_CLEARING;
+        }
+
+        if marker.stage == RESIZE_STAGE_CLEARING {
+            self.clear_new_bottom_range(marker.old_rows, marker.new_rows)?;
+            self.map.flush().context("failed to flush resized forest")?;
+            self.file
+                .sync_data()
+                .context("failed to sync resized forest")?;
+            let marker_path = resize_marker_path(&self.path);
+            std::fs::remove_file(&marker_path)
+                .with_context(|| format!("failed to remove {}", marker_path.display()))?;
+            sync_parent_directory(&marker_path)?;
+        }
+        Ok(())
+    }
+
+    fn grow_mapping(&mut self, old_node_count: u64, new_node_count: u64) -> Result<()> {
+        let node_size = size_of::<ForestNode>() as u64;
+        let old_byte_len = old_node_count
+            .checked_mul(node_size)
+            .context("old forest file size overflow")?;
+        let new_byte_len = new_node_count
+            .checked_mul(node_size)
+            .context("new forest file size overflow")?;
+        let allocation_offset = libc::off_t::try_from(old_byte_len)
+            .context("forest allocation offset exceeds off_t")?;
+        let allocation_len = libc::off_t::try_from(new_byte_len - old_byte_len)
+            .context("forest allocation length exceeds off_t")?;
+
+        if self.node_count == old_node_count {
+            self.map
+                .flush()
+                .context("failed to flush forest before resizing")?;
+            self.file
+                .set_len(new_byte_len)
+                .context("failed to extend forest file")?;
+        }
+        let allocation_result = unsafe {
+            libc::posix_fallocate(self.file.as_raw_fd(), allocation_offset, allocation_len)
+        };
+        if allocation_result != 0 {
+            if self.node_count == old_node_count {
+                let _ = self.file.set_len(old_byte_len);
+            }
+            return Err(std::io::Error::from_raw_os_error(allocation_result))
+                .context("failed to preallocate forest resize");
+        }
+        if self.node_count == new_node_count {
+            return Ok(());
+        }
+
+        self.unlock_pages();
+        let map_len = usize::try_from(new_byte_len)
+            .context("resized forest does not fit this address space")?;
+        // The file is extended and preallocated above, and the forest mutex prevents references
+        // into this mapping from surviving a move.
+        unsafe { self.map.remap(map_len, RemapOptions::new().may_move(true)) }
+            .context("failed to remap resized forest")?;
+        self.node_count = new_node_count;
+        Ok(())
+    }
+
+    fn copy_internal_rows(&mut self, old_rows: u8, new_rows: u8) -> Result<()> {
+        let node_size = size_of::<ForestNode>();
+        for row in 1..=old_rows {
+            let node_count = 1u64 << (old_rows - row);
+            let source = start_position_at_row(row, old_rows)?;
+            let destination = start_position_at_row(row, new_rows)?;
+            let source_byte = usize::try_from(source)
+                .context("forest source position exceeds usize")?
+                .checked_mul(node_size)
+                .context("forest source byte offset overflow")?;
+            let byte_len = usize::try_from(node_count)
+                .context("forest row length exceeds usize")?
+                .checked_mul(node_size)
+                .context("forest row byte length overflow")?;
+            let destination_byte = usize::try_from(destination)
+                .context("forest destination position exceeds usize")?
+                .checked_mul(node_size)
+                .context("forest destination byte offset overflow")?;
+            self.map
+                .copy_within(source_byte..source_byte + byte_len, destination_byte);
+        }
+        Ok(())
+    }
+
+    fn clear_new_bottom_range(&mut self, old_rows: u8, new_rows: u8) -> Result<()> {
+        let old_capacity = 1u64
+            .checked_shl(u32::from(old_rows))
+            .context("old forest bottom capacity overflow")?;
+        let new_capacity = 1u64
+            .checked_shl(u32::from(new_rows))
+            .context("new forest bottom capacity overflow")?;
+        let node_size = size_of::<ForestNode>() as u64;
+        let byte_offset = old_capacity
+            .checked_mul(node_size)
+            .context("forest clear offset overflow")?;
+        let byte_len = (new_capacity - old_capacity)
+            .checked_mul(node_size)
+            .context("forest clear length overflow")?;
+        let offset =
+            libc::off_t::try_from(byte_offset).context("forest clear offset exceeds off_t")?;
+        let length =
+            libc::off_t::try_from(byte_len).context("forest clear length exceeds off_t")?;
+        let result = unsafe {
+            libc::fallocate(
+                self.file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset,
+                length,
+            )
+        };
+        if result == 0 {
+            let allocation_result =
+                unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, length) };
+            if allocation_result != 0 {
+                return Err(std::io::Error::from_raw_os_error(allocation_result))
+                    .context("failed to reallocate resized forest bottom row");
+            }
+            return Ok(());
+        }
+
+        warn!(
+            "could not punch old forest rows while resizing: {}; zeroing through the mapping",
+            std::io::Error::last_os_error()
+        );
+        let start = usize::try_from(byte_offset).context("forest clear offset exceeds usize")?;
+        let len = usize::try_from(byte_len).context("forest clear length exceeds usize")?;
+        self.map[start..start + len].fill(0);
+        Ok(())
+    }
+
+    fn unlock_pages(&mut self) {
+        if !self.pages_locked {
+            return;
+        }
+        if unsafe { libc::munlock(self.map.as_mut_ptr().cast::<libc::c_void>(), self.map.len()) }
+            != 0
+        {
+            warn!(
+                "failed to unlock forest pages before resizing: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        self.pages_locked = false;
     }
 
     fn prepare_residency(&mut self, lock_pages: bool) {
@@ -432,27 +777,30 @@ impl FlatForest {
         Ok(())
     }
 
-    fn overwrite(&self, position: u64, value: ForestNodeData) -> Result<()> {
-        let node = self.node(position)?;
-        let previous = node.flags.swap(WRITING, Ordering::AcqRel);
-        if previous & READY == 0 || previous & WRITING != 0 {
-            node.flags.store(previous, Ordering::Release);
-            bail!("forest position {position} cannot be overwritten from flags {previous:#04x}");
-        }
-        unsafe {
-            *node.hash.get() = value.hash;
-        }
-        let flags = READY | if value.spent { SPENT } else { 0 };
-        node.flags.store(flags, Ordering::Release);
-        Ok(())
+    fn journal_state(&self, position: u64) -> Result<JournalNodeState> {
+        Ok(match self.try_read(position)? {
+            Some(node) => JournalNodeState {
+                ready: true,
+                spent: node.spent,
+                hash: node.hash,
+            },
+            None => JournalNodeState::UNINITIALIZED,
+        })
     }
 
-    fn store(&self, position: u64, value: ForestNodeData) -> Result<()> {
-        if self.try_read(position)?.is_some() {
-            self.overwrite(position, value)
-        } else {
-            self.write(position, value)
+    fn set_journal_state(&self, position: u64, state: JournalNodeState) -> Result<()> {
+        let node = self.node(position)?;
+        node.flags.store(WRITING, Ordering::Release);
+        unsafe {
+            *node.hash.get() = state.hash;
         }
+        let flags = if state.ready {
+            READY | if state.spent { SPENT } else { 0 }
+        } else {
+            0
+        };
+        node.flags.store(flags, Ordering::Release);
+        Ok(())
     }
 
     fn flush(&self) -> Result<()> {
@@ -563,6 +911,8 @@ impl Availability {
 struct BlockVisitResult {
     leaves: u64,
     kernel_wait: Duration,
+    header: [u8; 80],
+    block_hash: [u8; 32],
 }
 
 trait BlockSource: Sync {
@@ -571,6 +921,7 @@ trait BlockSource: Sync {
         height: u32,
         visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
     ) -> Result<BlockVisitResult>;
+    fn header(&self, height: u32) -> Result<([u8; 80], [u8; 32])>;
 }
 
 pub struct KernelBlockSource {
@@ -664,26 +1015,42 @@ impl BlockSource for KernelBlockSource {
         let started = Instant::now();
         let block = self.block_at_height(height)?;
         let kernel_wait = started.elapsed();
+        let header = block.header();
+        let header_bytes = header.consensus_encode()?;
+        let block_hash = header.hash().to_bytes();
         let leaves = visit_kernel_leaf_outputs(height, &block, visitor)?;
         Ok(BlockVisitResult {
             leaves,
             kernel_wait,
+            header: header_bytes,
+            block_hash,
         })
+    }
+
+    fn header(&self, height: u32) -> Result<([u8; 80], [u8; 32])> {
+        let block = self.block_at_height(height)?;
+        let header = block.header();
+        Ok((header.consensus_encode()?, header.hash().to_bytes()))
     }
 }
 
 trait Hints: Sync {
     fn stop_height(&self) -> u32;
+    fn leaf_count_at_height(&self, height: u32) -> Option<u32>;
     fn indices_at_height(&self, height: u32) -> Option<Vec<u32>>;
 }
 
-impl Hints for Hintsfile {
+impl Hints for BridgeHints {
     fn stop_height(&self) -> u32 {
-        Hintsfile::stop_height(self)
+        BridgeHints::stop_height(self)
+    }
+
+    fn leaf_count_at_height(&self, height: u32) -> Option<u32> {
+        BridgeHints::leaf_count_at_height(self, height)
     }
 
     fn indices_at_height(&self, height: u32) -> Option<Vec<u32>> {
-        Hintsfile::indices_at_height(self, height)
+        BridgeHints::indices_at_height(self, height)
     }
 }
 
@@ -751,21 +1118,15 @@ pub struct SteadyStateForest {
     forest_rows: u8,
 }
 
+struct PlannedNode {
+    before: JournalNodeState,
+    after: ForestNodeData,
+}
+
 impl SteadyStateForest {
     pub fn open(forest_path: &Path, leaf_map_path: &Path, lock_pages: bool) -> Result<Self> {
         let forest = FlatForest::open(forest_path, lock_pages)?;
-        let positional_size = forest
-            .node_count
-            .checked_add(1)
-            .context("forest position count overflow")?;
-        if positional_size < 2 || !positional_size.is_power_of_two() {
-            bail!(
-                "forest contains {} nodes, not a complete positional space",
-                forest.node_count
-            );
-        }
-        let forest_rows =
-            u8::try_from(positional_size.ilog2() - 1).context("forest height exceeds u8")?;
+        let forest_rows = forest_rows_from_node_count(forest.node_count)?;
         let bottom_capacity = 1u64
             .checked_shl(u32::from(forest_rows))
             .context("forest bottom capacity overflow")?;
@@ -808,6 +1169,32 @@ impl SteadyStateForest {
     pub fn leaves(&self) -> u64 {
         self.leaves
     }
+    pub(crate) fn forest_rows(&self) -> u8 {
+        self.forest_rows
+    }
+
+    pub(crate) fn leaf_capacity(&self) -> Result<u64> {
+        1u64.checked_shl(u32::from(self.forest_rows))
+            .context("forest bottom capacity overflow")
+    }
+
+    pub(crate) fn ensure_leaf_capacity(&mut self, required_leaves: u64) -> Result<bool> {
+        let current_capacity = self.leaf_capacity()?;
+        if required_leaves <= current_capacity {
+            return Ok(false);
+        }
+        let new_rows = tree_rows(required_leaves);
+        let new_capacity = 1u64
+            .checked_shl(u32::from(new_rows))
+            .context("resized forest bottom capacity overflow")?;
+        info!(
+            "Growing flat forest online: rows={} -> {new_rows} leaf_capacity={current_capacity} -> {new_capacity}",
+            self.forest_rows
+        );
+        self.forest.resize_to_rows(new_rows)?;
+        self.forest_rows = new_rows;
+        Ok(true)
+    }
 
     pub fn roots(&self) -> Result<Vec<BitcoinNodeHash>> {
         let mut roots = Vec::with_capacity(self.leaves.count_ones() as usize);
@@ -820,7 +1207,7 @@ impl SteadyStateForest {
                 .forest
                 .try_read(position)?
                 .ok_or_else(|| anyhow!("root position {position} is uninitialized"))?;
-            roots.push(BitcoinNodeHash::from(node.hash));
+            roots.push(accumulator_hash(node));
         }
         Ok(roots)
     }
@@ -853,6 +1240,79 @@ impl SteadyStateForest {
         Ok(position)
     }
 
+    pub(crate) fn repair_leaf_position(&self, outpoint: &OutPoint, position: u64) -> Result<()> {
+        if position >= self.leaves {
+            bail!(
+                "cannot map {outpoint} to position {position} beyond {} leaves",
+                self.leaves
+            );
+        }
+        let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
+        self.leaf_map.put(&key, &position.to_le_bytes())?;
+        self.leaf_map
+            .sync()
+            .context("failed to sync repaired leaf map")
+    }
+    pub(crate) fn recover_leaf_position_from_block(
+        &self,
+        target: OutPoint,
+        target_hash: BitcoinNodeHash,
+        block_leaves: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<u64> {
+        let target_index = block_leaves
+            .iter()
+            .position(|(outpoint, _)| *outpoint == target)
+            .map(|index| index as u64)
+            .ok_or_else(|| anyhow!("outpoint {target} is not an eligible leaf in its block"))?;
+
+        let mut block_start = None;
+        for (local_index, (outpoint, leaf_hash)) in block_leaves.iter().enumerate() {
+            let Ok(position) = self.leaf_position(outpoint) else {
+                continue;
+            };
+            if self.leaf_hash(position).ok().as_ref() != Some(leaf_hash) {
+                continue;
+            }
+            let Some(start) = position.checked_sub(local_index as u64) else {
+                continue;
+            };
+            match block_start {
+                Some(previous) if previous != start => {
+                    block_start = None;
+                    break;
+                }
+                None => block_start = Some(start),
+                _ => {}
+            }
+        }
+
+        if let Some(block_start) = block_start {
+            let position = block_start
+                .checked_add(target_index)
+                .context("recovered leaf position overflow")?;
+            if self
+                .forest
+                .try_read(position)?
+                .is_some_and(|node| !node.spent && node.hash == *target_hash)
+            {
+                return Ok(position);
+            }
+        }
+
+        for position in 0..self.leaves {
+            let Some(node) = self.forest.try_read(position)? else {
+                continue;
+            };
+            if !node.spent && node.hash == *target_hash {
+                return Ok(position);
+            }
+        }
+        bail!(
+            "could not recover outpoint {target} from its {}-leaf block range",
+            block_leaves.len()
+        )
+    }
+
     pub fn leaf_hash(&self, bottom_position: u64) -> Result<BitcoinNodeHash> {
         let node = self
             .forest
@@ -866,39 +1326,67 @@ impl SteadyStateForest {
 
     /// Converts a stable bottom position into its position in the promoted, sparse forest.
     pub fn proof_position(&self, bottom_position: u64) -> Result<u64> {
+        self.proof_position_with_overlay(bottom_position, self.leaves, &AHashMap::new())
+    }
+
+    pub(crate) fn proof_position_with_overlay(
+        &self,
+        bottom_position: u64,
+        leaves: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+    ) -> Result<u64> {
         let mut original_position = bottom_position;
         let mut branch_directions = Vec::new();
-        while !is_root_position(original_position, self.leaves, self.forest_rows) {
+        while !is_root_position(original_position, leaves, self.forest_rows) {
             let sibling_position = original_position ^ 1;
-            let sibling = self
-                .forest
-                .try_read(sibling_position)?
-                .ok_or_else(|| anyhow!("sibling position {sibling_position} is uninitialized"))?;
+            let sibling = self.read_with_overlay(sibling_position, overlay)?;
             if !sibling.spent {
                 branch_directions.push(original_position & 1 != 0);
             }
             original_position = parent(original_position, self.forest_rows);
         }
 
-        let mut promoted_position = original_position;
+        // Preallocated storage rows are not part of the Utreexo proof coordinate system. Convert
+        // the physical root and descent to the canonical row count implied by numleaves.
+        let root_row = detect_row(original_position, self.forest_rows);
+        let logical_rows = tree_rows(leaves);
+        let mut promoted_position = root_position(leaves, root_row, logical_rows);
         for is_right in branch_directions.into_iter().rev() {
-            promoted_position =
-                left_child(promoted_position, self.forest_rows) + u64::from(is_right);
+            promoted_position = left_child(promoted_position, logical_rows) + u64::from(is_right);
         }
         Ok(promoted_position)
     }
 
-    fn containing_root(&self, position: u64) -> Result<(u64, u8)> {
+    fn read_with_overlay(
+        &self,
+        position: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+    ) -> Result<ForestNodeData> {
+        if let Some(state) = overlay.get(&position) {
+            if !state.ready {
+                bail!("forest position {position} is uninitialized");
+            }
+            return Ok(ForestNodeData {
+                hash: state.hash,
+                spent: state.spent,
+            });
+        }
+        self.forest
+            .try_read(position)?
+            .ok_or_else(|| anyhow!("forest position {position} is uninitialized"))
+    }
+
+    fn containing_root(&self, position: u64, leaves: u64) -> Result<(u64, u8)> {
         let position_row = detect_row(position, self.forest_rows);
         for root_row in position_row..=self.forest_rows {
-            if self.leaves & (1u64 << root_row) == 0 {
+            if leaves & (1u64 << root_row) == 0 {
                 continue;
             }
             let mut ancestor = position;
             for _ in position_row..root_row {
                 ancestor = parent(ancestor, self.forest_rows);
             }
-            let root = root_position(self.leaves, root_row, self.forest_rows);
+            let root = root_position(leaves, root_row, self.forest_rows);
             if ancestor == root {
                 return Ok((root, root_row));
             }
@@ -906,8 +1394,17 @@ impl SteadyStateForest {
         bail!("position {position} is not below a populated root")
     }
 
-    fn compressed_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
-        let (root, mut original_row) = self.containing_root(position)?;
+    // Proof positions use the canonical row count; storage positions use the preallocated
+    // capacity. Row-local offsets are stable between the two layouts.
+    fn compressed_hash(
+        &self,
+        position: u64,
+        logical_rows: u8,
+        leaves: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+    ) -> Result<BitcoinNodeHash> {
+        let position = translate_position(position, logical_rows, self.forest_rows)?;
+        let (root, mut original_row) = self.containing_root(position, leaves)?;
         let mut directions = Vec::new();
         let mut logical_position = position;
         while logical_position != root {
@@ -922,14 +1419,8 @@ impl SteadyStateForest {
                     bail!("compressed position {position} descends below the bottom row");
                 }
                 let left_position = left_child(original_position, self.forest_rows);
-                let left = self
-                    .forest
-                    .try_read(left_position)?
-                    .ok_or_else(|| anyhow!("left child {left_position} is uninitialized"))?;
-                let right = self
-                    .forest
-                    .try_read(left_position + 1)?
-                    .ok_or_else(|| anyhow!("right child {} is uninitialized", left_position + 1))?;
+                let left = self.read_with_overlay(left_position, overlay)?;
+                let right = self.read_with_overlay(left_position + 1, overlay)?;
                 original_row -= 1;
                 match (left.spent, right.spent) {
                     (true, true) => {
@@ -945,37 +1436,166 @@ impl SteadyStateForest {
             }
         }
 
-        let node = self
-            .forest
-            .try_read(original_position)?
-            .ok_or_else(|| anyhow!("compressed node {original_position} is uninitialized"))?;
+        let node = self.read_with_overlay(original_position, overlay)?;
         if node.spent {
             bail!("compressed position {position} resolves to an empty subtree");
         }
         Ok(BitcoinNodeHash::from(node.hash))
     }
 
+    #[cfg(test)]
     pub fn prove(&self, targets: &[u64]) -> Result<Proof<BitcoinNodeHash>> {
-        let proof_positions = get_proof_positions(targets, self.leaves, self.forest_rows);
-        let hashes = proof_positions
+        let logical_rows = tree_rows(self.leaves);
+        let overlay = AHashMap::new();
+        let hashes = get_proof_positions(targets, self.leaves, logical_rows)
             .into_iter()
-            .map(|position| self.compressed_hash(position))
+            .map(|position| self.compressed_hash(position, logical_rows, self.leaves, &overlay))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Proof::new_with_hash(targets.to_vec(), hashes))
+        let targets = targets
+            .iter()
+            .map(|position| translate_position(*position, logical_rows, 63))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Proof::new_with_hash(targets, hashes))
     }
 
-    pub fn delete(&mut self, deletions: &[(OutPoint, u64)]) -> Result<()> {
-        let mut positions = BTreeSet::new();
-        for (outpoint, position) in deletions {
-            let indexed = self.leaf_position(outpoint)?;
-            if indexed != *position {
-                bail!("outpoint {outpoint} moved from requested position {position} to {indexed}");
+    pub(crate) fn position_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
+        self.position_hash_with_overlay(position, self.leaves, &AHashMap::new())
+    }
+
+    pub(crate) fn position_hash_with_overlay(
+        &self,
+        position: u64,
+        leaves: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+    ) -> Result<BitcoinNodeHash> {
+        self.compressed_hash(position, tree_rows(leaves), leaves, overlay)
+    }
+
+    fn staged_read(
+        forest: &FlatForest,
+        overlay: &AHashMap<u64, JournalNodeState>,
+        nodes: &AHashMap<u64, PlannedNode>,
+        position: u64,
+    ) -> Result<ForestNodeData> {
+        if let Some(node) = nodes.get(&position) {
+            return Ok(node.after);
+        }
+        if let Some(state) = overlay.get(&position) {
+            if !state.ready {
+                bail!("forest position {position} is uninitialized");
             }
-            let node = self
-                .forest
-                .try_read(*position)?
-                .expect("leaf_position checked initialization");
-            self.forest.overwrite(
+            return Ok(ForestNodeData {
+                hash: state.hash,
+                spent: state.spent,
+            });
+        }
+        forest
+            .try_read(position)?
+            .ok_or_else(|| anyhow!("forest position {position} is uninitialized"))
+    }
+
+    fn stage_node(
+        forest: &FlatForest,
+        overlay: &AHashMap<u64, JournalNodeState>,
+        nodes: &mut AHashMap<u64, PlannedNode>,
+        position: u64,
+        after: ForestNodeData,
+    ) -> Result<()> {
+        match nodes.entry(position) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().after = after;
+            }
+            Entry::Vacant(entry) => {
+                let before = overlay
+                    .get(&position)
+                    .copied()
+                    .map(Ok)
+                    .unwrap_or_else(|| forest.journal_state(position))?;
+                entry.insert(PlannedNode { before, after });
+            }
+        }
+        Ok(())
+    }
+
+    /// Computes a complete block mutation without writing the forest or leaf map.
+    #[cfg(test)]
+    pub(crate) fn plan_update(
+        &mut self,
+        height: u32,
+        block_hash: BlockHash,
+        previous_block_hash: BlockHash,
+        deletions: &[(OutPoint, u64)],
+        additions: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<JournalEntry> {
+        let required_leaves = self
+            .leaves
+            .checked_add(additions.len() as u64)
+            .context("leaf count overflow")?;
+        self.ensure_leaf_capacity(required_leaves)?;
+        self.plan_update_without_resize(
+            height,
+            block_hash,
+            previous_block_hash,
+            deletions,
+            additions,
+        )
+    }
+
+    ///
+    /// Deletion positions must come from this forest's leaf map in the same serialized update.
+    pub(crate) fn plan_update_without_resize(
+        &self,
+        height: u32,
+        block_hash: BlockHash,
+        previous_block_hash: BlockHash,
+        deletions: &[(OutPoint, u64)],
+        additions: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<JournalEntry> {
+        self.plan_update_with_overlay(
+            height,
+            block_hash,
+            previous_block_hash,
+            self.leaves,
+            &AHashMap::new(),
+            deletions,
+            additions,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_update_with_overlay(
+        &self,
+        height: u32,
+        block_hash: BlockHash,
+        previous_block_hash: BlockHash,
+        base_leaves: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+        deletions: &[(OutPoint, u64)],
+        additions: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<JournalEntry> {
+        let bottom_capacity = 1u64
+            .checked_shl(u32::from(self.forest_rows))
+            .context("forest bottom capacity overflow")?;
+        let final_leaves = base_leaves
+            .checked_add(additions.len() as u64)
+            .context("leaf count overflow")?;
+        if final_leaves > bottom_capacity {
+            bail!("flat forest capacity {bottom_capacity} is exhausted by {final_leaves} leaves");
+        }
+
+        let estimated_nodes = deletions
+            .len()
+            .saturating_mul(usize::from(self.forest_rows) + 1)
+            .saturating_add(additions.len().saturating_mul(2));
+        let mut nodes = AHashMap::with_capacity(estimated_nodes);
+        let mut positions = AHashSet::with_capacity(deletions.len());
+        let mut removed = Vec::with_capacity(deletions.len());
+        for (outpoint, position) in deletions {
+            let node = Self::staged_read(&self.forest, overlay, &nodes, *position)?;
+            Self::stage_node(
+                &self.forest,
+                overlay,
+                &mut nodes,
                 *position,
                 ForestNodeData {
                     hash: node.hash,
@@ -983,91 +1603,203 @@ impl SteadyStateForest {
                 },
             )?;
             positions.insert(*position);
+            removed.push(JournalIndexDelta {
+                outpoint: *outpoint,
+                position: *position,
+            });
         }
 
+        let forest = &self.forest;
+        let forest_rows = self.forest_rows;
         while !positions.is_empty() {
-            let parents: BTreeSet<u64> = positions
+            let mut parents: Vec<u64> = positions
                 .iter()
-                .filter(|position| !is_root_position(**position, self.leaves, self.forest_rows))
-                .map(|position| parent(*position, self.forest_rows))
+                .filter(|position| !is_root_position(**position, base_leaves, forest_rows))
+                .map(|position| parent(*position, forest_rows))
+                .collect::<AHashSet<_>>()
+                .into_iter()
                 .collect();
-            for parent_position in &parents {
-                let left_position = left_child(*parent_position, self.forest_rows);
-                let left = self
-                    .forest
-                    .try_read(left_position)?
-                    .ok_or_else(|| anyhow!("left child {left_position} is uninitialized"))?;
-                let right = self
-                    .forest
-                    .try_read(left_position + 1)?
-                    .ok_or_else(|| anyhow!("right child {} is uninitialized", left_position + 1))?;
-                self.forest
-                    .overwrite(*parent_position, combine_children(left, right))?;
+            parents.sort_unstable();
+            let staged_parents = if parents.len() >= MIN_PARALLEL_PLANNING_NODES {
+                parents
+                    .par_iter()
+                    .map(|parent_position| {
+                        let left_position = left_child(*parent_position, forest_rows);
+                        let result = Self::staged_read(forest, overlay, &nodes, left_position)
+                            .and_then(|left| {
+                                Self::staged_read(forest, overlay, &nodes, left_position + 1)
+                                    .map(|right| combine_children(left, right))
+                            });
+                        (*parent_position, result)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                parents
+                    .iter()
+                    .map(|parent_position| {
+                        let left_position = left_child(*parent_position, forest_rows);
+                        let result = Self::staged_read(forest, overlay, &nodes, left_position)
+                            .and_then(|left| {
+                                Self::staged_read(forest, overlay, &nodes, left_position + 1)
+                                    .map(|right| combine_children(left, right))
+                            });
+                        (*parent_position, result)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (parent_position, after) in staged_parents {
+                Self::stage_node(&self.forest, overlay, &mut nodes, parent_position, after?)?;
             }
-            positions = parents;
+            positions = parents.into_iter().collect();
         }
 
-        for (outpoint, _) in deletions {
-            let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
-            if !self
-                .leaf_map
-                .delete(&key)
-                .context("failed to delete leaf-map entry")?
-            {
-                bail!("outpoint {outpoint} disappeared from the leaf map");
-            }
-        }
-        Ok(())
-    }
-
-    pub fn add(&mut self, additions: &[(OutPoint, BitcoinNodeHash)]) -> Result<()> {
-        let bottom_capacity = 1u64
-            .checked_shl(u32::from(self.forest_rows))
-            .context("forest bottom capacity overflow")?;
-        let final_leaves = self
-            .leaves
-            .checked_add(additions.len() as u64)
-            .context("leaf count overflow")?;
-        if final_leaves > bottom_capacity {
-            bail!("flat forest capacity {bottom_capacity} is exhausted by {final_leaves} leaves");
-        }
-
+        let mut leaves = base_leaves;
+        let mut added = Vec::with_capacity(additions.len());
         for (outpoint, hash) in additions {
-            let bottom_position = self.leaves;
-            self.forest.store(
+            let bottom_position = leaves;
+            Self::stage_node(
+                &self.forest,
+                overlay,
+                &mut nodes,
                 bottom_position,
                 ForestNodeData {
                     hash: **hash,
                     spent: false,
                 },
             )?;
-
             let mut position = bottom_position;
             let mut row = 0u8;
-            while self.leaves & (1u64 << row) != 0 {
-                let left_position = root_position(self.leaves, row, self.forest_rows);
-                let left = self
-                    .forest
-                    .try_read(left_position)?
-                    .ok_or_else(|| anyhow!("addition root {left_position} is uninitialized"))?;
-                let right = self
-                    .forest
-                    .try_read(position)?
-                    .ok_or_else(|| anyhow!("addition node {position} is uninitialized"))?;
+            while leaves & (1u64 << row) != 0 {
+                let left_position = root_position(leaves, row, self.forest_rows);
+                let left = Self::staged_read(&self.forest, overlay, &nodes, left_position)?;
+                let right = Self::staged_read(&self.forest, overlay, &nodes, position)?;
                 position = parent(position, self.forest_rows);
-                self.forest.store(position, combine_children(left, right))?;
+                Self::stage_node(
+                    &self.forest,
+                    overlay,
+                    &mut nodes,
+                    position,
+                    combine_children(left, right),
+                )?;
                 row += 1;
             }
+            added.push(JournalIndexDelta {
+                outpoint: *outpoint,
+                position: bottom_position,
+            });
+            leaves += 1;
+        }
 
-            let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
-            if !self
-                .leaf_map
-                .put_new(&key, &bottom_position.to_le_bytes())
-                .context("failed to insert leaf-map entry")?
-            {
-                bail!("outpoint {outpoint} already exists in the leaf map");
+        let mut forest = nodes
+            .into_iter()
+            .map(|(position, node)| JournalForestDelta {
+                position,
+                before: node.before,
+                after: JournalNodeState {
+                    ready: true,
+                    spent: node.after.spent,
+                    hash: node.after.hash,
+                },
+            })
+            .collect::<Vec<_>>();
+        forest.sort_unstable_by_key(|delta| delta.position);
+        Ok(JournalEntry {
+            height,
+            block_hash,
+            num_leaves: leaves,
+            previous_block_hash,
+            forest,
+            removed,
+            added,
+        })
+    }
+
+    pub fn roots_after(&self, entry: &JournalEntry) -> Result<Vec<BitcoinNodeHash>> {
+        self.roots_after_with_overlay(entry, self.leaves, &AHashMap::new())
+    }
+
+    pub(crate) fn roots_after_with_overlay(
+        &self,
+        entry: &JournalEntry,
+        base_leaves: u64,
+        overlay: &AHashMap<u64, JournalNodeState>,
+    ) -> Result<Vec<BitcoinNodeHash>> {
+        if entry.previous_num_leaves()? != base_leaves {
+            bail!(
+                "planned update begins with {} leaves, planner has {base_leaves}",
+                entry.previous_num_leaves()?
+            );
+        }
+        let changed: AHashMap<u64, JournalNodeState> = entry
+            .forest
+            .iter()
+            .map(|delta| (delta.position, delta.after))
+            .collect();
+        let mut roots = Vec::with_capacity(entry.num_leaves.count_ones() as usize);
+        for row in (0..=self.forest_rows).rev() {
+            if entry.num_leaves & (1u64 << row) == 0 {
+                continue;
             }
-            self.leaves += 1;
+            let position = root_position(entry.num_leaves, row, self.forest_rows);
+            let state = match changed.get(&position).or_else(|| overlay.get(&position)) {
+                Some(state) => *state,
+                None => self.forest.journal_state(position)?,
+            };
+            if !state.ready {
+                bail!("planned root position {position} is uninitialized");
+            }
+            roots.push(accumulator_hash(ForestNodeData {
+                hash: state.hash,
+                spent: state.spent,
+            }));
+        }
+        Ok(roots)
+    }
+
+    pub fn apply_forward(&mut self, entry: &JournalEntry) -> Result<()> {
+        for delta in &entry.forest {
+            self.forest.set_journal_state(delta.position, delta.after)?;
+        }
+        for delta in &entry.removed {
+            let key = leaf_map_key(delta.outpoint.txid.to_byte_array(), delta.outpoint.vout);
+            self.leaf_map.delete(&key)?;
+        }
+        for delta in &entry.added {
+            let key = leaf_map_key(delta.outpoint.txid.to_byte_array(), delta.outpoint.vout);
+            self.leaf_map.put(&key, &delta.position.to_le_bytes())?;
+        }
+        self.leaves = entry.num_leaves;
+        Ok(())
+    }
+
+    pub fn apply_backward(&mut self, entry: &JournalEntry) -> Result<()> {
+        for delta in entry.forest.iter().rev() {
+            self.forest
+                .set_journal_state(delta.position, delta.before)?;
+        }
+        for delta in &entry.added {
+            let key = leaf_map_key(delta.outpoint.txid.to_byte_array(), delta.outpoint.vout);
+            self.leaf_map.delete(&key)?;
+        }
+        for delta in &entry.removed {
+            let key = leaf_map_key(delta.outpoint.txid.to_byte_array(), delta.outpoint.vout);
+            self.leaf_map.put(&key, &delta.position.to_le_bytes())?;
+        }
+        self.leaves = entry.previous_num_leaves()?;
+        Ok(())
+    }
+
+    pub fn replay_journal(&mut self, journal: &ForestJournal) -> Result<()> {
+        for record in journal.records().iter().rev() {
+            self.apply_backward(&record.entry)?;
+        }
+        for record in journal.records() {
+            if record.status == crate::forest_journal::JournalStatus::Forward {
+                self.apply_forward(&record.entry)?;
+            }
+        }
+        if !journal.records().is_empty() {
+            self.sync()?;
         }
         Ok(())
     }
@@ -1081,7 +1813,7 @@ impl SteadyStateForest {
 /// Build and persist a complete flat forest through the hintsfile's stop height.
 pub fn build_parallel_forest(
     source: &KernelBlockSource,
-    hints: &Hintsfile,
+    hints: &BridgeHints,
     config: ParallelForestConfig,
 ) -> Result<ForestBuildSummary> {
     if hints.stop_height() > source.tip_height() {
@@ -1106,8 +1838,15 @@ fn build_with_source<S: BlockSource, H: Hints>(
     }
 
     let stats = Arc::new(BuildStats::default());
-    info!("indexing leaf counts through height {stop_height}");
-    let leaf_counts = index_leaf_counts(source, stop_height, config.leaf_workers, &stats)?;
+    let leaf_count_capacity =
+        usize::try_from(stop_height).context("hints stop height exceeds usize")?;
+    let mut leaf_counts = Vec::with_capacity(leaf_count_capacity);
+    for height in 1..=stop_height {
+        let count = hints
+            .leaf_count_at_height(height)
+            .ok_or_else(|| anyhow!("leaf count unavailable at height {height}"))?;
+        leaf_counts.push(u64::from(count));
+    }
     let mut leaf_offsets = Vec::with_capacity(leaf_counts.len());
     let mut leaves = 0u64;
     for count in &leaf_counts {
@@ -1121,13 +1860,28 @@ fn build_with_source<S: BlockSource, H: Hints>(
     }
     let live_leaves = count_hinted_leaves(hints, stop_height, config.leaf_workers)?;
 
-    let forest_rows = tree_rows(leaves);
+    let capacity_leaves = config.minimum_leaf_capacity.unwrap_or(leaves);
+    if capacity_leaves < leaves {
+        bail!("configured forest capacity {capacity_leaves} is below {leaves} bootstrap leaves");
+    }
+    let forest_rows = tree_rows(capacity_leaves);
     let file_nodes = forest_capacity(forest_rows)?;
     let leaf_map = Arc::new(create_leaf_map(
         &config.leaf_map_path,
         live_leaves,
         config.leaf_workers,
     )?);
+    let header_index = Arc::new(HeaderIndex::create(
+        &config.header_file_path,
+        &config.header_index_path,
+        stop_height,
+        config.leaf_workers,
+    )?);
+    {
+        let writer = header_index.build_writer()?;
+        let (header, block_hash) = source.header(0)?;
+        writer.put(0, header, block_hash)?;
+    }
     let forest = Arc::new(FlatForest::create(
         &config.forest_path,
         file_nodes,
@@ -1153,6 +1907,7 @@ fn build_with_source<S: BlockSource, H: Hints>(
         &availability,
         &leaf_map,
         &leaf_map_entries,
+        &header_index,
         &stats,
     )?;
 
@@ -1168,8 +1923,13 @@ fn build_with_source<S: BlockSource, H: Hints>(
         Arc::try_unwrap(leaf_map).map_err(|_| anyhow!("leaf map still has active writers"))?;
     leaf_map.close().context("failed to close leaf map")?;
     info!("closed {leaf_map_entries} leaf positions without checkpointing");
+    let header_index = Arc::try_unwrap(header_index)
+        .map_err(|_| anyhow!("header index still has active writers"))?;
+    header_index
+        .close()
+        .context("failed to close header index")?;
     let statistics = stats.snapshot();
-    info!(
+    debug!(
         "build stats: ranges={} avg_range_lock={:?} avg_range_processing={:?} kernel_blocks={} avg_kernel_wait={:?} index_writes={} avg_index_write={:?} forest_writes={} avg_forest_write={:?} chaser_range_waits={}",
         statistics.ranges,
         statistics.average_range_lock_time,
@@ -1207,44 +1967,6 @@ fn validate_config(config: &ParallelForestConfig) -> Result<()> {
     Ok(())
 }
 
-fn index_leaf_counts<S: BlockSource>(
-    source: &S,
-    stop_height: u32,
-    worker_count: usize,
-    stats: &BuildStats,
-) -> Result<Vec<u64>> {
-    let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
-    let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
-    thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _worker in 0..worker_count {
-            let ranges = Arc::clone(&ranges);
-            handles.push(scope.spawn(move || -> Result<Vec<(u32, u64)>> {
-                let mut counts = Vec::new();
-                while let Some(range) = ranges.acquire() {
-                    counts.reserve(range.len());
-                    for height in range {
-                        let visit = source.visit_leaf_outputs(height, &mut |_| Ok(()))?;
-                        stats.kernel_wait.record(visit.kernel_wait);
-                        counts.push((height, visit.leaves));
-                    }
-                }
-                Ok(counts)
-            }));
-        }
-
-        let mut counts = vec![0; stop_height as usize];
-        for handle in handles {
-            let values = handle
-                .join()
-                .map_err(|_| anyhow!("leaf indexing worker panicked"))??;
-            for (height, count) in values {
-                counts[(height - 1) as usize] = count;
-            }
-        }
-        Ok(counts)
-    })
-}
 fn count_hinted_leaves<H: Hints>(hints: &H, stop_height: u32, worker_count: usize) -> Result<u64> {
     let worker_count = worker_count.min(height_chunk_count(stop_height)).max(1);
     let ranges = Arc::new(HeightRangeAllocator::new(stop_height));
@@ -1295,6 +2017,7 @@ fn run_builders<S: BlockSource, H: Hints>(
     availability: &Arc<Availability>,
     leaf_map: &Arc<Database>,
     leaf_map_entries: &Arc<AtomicU64>,
+    header_index: &Arc<HeaderIndex>,
     stats: &Arc<BuildStats>,
 ) -> Result<()> {
     thread::scope(|scope| {
@@ -1331,6 +2054,7 @@ fn run_builders<S: BlockSource, H: Hints>(
                 availability: Arc::clone(availability),
                 leaf_map: Arc::clone(leaf_map),
                 leaf_map_entries: Arc::clone(leaf_map_entries),
+                header_index: Arc::clone(header_index),
                 stats: Arc::clone(stats),
             };
             let ranges = Arc::clone(&ranges);
@@ -1342,7 +2066,7 @@ fn run_builders<S: BlockSource, H: Hints>(
                             break;
                         };
                         outputs.stats.range_lock.record(lock_started.elapsed());
-                        info!(
+                        debug!(
                             "leaf worker {worker} acquired height range {}..={}",
                             range.start,
                             range.end - 1
@@ -1351,6 +2075,10 @@ fn run_builders<S: BlockSource, H: Hints>(
                             .leaf_map
                             .write_only()
                             .context("failed to create range leaf-map writer")?;
+                        let header_writer = outputs
+                            .header_index
+                            .build_writer()
+                            .context("failed to create range header-index writer")?;
                         let processing_started = Instant::now();
                         let processed = fill_leaf_range(
                             source,
@@ -1360,6 +2088,7 @@ fn run_builders<S: BlockSource, H: Hints>(
                             leaf_offsets,
                             &outputs,
                             &writer,
+                            &header_writer,
                         );
                         outputs
                             .stats
@@ -1410,9 +2139,11 @@ struct LeafBuildOutputs {
     availability: Arc<Availability>,
     leaf_map: Arc<Database>,
     leaf_map_entries: Arc<AtomicU64>,
+    header_index: Arc<HeaderIndex>,
     stats: Arc<BuildStats>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_leaf_range<S: BlockSource, H: Hints>(
     source: &S,
     hints: &H,
@@ -1421,6 +2152,7 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
     leaf_offsets: &[u64],
     outputs: &LeafBuildOutputs,
     writer: &WriteOnlyWriter<'_>,
+    header_writer: &HeaderBuildWriter<'_>,
 ) -> Result<()> {
     let publish_nodes = nodes_per_two_pages();
     for height in heights {
@@ -1434,11 +2166,12 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
         }
 
         let mut local_position = 0u64;
+        let mut hint_leaf_position = 0u64;
         let mut hint_position = 0usize;
         let mut unpublished = 0usize;
         let visited = source.visit_leaf_outputs(height, &mut |leaf| {
-            let local_hint = u32::try_from(local_position)
-                .context("one block contains more than u32::MAX leaves")?;
+            let local_hint = u32::try_from(hint_leaf_position)
+                .context("one block contains more than u32::MAX hinted leaves")?;
             if unspent
                 .get(hint_position)
                 .copied()
@@ -1446,7 +2179,13 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             {
                 bail!("hint index is duplicated or out of order at height {height}");
             }
-            let spent = if unspent.get(hint_position) == Some(&local_hint) {
+            hint_leaf_position += 1;
+            let spent = if leaf.force_unindexed {
+                if unspent.get(hint_position) == Some(&local_hint) {
+                    bail!("hardcoded unspendable leaf is marked in hints at height {height}");
+                }
+                false
+            } else if unspent.get(hint_position) == Some(&local_hint) {
                 hint_position += 1;
                 false
             } else {
@@ -1470,7 +2209,7 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
                 .forest_write
                 .record(forest_write_started.elapsed());
             forest_write?;
-            if !spent {
+            if !spent && !leaf.force_unindexed {
                 let key = leaf_map_key(leaf.txid, leaf.vout);
                 let value: [u8; LEAF_MAP_VALUE_SIZE] = bottom_position.to_le_bytes();
                 let index_write_started = Instant::now();
@@ -1492,10 +2231,11 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
             }
             Ok(())
         })?;
+        header_writer.put(height, visited.header, visited.block_hash)?;
         outputs.stats.kernel_wait.record(visited.kernel_wait);
         if visited.leaves != expected_count || local_position != expected_count {
             bail!(
-                "leaf count changed at height {height}: indexed {expected_count}, visited {}, built {local_position}",
+                "leaf count changed at height {height}: declared {expected_count}, visited {}, built {local_position}",
                 visited.leaves
             );
         }
@@ -1509,6 +2249,14 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
         outputs.availability.publish()?;
     }
     Ok(())
+}
+
+fn accumulator_hash(node: ForestNodeData) -> BitcoinNodeHash {
+    if node.spent {
+        BitcoinNodeHash::empty()
+    } else {
+        BitcoinNodeHash::from(node.hash)
+    }
 }
 
 fn combine_children(left: ForestNodeData, right: ForestNodeData) -> ForestNodeData {
@@ -1642,7 +2390,6 @@ fn visit_kernel_leaf_outputs(
             if script_pubkey.len() > 10_000
                 || script_pubkey.first() == Some(&0x6a)
                 || spent_in_block.contains(&outpoint)
-                || bip30_exclusion == Some(outpoint)
             {
                 continue;
             }
@@ -1653,6 +2400,7 @@ fn visit_kernel_leaf_outputs(
                 txid,
                 vout: outpoint.vout,
                 is_coinbase,
+                force_unindexed: bip30_exclusion == Some(outpoint),
                 value,
                 script_pubkey: &script_pubkey,
             })?;
@@ -1767,7 +2515,7 @@ fn parents_per_two_child_pages() -> u64 {
     (nodes_per_two_pages().div_ceil(2)).max(1) as u64
 }
 
-fn tree_rows(leaves: u64) -> u8 {
+pub(crate) fn tree_rows(leaves: u64) -> u8 {
     if leaves == 0 {
         0
     } else {
@@ -1806,6 +2554,7 @@ fn is_root_position(position: u64, leaves: u64, forest_rows: u8) -> bool {
     leaves & (1 << row) != 0 && root_position(leaves, row, forest_rows) == position
 }
 
+#[cfg(test)]
 fn get_proof_positions(targets: &[u64], leaves: u64, forest_rows: u8) -> Vec<u64> {
     let mut proof_positions = BTreeSet::new();
     let mut known = HashSet::with_capacity(targets.len() * 2);
@@ -1832,6 +2581,15 @@ fn get_proof_positions(targets: &[u64], leaves: u64, forest_rows: u8) -> Vec<u64
     proof_positions.into_iter().collect()
 }
 
+fn translate_position(position: u64, from_rows: u8, to_rows: u8) -> Result<u64> {
+    let row = detect_row(position, from_rows);
+    let from_start = start_position_at_row(row, from_rows)?;
+    let to_start = start_position_at_row(row, to_rows)?;
+    to_start
+        .checked_add(position - from_start)
+        .context("translated forest position overflow")
+}
+
 fn forest_capacity(forest_rows: u8) -> Result<u64> {
     u64::try_from((2u128 << forest_rows) - 1).context("forest position space exceeds u64")
 }
@@ -1847,6 +2605,7 @@ fn start_position_at_row(row: u8, forest_rows: u8) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::atomic::AtomicU64;
 
     use bitcoin::absolute;
@@ -1866,8 +2625,11 @@ mod tests {
     use bitcoin::TxMerkleNode;
     use bitcoin::TxOut;
     use bitcoin::Witness;
+    use bridge::prefixed_hints::write_leaf_count_prefix;
+    use hintsfile::EliasFano;
+    use hintsfile::HintsfileBuilder;
 
-    use rustreexo::accumulator::stump::Stump;
+    use rustreexo::stump::Stump;
 
     use super::*;
 
@@ -1921,7 +2683,6 @@ mod tests {
                     if output.script_pubkey.len() > 10_000
                         || output.script_pubkey.as_bytes().first() == Some(&0x6a)
                         || spent_in_block.contains(&outpoint)
-                        || bip30_exclusion == Some(outpoint)
                     {
                         continue;
                     }
@@ -1930,21 +2691,88 @@ mod tests {
                         txid,
                         vout: outpoint.vout,
                         is_coinbase: tx.is_coinbase(),
+                        force_unindexed: bip30_exclusion == Some(outpoint),
                         value: output.value.to_sat(),
                         script_pubkey: output.script_pubkey.as_bytes(),
                     })?;
                     count += 1;
                 }
             }
+            let bytes: [u8; 80] = bitcoin::consensus::serialize(&block.header)
+                .try_into()
+                .expect("header serialization is fixed-size");
             Ok(BlockVisitResult {
                 leaves: count,
                 kernel_wait: Duration::ZERO,
+                header: bytes,
+                block_hash: block.header.block_hash().to_byte_array(),
             })
+        }
+
+        fn header(&self, height: u32) -> Result<([u8; 80], [u8; 32])> {
+            let header = if height == 0 {
+                mock_block(0, &[]).header
+            } else {
+                self.blocks
+                    .get((height - 1) as usize)
+                    .ok_or_else(|| anyhow!("missing mock block {height}"))?
+                    .header
+            };
+            let bytes: [u8; 80] = bitcoin::consensus::serialize(&header)
+                .try_into()
+                .expect("header serialization is fixed-size");
+            Ok((bytes, header.block_hash().to_byte_array()))
+        }
+    }
+
+    struct Bip30Source;
+
+    impl BlockSource for Bip30Source {
+        fn visit_leaf_outputs(
+            &self,
+            height: u32,
+            visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
+        ) -> Result<BlockVisitResult> {
+            assert_eq!(height, 1);
+            visitor(LeafOutput {
+                block_hash: [3; 32],
+                txid: [1; 32],
+                vout: 0,
+                is_coinbase: true,
+                force_unindexed: true,
+                value: 10,
+                script_pubkey: &[],
+            })?;
+            visitor(LeafOutput {
+                block_hash: [3; 32],
+                txid: [2; 32],
+                vout: 0,
+                is_coinbase: true,
+                force_unindexed: false,
+                value: 20,
+                script_pubkey: &[],
+            })?;
+            let header = mock_block(1, &[]).header;
+            Ok(BlockVisitResult {
+                leaves: 2,
+                kernel_wait: Duration::ZERO,
+                header: bitcoin::consensus::serialize(&header).try_into().unwrap(),
+                block_hash: header.block_hash().to_byte_array(),
+            })
+        }
+
+        fn header(&self, height: u32) -> Result<([u8; 80], [u8; 32])> {
+            let header = mock_block(height, &[]).header;
+            Ok((
+                bitcoin::consensus::serialize(&header).try_into().unwrap(),
+                header.block_hash().to_byte_array(),
+            ))
         }
     }
 
     struct MockHints {
         stop_height: u32,
+        leaf_counts: BTreeMap<u32, u32>,
         indices: BTreeMap<u32, Vec<u32>>,
     }
 
@@ -1953,9 +2781,28 @@ mod tests {
             self.stop_height
         }
 
+        fn leaf_count_at_height(&self, height: u32) -> Option<u32> {
+            self.leaf_counts.get(&height).copied()
+        }
+
         fn indices_at_height(&self, height: u32) -> Option<Vec<u32>> {
             self.indices.get(&height).cloned()
         }
+    }
+
+    fn bridge_hints(leaf_counts: &[u32], indices: &[Vec<u32>]) -> BridgeHints {
+        assert_eq!(leaf_counts.len(), indices.len());
+        let stop_height = u32::try_from(leaf_counts.len() - 1).unwrap();
+        let mut encoded = Vec::new();
+        write_leaf_count_prefix(&mut encoded, stop_height, leaf_counts).unwrap();
+        let mut builder = HintsfileBuilder::new(&mut encoded)
+            .initialize(stop_height)
+            .unwrap();
+        for at_height in &indices[1..] {
+            builder.append(EliasFano::compress(at_height)).unwrap();
+        }
+        builder.finish().unwrap();
+        BridgeHints::from_reader(&mut Cursor::new(encoded)).unwrap()
     }
 
     fn mock_block(nonce: u32, values: &[u64]) -> Block {
@@ -1997,6 +2844,13 @@ mod tests {
         ))
     }
 
+    fn remove_bootstrap_files(path: &Path, leaf_map_path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(leaf_map_path).unwrap();
+        std::fs::remove_file(path.with_extension("headers")).unwrap();
+        std::fs::remove_dir_all(path.with_extension("header-index")).unwrap();
+    }
+
     #[test]
     fn flat_node_layout_is_position_addressable() {
         assert_eq!(size_of::<ForestNode>(), 33);
@@ -2005,6 +2859,48 @@ mod tests {
         assert_eq!(start_position_at_row(1, 3).unwrap(), 8);
         assert_eq!(start_position_at_row(2, 3).unwrap(), 12);
         assert_eq!(start_position_at_row(3, 3).unwrap(), 14);
+    }
+
+    #[test]
+    fn bip30_leaf_stays_live_without_entering_the_leaf_map() {
+        let path = temp_forest_path();
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 2)]),
+            indices: BTreeMap::from([(1, vec![1])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        let summary = build_with_source(&Bip30Source, &hints, config).unwrap();
+
+        assert_eq!(summary.leaves, 2);
+        assert_eq!(summary.leaf_map_entries, 1);
+        {
+            let reader = FlatForestReader::open(&path).unwrap();
+            assert!(!reader.read(0).unwrap().spent);
+            assert!(!reader.read(1).unwrap().spent);
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert!(steady
+                .leaf_position(&OutPoint {
+                    txid: Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                })
+                .is_err());
+            assert_eq!(
+                steady
+                    .leaf_position(&OutPoint {
+                        txid: Txid::from_byte_array([2; 32]),
+                        vout: 0,
+                    })
+                    .unwrap(),
+                1
+            );
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
     }
 
     #[test]
@@ -2049,6 +2945,17 @@ mod tests {
     }
 
     #[test]
+    fn spent_roots_use_the_accumulator_empty_hash() {
+        assert_eq!(
+            accumulator_hash(ForestNodeData {
+                hash: [0; 32],
+                spent: true,
+            }),
+            BitcoinNodeHash::empty()
+        );
+    }
+
+    #[test]
     fn deleted_children_promote_surviving_subtrees() {
         let left = ForestNodeData {
             hash: [1; 32],
@@ -2088,6 +2995,343 @@ mod tests {
     }
 
     #[test]
+    fn preallocated_capacity_accepts_additions_beyond_bootstrap_rows() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.minimum_leaf_capacity = Some(8);
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        {
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert_eq!(steady.leaves(), 3);
+            assert_eq!(steady.forest_rows, 3);
+            let bootstrap_txid = source.blocks[0].txdata[0].compute_txid();
+            for vout in 0..3 {
+                let outpoint = OutPoint {
+                    txid: bootstrap_txid,
+                    vout,
+                };
+                let bottom = steady.leaf_position(&outpoint).unwrap();
+                let target = steady.proof_position(bottom).unwrap();
+                let proof = steady.prove(&[target]).unwrap();
+                let stump = Stump {
+                    leaves: steady.leaves(),
+                    roots: steady.roots().unwrap(),
+                };
+                assert!(stump
+                    .verify(&proof, &[steady.leaf_hash(bottom).unwrap()])
+                    .unwrap());
+            }
+            let additions = [
+                (
+                    OutPoint {
+                        txid: Txid::from_byte_array([4; 32]),
+                        vout: 0,
+                    },
+                    BitcoinNodeHash::from([4; 32]),
+                ),
+                (
+                    OutPoint {
+                        txid: Txid::from_byte_array([5; 32]),
+                        vout: 0,
+                    },
+                    BitcoinNodeHash::from([5; 32]),
+                ),
+            ];
+            let entry = steady
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    source.blocks[0].block_hash(),
+                    &[],
+                    &additions,
+                )
+                .unwrap();
+            let expected_roots = steady.roots_after(&entry).unwrap();
+            steady.apply_forward(&entry).unwrap();
+            assert_eq!(steady.leaves(), 5);
+            assert_eq!(steady.roots().unwrap(), expected_roots);
+            steady.sync().unwrap();
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn steady_state_grows_the_forest_online() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        let expected_roots = {
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert_eq!(steady.leaf_capacity().unwrap(), 4);
+            let roots_before = steady.roots().unwrap();
+            let additions = [
+                (
+                    OutPoint {
+                        txid: Txid::from_byte_array([4; 32]),
+                        vout: 0,
+                    },
+                    BitcoinNodeHash::from([4; 32]),
+                ),
+                (
+                    OutPoint {
+                        txid: Txid::from_byte_array([5; 32]),
+                        vout: 0,
+                    },
+                    BitcoinNodeHash::from([5; 32]),
+                ),
+            ];
+
+            let entry = steady
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    source.blocks[0].block_hash(),
+                    &[],
+                    &additions,
+                )
+                .unwrap();
+            assert_eq!(steady.forest_rows(), 3);
+            assert_eq!(steady.leaf_capacity().unwrap(), 8);
+            assert_eq!(steady.roots().unwrap(), roots_before);
+            assert_eq!(FlatForestReader::open(&path).unwrap().node_count(), 15);
+            assert!(!resize_marker_path(&path).exists());
+
+            let bootstrap_outpoint = OutPoint {
+                txid: source.blocks[0].txdata[0].compute_txid(),
+                vout: 1,
+            };
+            let bottom = steady.leaf_position(&bootstrap_outpoint).unwrap();
+            let target = steady.proof_position(bottom).unwrap();
+            let proof = steady.prove(&[target]).unwrap();
+            assert!(Stump {
+                leaves: steady.leaves(),
+                roots: roots_before,
+            }
+            .verify(&proof, &[steady.leaf_hash(bottom).unwrap()])
+            .unwrap());
+
+            let expected_roots = steady.roots_after(&entry).unwrap();
+            steady.apply_forward(&entry).unwrap();
+            steady.sync().unwrap();
+            expected_roots
+        };
+
+        {
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert_eq!(steady.leaves(), 5);
+            assert_eq!(steady.forest_rows(), 3);
+            assert_eq!(steady.roots().unwrap(), expected_roots);
+            assert_eq!(
+                steady
+                    .leaf_position(&OutPoint {
+                        txid: Txid::from_byte_array([5; 32]),
+                        vout: 0,
+                    })
+                    .unwrap(),
+                4
+            );
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn resumes_an_interrupted_online_forest_resize() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        let roots_before = {
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let roots = steady.roots().unwrap();
+            let marker = ResizeMarker {
+                old_rows: 2,
+                new_rows: 3,
+                stage: RESIZE_STAGE_COPYING,
+            };
+            write_resize_marker(&path, marker).unwrap();
+            steady
+                .forest
+                .grow_mapping(forest_capacity(2).unwrap(), forest_capacity(3).unwrap())
+                .unwrap();
+            roots
+        };
+        assert!(resize_marker_path(&path).exists());
+
+        {
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            assert_eq!(steady.leaves(), 3);
+            assert_eq!(steady.forest_rows(), 3);
+            assert_eq!(steady.roots().unwrap(), roots_before);
+            assert!(!resize_marker_path(&path).exists());
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn plans_against_an_unflushed_forest_overlay() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        {
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let first_outpoint = OutPoint {
+                txid: Txid::from_byte_array([9; 32]),
+                vout: 0,
+            };
+            let first = steady
+                .plan_update_with_overlay(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    source.blocks[0].block_hash(),
+                    steady.leaves(),
+                    &AHashMap::new(),
+                    &[],
+                    &[(first_outpoint, BitcoinNodeHash::from([9; 32]))],
+                )
+                .unwrap();
+            let mut overlay = AHashMap::new();
+            for delta in &first.forest {
+                overlay.insert(delta.position, delta.after);
+            }
+            let first_added_state = overlay[&3];
+            let second = steady
+                .plan_update_with_overlay(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    BlockHash::from_byte_array([2; 32]),
+                    first.num_leaves,
+                    &overlay,
+                    &[(first_outpoint, 3)],
+                    &[],
+                )
+                .unwrap();
+            let second_added_delta = second
+                .forest
+                .iter()
+                .find(|delta| delta.position == 3)
+                .unwrap();
+            assert_eq!(second_added_delta.before, first_added_state);
+            assert!(second_added_delta.after.spent);
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn large_deletion_rows_plan_deterministically_in_parallel() {
+        let path = temp_forest_path();
+        let values: Vec<u64> = (1..=512).collect();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &values)],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 512)]),
+            indices: BTreeMap::from([(1, (0..512).collect())]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        {
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let txid = source.blocks[0].txdata[0].compute_txid();
+            let deletions: Vec<_> = (0..256)
+                .map(|vout| {
+                    let outpoint = OutPoint { txid, vout };
+                    let position = steady.leaf_position(&outpoint).unwrap();
+                    (outpoint, position)
+                })
+                .collect();
+            let roots_before = steady.roots().unwrap();
+            let first = steady
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    BlockHash::from_byte_array([1; 32]),
+                    &deletions,
+                    &[],
+                )
+                .unwrap();
+            let second = steady
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    BlockHash::from_byte_array([1; 32]),
+                    &deletions,
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(first, second);
+            assert!(first.forest.len() > deletions.len());
+            assert!(first
+                .forest
+                .windows(2)
+                .all(|pair| pair[0].position < pair[1].position));
+            assert_eq!(steady.roots().unwrap(), roots_before);
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
     fn proofs_read_hashes_from_promoted_sparse_positions() {
         let path = temp_forest_path();
         let source = MockSource {
@@ -2095,6 +3339,7 @@ mod tests {
         };
         let hints = MockHints {
             stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 8)]),
             indices: BTreeMap::from([(1, vec![0, 1, 4, 5])]),
         };
         let mut config = ParallelForestConfig::new(path.clone());
@@ -2124,8 +3369,191 @@ mod tests {
             assert!(stump.verify(&proof, &[leaf_hash]).unwrap());
         }
 
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir_all(leaf_map_path).unwrap();
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn recovers_a_missing_leaf_map_entry_despite_a_corrupt_sibling_hint() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        {
+            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let txid = source.blocks[0].txdata[0].compute_txid();
+            let block_leaves = (0..3)
+                .map(|vout| {
+                    let outpoint = OutPoint { txid, vout };
+                    let position = steady.leaf_position(&outpoint).unwrap();
+                    (outpoint, steady.leaf_hash(position).unwrap())
+                })
+                .collect::<Vec<_>>();
+            let target = block_leaves[1].0;
+            let expected_position = steady.leaf_position(&target).unwrap();
+            let target_hash = block_leaves[1].1;
+            let misleading = block_leaves[0].0;
+            let wrong_position = steady.leaf_position(&block_leaves[2].0).unwrap();
+            steady
+                .leaf_map
+                .put(
+                    &leaf_map_key(misleading.txid.to_byte_array(), misleading.vout),
+                    &wrong_position.to_le_bytes(),
+                )
+                .unwrap();
+            steady
+                .leaf_map
+                .delete(&leaf_map_key(target.txid.to_byte_array(), target.vout))
+                .unwrap();
+
+            assert!(steady.leaf_position(&target).is_err());
+            assert_eq!(
+                steady
+                    .recover_leaf_position_from_block(target, target_hash, &block_leaves)
+                    .unwrap(),
+                expected_position
+            );
+        }
+
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+    #[test]
+    fn replay_restores_baseline_after_multiple_interrupted_rollbacks() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = MockHints {
+            stop_height: 1,
+            leaf_counts: BTreeMap::from([(1, 3)]),
+            indices: BTreeMap::from([(1, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+        let journal_path = path.with_extension("journal");
+        let txid = source.blocks[0].txdata[0].compute_txid();
+        let first = OutPoint { txid, vout: 0 };
+        let second = OutPoint { txid, vout: 1 };
+        let expected_roots;
+        {
+            let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            expected_roots = forest.roots().unwrap();
+            let first_position = forest.leaf_position(&first).unwrap();
+            let first_entry = forest
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    source.blocks[0].block_hash(),
+                    &[(first, first_position)],
+                    &[],
+                )
+                .unwrap();
+            let mut journal = ForestJournal::open(&journal_path).unwrap();
+            let first_index = journal.append(first_entry.clone()).unwrap();
+            forest.apply_forward(&first_entry).unwrap();
+            let second_position = forest.leaf_position(&second).unwrap();
+            let second_entry = forest
+                .plan_update(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    first_entry.block_hash,
+                    &[(second, second_position)],
+                    &[],
+                )
+                .unwrap();
+            let second_index = journal.append(second_entry.clone()).unwrap();
+            forest.apply_forward(&second_entry).unwrap();
+            journal.flush().unwrap();
+            forest.sync().unwrap();
+
+            journal.mark_rolled_back(second_index).unwrap();
+            journal.mark_rolled_back(first_index).unwrap();
+            forest.replay_journal(&journal).unwrap();
+            assert_eq!(forest.roots().unwrap(), expected_roots);
+            assert_eq!(forest.leaf_position(&first).unwrap(), first_position);
+            assert_eq!(forest.leaf_position(&second).unwrap(), second_position);
+        }
+
+        std::fs::remove_file(journal_path).unwrap();
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn background_worker_replays_a_durable_journal_entry() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30]), mock_block(2, &[40, 50, 60])],
+        };
+        let hints = MockHints {
+            stop_height: 2,
+            leaf_counts: BTreeMap::from([(1, 3), (2, 3)]),
+            indices: BTreeMap::from([(1, vec![1]), (2, vec![0, 1, 2])]),
+        };
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+        let journal_path = path.with_extension("journal");
+        let outpoint = OutPoint {
+            txid: source.blocks[0].txdata[0].compute_txid(),
+            vout: 1,
+        };
+
+        let (expected_roots, entry, published_size, flusher) = {
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let position = steady.leaf_position(&outpoint).unwrap();
+            let entry = steady
+                .plan_update(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    BlockHash::from_byte_array([2; 32]),
+                    &[(outpoint, position)],
+                    &[],
+                )
+                .unwrap();
+            let expected = steady.roots_after(&entry).unwrap();
+            let mut journal = crate::forest_journal::ForestJournal::open(&journal_path).unwrap();
+            journal.append(entry.clone()).unwrap();
+            let published_size = journal.published_size();
+            let flusher = journal.flusher().unwrap();
+            (expected, entry, published_size, flusher)
+        };
+
+        let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+        let worker = crate::prover::JournalApplyWorker::new(flusher).unwrap();
+        let (forest, timings) = worker
+            .enqueue(entry, published_size, forest)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(timings.journal_flush < Duration::from_secs(2));
+        assert!(timings.apply < Duration::from_secs(2));
+        assert!(timings.state_flush < Duration::from_secs(2));
+        assert_eq!(forest.roots().unwrap(), expected_roots);
+        assert!(forest.leaf_position(&outpoint).is_err());
+        drop(worker);
+        drop(forest);
+
+        std::fs::remove_file(journal_path).unwrap();
+        remove_bootstrap_files(&path, &leaf_map_path);
     }
 
     #[test]
@@ -2134,10 +3562,7 @@ mod tests {
         let source = MockSource {
             blocks: vec![mock_block(1, &[10, 20, 30]), mock_block(2, &[40, 50, 60])],
         };
-        let hints = MockHints {
-            stop_height: 2,
-            indices: BTreeMap::from([(1, vec![1]), (2, vec![0, 1, 2])]),
-        };
+        let hints = bridge_hints(&[0, 3, 3], &[Vec::new(), vec![1], vec![0, 1, 2]]);
         let mut config = ParallelForestConfig::new(path.clone());
         config.leaf_workers = 2;
         config.chaser_workers = 2;
@@ -2151,12 +3576,29 @@ mod tests {
         assert_eq!(summary.file_nodes, 15);
         assert_eq!(summary.leaf_map_entries, 4);
         assert_eq!(summary.statistics.ranges, 1);
-        assert_eq!(summary.statistics.kernel_blocks, 4);
+        assert_eq!(summary.statistics.kernel_blocks, 2);
         assert_eq!(summary.statistics.index_writes, 4);
         assert_eq!(summary.statistics.forest_writes, 6);
         assert_eq!(summary.roots.len(), 2);
         assert_eq!(summary.roots[0].position, 12);
         assert_eq!(summary.roots[1].position, 10);
+
+        {
+            let headers = HeaderIndex::open(
+                &path.with_extension("headers"),
+                &path.with_extension("header-index"),
+            )
+            .unwrap();
+            assert_eq!(
+                headers.get_by_height(1).unwrap(),
+                Some(source.blocks[0].header)
+            );
+            assert_eq!(
+                headers.get_height(source.blocks[1].block_hash()).unwrap(),
+                Some(2)
+            );
+            headers.close().unwrap();
+        }
 
         {
             let reader = FlatForestReader::open(&path).unwrap();
@@ -2227,8 +3669,36 @@ mod tests {
                 roots: steady.roots().unwrap(),
             };
             assert!(before.verify(&proof, &[deleted_hash]).unwrap());
-            let after_delete = before.modify(&[], &[deleted_hash], &proof).unwrap().0;
-            steady.delete(&[(spent_outpoint, bottom)]).unwrap();
+            let after_delete = before.modify(&[], &[deleted_hash], &proof).unwrap();
+            let delete_entry = steady
+                .plan_update(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    BlockHash::from_byte_array([2; 32]),
+                    &[(spent_outpoint, bottom)],
+                    &[],
+                )
+                .unwrap();
+            let repeated_plan = steady
+                .plan_update(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    BlockHash::from_byte_array([2; 32]),
+                    &[(spent_outpoint, bottom)],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(repeated_plan, delete_entry);
+            assert!(delete_entry
+                .forest
+                .windows(2)
+                .all(|pair| pair[0].position < pair[1].position));
+            assert_eq!(steady.roots().unwrap(), before.roots);
+            assert_eq!(
+                steady.roots_after(&delete_entry).unwrap(),
+                after_delete.roots
+            );
+            steady.apply_forward(&delete_entry).unwrap();
             assert_eq!(steady.roots().unwrap(), after_delete.roots);
 
             let surviving_outpoint = OutPoint {
@@ -2252,15 +3722,52 @@ mod tests {
             let added_hash = BitcoinNodeHash::from([7; 32]);
             let after_add = after_delete
                 .modify(&[added_hash], &[], &Proof::default())
-                .unwrap()
-                .0;
-            steady.add(&[(added_outpoint, added_hash)]).unwrap();
+                .unwrap();
+            let add_entry = steady
+                .plan_update(
+                    4,
+                    BlockHash::from_byte_array([4; 32]),
+                    BlockHash::from_byte_array([3; 32]),
+                    &[],
+                    &[(added_outpoint, added_hash)],
+                )
+                .unwrap();
+            assert_eq!(steady.roots_after(&add_entry).unwrap(), after_add.roots);
+            steady.apply_forward(&add_entry).unwrap();
             assert_eq!(steady.leaves(), 7);
             assert_eq!(steady.leaf_position(&added_outpoint).unwrap(), 6);
             assert_eq!(steady.roots().unwrap(), after_add.roots);
+            let second_outpoint = OutPoint {
+                txid: Txid::from_byte_array([10; 32]),
+                vout: 8,
+            };
+            let second_hash = BitcoinNodeHash::from([8; 32]);
+            let after_second = after_add
+                .modify(&[second_hash], &[], &Proof::default())
+                .unwrap();
+            let second_entry = steady
+                .plan_update(
+                    5,
+                    BlockHash::from_byte_array([5; 32]),
+                    BlockHash::from_byte_array([4; 32]),
+                    &[],
+                    &[(second_outpoint, second_hash)],
+                )
+                .unwrap();
+            steady.apply_forward(&second_entry).unwrap();
+            assert_eq!(steady.roots().unwrap(), after_second.roots);
+
+            steady.apply_backward(&second_entry).unwrap();
+            steady.apply_backward(&add_entry).unwrap();
+            assert_eq!(steady.leaves(), 6);
+            assert!(steady.leaf_position(&added_outpoint).is_err());
+            assert!(steady.leaf_position(&second_outpoint).is_err());
+            assert_eq!(steady.roots().unwrap(), after_delete.roots);
+            steady.apply_forward(&add_entry).unwrap();
+            steady.apply_forward(&second_entry).unwrap();
+            assert_eq!(steady.roots().unwrap(), after_second.roots);
             steady.sync().unwrap();
         }
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir_all(leaf_map_path).unwrap();
+        remove_bootstrap_files(&path, &leaf_map_path);
     }
 }

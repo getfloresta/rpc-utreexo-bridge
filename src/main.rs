@@ -1,47 +1,24 @@
 //SPDX-License-Identifier: MIT
 
-#[cfg(all(feature = "shinigami", feature = "bitcoin"))]
-compile_error!("You can't have both shinigami and bitcoin features enabled at the same time");
-
-#[cfg(all(not(feature = "shinigami"), not(feature = "bitcoin")))]
-compile_error!("You must enable either the shinigami or the bitcoin feature");
-
-#[cfg(all(feature = "shinigami", feature = "api"))]
-compile_error!("This combination is not supported yet");
-
-#[cfg(all(feature = "shinigami", feature = "node"))]
-compile_error!("This combination is not supported yet");
-
-#[cfg(all(feature = "shinigami", feature = "esplora"))]
-compile_error!("This combination is not supported yet");
-
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[cfg(feature = "api")]
-mod api;
-
-#[cfg(not(feature = "shinigami"))]
 mod blockfile;
 
 #[cfg(feature = "esplora")]
 mod esplora;
+mod forest_journal;
+mod header_index;
 
-#[cfg(feature = "node")]
 mod node;
 
-#[cfg(not(feature = "shinigami"))]
 mod parallel_forest;
 mod prover;
-
-#[cfg(feature = "shinigami")]
-mod shinigami_block_storage;
 
 mod block_index;
 mod chaininterface;
 mod chainview;
 mod cli;
-mod leaf_cache;
 mod udata;
 
 use std::env;
@@ -56,16 +33,7 @@ use log::info;
 use simplelog::Config;
 use simplelog::SharedLogger;
 
-#[cfg(feature = "shinigami")]
-pub mod shinigami_bridge;
-
-#[cfg(feature = "shinigami")]
-use crate::shinigami_bridge::run_bridge;
-
-#[cfg(not(feature = "shinigami"))]
 pub mod bitcoin_bridge;
-
-#[cfg(not(feature = "shinigami"))]
 use crate::bitcoin_bridge::run_bridge;
 
 fn main() -> anyhow::Result<()> {
@@ -82,30 +50,31 @@ fn subdir(path: &str) -> String {
     dir + "/" + path
 }
 
-fn init_logger(log_file: Option<&str>, log_level: log::LevelFilter, log_to_term: bool) {
-    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![];
-    if let Some(file) = log_file {
-        let file_logger = simplelog::WriteLogger::new(
-            log_level,
+fn init_logger(log_file: Option<&str>, log_to_term: bool) -> anyhow::Result<()> {
+    let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
+    if let Some(path) = log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        loggers.push(simplelog::WriteLogger::new(
+            log::LevelFilter::Debug,
             Config::default(),
-            std::fs::File::create(file).unwrap(),
-        );
-        loggers.push(file_logger);
+            file,
+        ));
     }
     if log_to_term {
-        let term_logger = simplelog::TermLogger::new(
-            log_level,
+        loggers.push(simplelog::TermLogger::new(
+            log::LevelFilter::Info,
             Config::default(),
             simplelog::TerminalMode::Mixed,
             simplelog::ColorChoice::Auto,
-        );
-        loggers.push(term_logger);
+        ));
     }
-    if loggers.is_empty() {
-        eprintln!("No logger specified, logging disabled");
-        return;
+    if !loggers.is_empty() {
+        simplelog::CombinedLogger::init(loggers)?;
     }
-    let _ = simplelog::CombinedLogger::init(loggers);
+    Ok(())
 }
 
 fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
