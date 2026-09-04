@@ -41,6 +41,19 @@ or you can pull it from dockerhub:
 docker pull dlsz/bridge
 ```
 
+### Fuzzing
+
+The fuzz package requires nightly Rust and `cargo-fuzz`:
+
+```bash
+cargo +nightly install cargo-fuzz
+cargo +nightly fuzz run journal_codec
+cargo +nightly fuzz run pollard_behavior
+```
+
+`pollard_behavior` uses a cheap non-cryptographic `FastHash`; it does not invoke Bitcoin SHA-256
+hashing in its update loop.
+
 ## Using
 
 ### Running the node
