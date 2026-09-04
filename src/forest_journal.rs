@@ -76,6 +76,14 @@ impl JournalEntry {
             .checked_sub(self.added.len() as u64)
             .context("journal addition count exceeds numleaves")
     }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        encode_entry(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        decode_entry(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,7 +186,7 @@ impl ForestJournal {
 
     /// Appends a complete page-aligned entry without flushing it.
     pub fn append(&mut self, entry: JournalEntry) -> Result<usize> {
-        let payload = encode_entry(&entry)?;
+        let payload = entry.encode()?;
         if payload.len() > MAX_RECORD_BYTES {
             bail!("journal entry is too large: {} bytes", payload.len());
         }
@@ -480,7 +488,7 @@ impl ForestJournal {
                 break;
             }
             self.records.push(JournalRecord {
-                entry: decode_entry(&payload)?,
+                entry: JournalEntry::decode(&payload)?,
                 status,
                 offset,
                 span,
