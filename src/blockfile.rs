@@ -1,116 +1,24 @@
 // SPDX-License-Identifier: MIT
 
-//! This module holds all blocks and proofs in a file that gets memory-mapped to the process's address space.
-//! This allows for fast access to the data without having to read it from disk, giving the OS the
-//! oportunity to cache the data in memory. This also allows for accessing the data in a read-only
-//! manner without having to use a mutex to synchronize access to the file.
+//! Append-only compact proof storage.
 
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::Seek;
-use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::slice;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::serialize;
-use bitcoin::consensus::Decodable;
-use bitcoin::hashes::Hash;
-use bitcoin::Block;
-use bitcoin::BlockHash;
-use bitcoin::VarInt;
-use mmap::MapOption;
-use mmap::MemoryMap;
-use rustreexo::accumulator::mem_forest::MemForest;
 
 use crate::block_index::BlockIndex;
-use crate::prover::BlockStorage;
-use crate::udata::BatchProof;
 use crate::udata::CompactBlockProof;
-use crate::udata::CompactLeafData;
-use crate::udata::UData;
-use crate::udata::UtreexoBlock;
-
-/// A file that holds all blocks and proofs in a memory-mapped file.
-pub struct BlockFile {
-    /// A pointer for the memory-mapped region.
-    mmap: MemoryMap,
-    /// The file that holds the data.
-    file: File,
-    /// The current position of the writer in the file.
-    writer_pos: usize,
-}
-
-unsafe impl Send for BlockFile {}
-unsafe impl Sync for BlockFile {}
-
-impl BlockFile {
-    /// Creates a new memory-mapped file with the given path and size.
-    pub fn new(path: PathBuf, map_size: usize) -> Result<Self, std::io::Error> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-
-        let pos = file.seek(std::io::SeekFrom::End(0))?;
-        let mmap = MemoryMap::new(
-            map_size,
-            &[
-                MapOption::MapReadable,
-                MapOption::MapReadable,
-                MapOption::MapFd(file.as_raw_fd()),
-            ],
-        )
-        .unwrap();
-
-        Ok(Self {
-            mmap,
-            writer_pos: pos as usize,
-            file,
-        })
-    }
-
-    /// Returns a block at the given position.
-    pub fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock> {
-        unsafe {
-            UtreexoBlock::consensus_decode(&mut slice::from_raw_parts(
-                self.read(&index),
-                index.size,
-            ))
-            .ok()
-        }
-    }
-
-    /// Appends a block to the file and returns the index of the block.
-    pub fn append(&mut self, block: &UtreexoBlock) -> BlockIndex {
-        // seek to the end of the file
-        self.file.seek(std::io::SeekFrom::End(0)).unwrap();
-        let buffer = serialize(block);
-        let size = self.file.write(&buffer).unwrap();
-        self.writer_pos += size;
-
-        BlockIndex {
-            offset: self.writer_pos - size,
-            size,
-        }
-    }
-
-    /// Returns a pointer to the block at the given index.
-    ///
-    /// This funcion is unsafe because it returns a raw pointer to the memory-mapped region.
-    pub unsafe fn read(&self, index: &BlockIndex) -> *mut u8 {
-        self.mmap.data().wrapping_add(index.offset)
-    }
-}
 
 /// An append-only file containing compact block proofs without Bitcoin blocks.
 pub struct ProofFile {
     file: File,
-    writer_pos: usize,
+    writer_pos: AtomicU64,
 }
 
 impl ProofFile {
@@ -118,34 +26,78 @@ impl ProofFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
-        let writer_pos = file.seek(std::io::SeekFrom::End(0))? as usize;
-        Ok(Self { file, writer_pos })
+        let writer_pos = file.metadata()?.len();
+        Ok(Self {
+            file,
+            writer_pos: AtomicU64::new(writer_pos),
+        })
     }
 
-    pub fn append(&mut self, proof: &CompactBlockProof) -> std::io::Result<BlockIndex> {
-        self.file.seek(std::io::SeekFrom::End(0))?;
+    pub fn append(&self, proof: &CompactBlockProof) -> std::io::Result<BlockIndex> {
         let buffer = serialize(proof);
-        self.file.write_all(&buffer)?;
-        let index = BlockIndex {
-            offset: self.writer_pos,
+        let length = u64::try_from(buffer.len())
+            .map_err(|_| std::io::Error::other("proof length exceeds u64"))?;
+        let offset = self
+            .writer_pos
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
+                offset.checked_add(length)
+            })
+            .map_err(|_| std::io::Error::other("proof file offset overflow"))?;
+        self.file.write_all_at(&buffer, offset)?;
+        Ok(BlockIndex {
+            offset: usize::try_from(offset)
+                .map_err(|_| std::io::Error::other("proof offset exceeds usize"))?,
             size: buffer.len(),
-        };
-        self.writer_pos += buffer.len();
-        Ok(index)
+            proof_forest_rows: None,
+        })
+    }
+
+    pub fn contains(&self, index: &BlockIndex) -> bool {
+        index
+            .offset
+            .checked_add(index.size)
+            .and_then(|end| u64::try_from(end).ok())
+            .zip(self.file.metadata().ok().map(|metadata| metadata.len()))
+            .is_some_and(|(end, file_len)| end <= file_len)
     }
 
     pub fn get(&self, index: &BlockIndex) -> Option<CompactBlockProof> {
-        let mut bytes = vec![0; index.size];
+        if !self.contains(index) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(index.size).ok()?;
+        bytes.resize(index.size, 0);
         self.file
             .read_exact_at(&mut bytes, index.offset as u64)
             .ok()?;
         deserialize(&bytes).ok()
+    }
+
+    pub fn truncate_after(&self, index: Option<&BlockIndex>) -> std::io::Result<()> {
+        let end = match index {
+            Some(index) => index
+                .offset
+                .checked_add(index.size)
+                .ok_or_else(|| std::io::Error::other("proof index end overflow"))?,
+            None => 0,
+        };
+        let end =
+            u64::try_from(end).map_err(|_| std::io::Error::other("proof index exceeds u64"))?;
+        if self.file.metadata()?.len() < end {
+            return Err(std::io::Error::other(format!(
+                "proof file ends before published proof offset {end}"
+            )));
+        }
+        self.file.set_len(end)?;
+        self.writer_pos.store(end, Ordering::Release);
+        self.file.sync_data()
     }
 
     pub fn sync(&self) -> std::io::Result<()> {
@@ -153,39 +105,36 @@ impl ProofFile {
     }
 }
 
-impl BlockStorage for BlockFile {
-    fn save_block(
-        &mut self,
-        block: &Block,
-        _block_height: u32,
-        proof: rustreexo::accumulator::proof::Proof<crate::prover::AccumulatorHash>,
-        leaves: Vec<crate::udata::LeafContext>,
-        _acc: &MemForest<crate::prover::AccumulatorHash>,
-    ) -> BlockIndex {
-        let batch_proof = BatchProof {
-            targets: proof.targets.iter().map(|x| VarInt(*x)).collect(),
-            hashes: proof
-                .hashes
-                .iter()
-                .map(|x| BlockHash::from_byte_array(**x))
-                .collect(),
-        };
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-        let leaves = leaves.iter().map(CompactLeafData::from).collect();
+    use super::*;
 
-        let block = UtreexoBlock {
-            block: block.clone(),
-            udata: Some(UData {
-                remember_idx: vec![],
-                proof: batch_proof,
-                leaves,
-            }),
-        };
+    #[test]
+    fn concurrent_appends_reserve_disjoint_ranges_without_a_lock() {
+        let path =
+            std::env::temp_dir().join(format!("bridge-proof-file-{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = Arc::new(ProofFile::new(path.clone()).unwrap());
+        let proof = CompactBlockProof::default();
+        let mut indexes = (0..8)
+            .map(|_| {
+                let file = Arc::clone(&file);
+                let proof = proof.clone();
+                std::thread::spawn(move || file.append(&proof).unwrap())
+            })
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        indexes.sort_unstable_by_key(|index| index.offset);
+        assert!(indexes
+            .windows(2)
+            .all(|pair| pair[0].offset + pair[0].size <= pair[1].offset));
+        assert!(indexes
+            .iter()
+            .all(|index| file.get(index).as_ref() == Some(&proof)));
 
-        self.append(&block)
-    }
-
-    fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock> {
-        self.get_block(index)
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -30,6 +30,7 @@ use bitcoinkernel::ChainType;
 use bitcoinkernel::ChainstateManager;
 use bitcoinkernel::Context as KernelContext;
 use bitcoinkernel::ContextBuilder;
+use bridge::prefixed_hints::write_leaf_count_prefix;
 use clap::Parser;
 use hintsfile::EliasFano;
 use hintsfile::HintsfileBuilder;
@@ -112,9 +113,16 @@ fn main() -> Result<()> {
         Some(capacity) => AHashMap::with_capacity(capacity),
         None => AHashMap::new(),
     };
+    let leaf_count_len = usize::try_from(stop_height)
+        .context("stop height exceeds usize")?
+        .checked_add(1)
+        .context("leaf-count vector length overflow")?;
+    let mut leaf_counts = vec![0u32; leaf_count_len];
     for height in 1..=stop_height {
         let block = kernel.block_at_height(height)?;
         let eligible_outputs = apply_block(height, &block, &mut utxos)?;
+        leaf_counts[usize::try_from(height).context("block height exceeds usize")?] =
+            eligible_outputs;
 
         if cli.progress_every != 0 && (height % cli.progress_every == 0 || height == stop_height) {
             eprintln!(
@@ -126,7 +134,7 @@ fn main() -> Result<()> {
 
     let live_utxos = utxos.len();
     let indices = collect_unspent_indices(stop_height, utxos)?;
-    write_hints_file(&cli.output, stop_height, &indices, cli.force)?;
+    write_hints_file(&cli.output, stop_height, &leaf_counts, &indices, cli.force)?;
     eprintln!(
         "Wrote {} with stop_height={stop_height} live_utxos={live_utxos}",
         cli.output.display()
@@ -254,7 +262,6 @@ fn apply_block(
             if script_pubkey.len() > 10_000
                 || script_pubkey.first() == Some(&0x6a)
                 || same_block_spends.contains(&outpoint)
-                || bip30_exclusion == Some(outpoint)
             {
                 continue;
             }
@@ -263,12 +270,15 @@ fn apply_block(
                 height,
                 index: eligible_outputs,
             };
-            if utxos.insert(outpoint, position).is_some() {
-                bail!("duplicate unspent outpoint {outpoint:?} at height {height}");
-            }
             eligible_outputs = eligible_outputs
                 .checked_add(1)
                 .context("one block contains more than u32::MAX eligible outputs")?;
+            if bip30_exclusion == Some(outpoint) {
+                continue;
+            }
+            if utxos.insert(outpoint, position).is_some() {
+                bail!("duplicate unspent outpoint {outpoint:?} at height {height}");
+            }
         }
     }
     Ok(eligible_outputs)
@@ -334,20 +344,30 @@ fn collect_unspent_indices(
     Ok(indices)
 }
 
-fn encode_hints<W: Write>(writer: W, stop_height: u32, indices: &[Vec<u32>]) -> Result<()> {
-    if indices.len() != stop_height as usize + 1 {
+fn encode_hints<W: Write>(
+    mut writer: W,
+    stop_height: u32,
+    leaf_counts: &[u32],
+    indices: &[Vec<u32>],
+) -> Result<()> {
+    let expected = usize::try_from(stop_height)
+        .context("stop height exceeds usize")?
+        .checked_add(1)
+        .context("per-height hint vector length overflow")?;
+    if indices.len() != expected {
         bail!(
-            "expected {} per-height hint vectors, got {}",
-            stop_height as usize + 1,
+            "expected {expected} per-height hint vectors, got {}",
             indices.len()
         );
     }
+    write_leaf_count_prefix(&mut writer, stop_height, leaf_counts)?;
     let mut builder = HintsfileBuilder::new(writer)
         .initialize(stop_height)
         .context("failed to initialize hintsfile")?;
     for height in 1..=stop_height {
+        let index = usize::try_from(height).context("hint height exceeds usize")?;
         builder
-            .append(EliasFano::compress(&indices[height as usize]))
+            .append(EliasFano::compress(&indices[index]))
             .with_context(|| format!("failed to encode hints at height {height}"))?;
     }
     builder.finish().context("failed to finish hintsfile")
@@ -356,6 +376,7 @@ fn encode_hints<W: Write>(writer: W, stop_height: u32, indices: &[Vec<u32>]) -> 
 fn write_hints_file(
     output: &Path,
     stop_height: u32,
+    leaf_counts: &[u32],
     indices: &[Vec<u32>],
     force: bool,
 ) -> Result<()> {
@@ -392,6 +413,7 @@ fn write_hints_file(
         encode_hints(
             BufWriter::with_capacity(1024 * 1024, file),
             stop_height,
+            leaf_counts,
             indices,
         )?;
         OpenOptions::new()
@@ -438,7 +460,7 @@ mod tests {
     use bitcoin::TxMerkleNode;
     use bitcoin::TxOut;
     use bitcoin::Witness;
-    use hintsfile::Hintsfile;
+    use bridge::prefixed_hints::BridgeHints;
 
     use super::*;
 
@@ -544,12 +566,28 @@ mod tests {
         assert_eq!(indices[1], vec![1]);
         assert_eq!(indices[2], vec![0, 1]);
 
+        let leaf_counts = vec![0, 2, 2];
         let mut encoded = Vec::new();
-        encode_hints(&mut encoded, 2, &indices).unwrap();
-        let hints = Hintsfile::from_reader(&mut Cursor::new(encoded)).unwrap();
+        encode_hints(&mut encoded, 2, &leaf_counts, &indices).unwrap();
+        let hints = BridgeHints::from_reader(&mut Cursor::new(encoded)).unwrap();
         assert_eq!(hints.stop_height(), 2);
+        assert_eq!(hints.leaf_count_at_height(1), Some(2));
+        assert_eq!(hints.leaf_count_at_height(2), Some(2));
         assert_eq!(hints.indices_at_height(1), Some(vec![1]));
         assert_eq!(hints.indices_at_height(2), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn rejects_unprefixed_library_hintsfile() {
+        let mut raw = Vec::new();
+        let mut builder = HintsfileBuilder::new(&mut raw).initialize(1).unwrap();
+        builder.append(EliasFano::compress(&[])).unwrap();
+        builder.finish().unwrap();
+
+        let error = BridgeHints::from_reader(&mut Cursor::new(raw)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing the bridge leaf-count prefix"));
     }
 
     #[test]

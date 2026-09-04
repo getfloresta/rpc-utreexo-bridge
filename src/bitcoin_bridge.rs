@@ -2,55 +2,43 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::RwLock;
 
-use actix_rt::signal::ctrl_c;
+use anyhow::Context;
 use bitcoin::consensus::serialize;
 use bitcoin::constants::genesis_block;
+use bridge::prefixed_hints::BridgeHints;
 use clap::Parser;
-use futures::channel::mpsc::channel;
-use hintsfile::Hintsfile;
 use log::info;
-use log::warn;
 
-use crate::api;
 use crate::block_index::BlocksIndex;
-use crate::blockfile::BlockFile;
 use crate::blockfile::ProofFile;
+use crate::chaininterface::Blockchain;
 use crate::chainview;
 use crate::cli::CliArgs;
 use crate::get_chain_provider;
+use crate::header_index::HeaderIndex;
 use crate::init_logger;
-use crate::leaf_cache::DiskLeafStorage;
 use crate::node;
 use crate::node::ProofBackend;
 use crate::node::WorkerContext;
 use crate::parallel_forest::build_parallel_forest;
 use crate::parallel_forest::KernelBlockSource;
 use crate::parallel_forest::ParallelForestConfig;
-use crate::prover;
 use crate::prover::FlatFileProver;
 use crate::subdir;
 
 pub fn run_bridge() -> anyhow::Result<()> {
     let cli_options = CliArgs::parse();
-    fs::DirBuilder::new()
-        .recursive(true)
-        .create(subdir(""))
-        .unwrap();
+    fs::DirBuilder::new().recursive(true).create(subdir(""))?;
 
-    // Initialize the logger
-    init_logger(
-        Some(&subdir("debug.log")),
-        simplelog::LevelFilter::Info,
-        true,
-    );
+    init_logger(Some(&subdir("debug.log")), true)?;
 
     if let Some(hints_path) = cli_options.build_forest.as_deref() {
         let file = File::open(hints_path)?;
-        let hints = Hintsfile::from_reader(&mut BufReader::new(file))?;
+        let hints = BridgeHints::from_reader(&mut BufReader::new(file))?;
         let forest_path = cli_options
             .forest_file
             .clone()
@@ -60,6 +48,14 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .leaf_map_path
             .clone()
             .unwrap_or_else(|| subdir("leaf-map").into());
+        config.header_file_path = cli_options
+            .header_file
+            .clone()
+            .unwrap_or_else(|| subdir("headers.dat").into());
+        config.header_index_path = cli_options
+            .header_index_path
+            .clone()
+            .unwrap_or_else(|| subdir("header-index").into());
         if let Some(workers) = cli_options.forest_leaf_workers {
             config.leaf_workers = workers;
         }
@@ -69,6 +65,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         if let Some(iterations) = cli_options.forest_spin_iterations {
             config.spin_iterations = iterations;
         }
+        config.minimum_leaf_capacity = cli_options.forest_leaf_capacity;
         config.lock_pages = !cli_options.forest_no_mlock;
 
         let source = KernelBlockSource::open(cli_options.network)?;
@@ -87,7 +84,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
 
     if let Some(hints_path) = cli_options.steady_state.as_deref() {
         let file = File::open(hints_path)?;
-        let hints = Hintsfile::from_reader(&mut BufReader::new(file))?;
+        let hints = BridgeHints::from_reader(&mut BufReader::new(file))?;
         let forest_path = cli_options
             .forest_file
             .clone()
@@ -96,118 +93,62 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .leaf_map_path
             .clone()
             .unwrap_or_else(|| subdir("leaf-map").into());
-        let proof_index = Arc::new(open_index(subdir("proof-index/")));
-        let proof_file = Arc::new(RwLock::new(ProofFile::new(subdir("proofs").into())?));
-        let view = open_chain_view(cli_options.network);
+        let header_file_path = cli_options
+            .header_file
+            .clone()
+            .unwrap_or_else(|| subdir("headers.dat").into());
+        let header_index_path = cli_options
+            .header_index_path
+            .clone()
+            .unwrap_or_else(|| subdir("header-index").into());
+        let proof_index = Arc::new(open_index(subdir("proof-index/"))?);
+        let proof_file = Arc::new(ProofFile::new(subdir("proofs").into())?);
+        let view = open_chain_view(cli_options.network)?;
+        let header_index = Arc::new(HeaderIndex::open(&header_file_path, &header_index_path)?);
         let (block_notifier_tx, block_notifier_rx) = std::sync::mpsc::channel();
-        start_p2p(
-            cli_options.network,
-            view,
-            proof_index.clone(),
-            ProofBackend::CompactProofs(proof_file.clone()),
-            block_notifier_rx,
-        );
-        let client = get_chain_provider()?;
-        let kill_signal = Arc::new(Mutex::new(false));
-        let shutdown = kill_signal.clone();
+        let client: Arc<dyn Blockchain> = get_chain_provider()?.into();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = Arc::clone(&shutdown);
         ctrlc::set_handler(move || {
-            *shutdown.lock().unwrap() = true;
+            shutdown_signal.store(true, Ordering::Release);
         })?;
+        let pollard_memory_limit = cli_options
+            .pollard_memory_mib
+            .checked_mul(1024 * 1024)
+            .context("Pollard memory limit exceeds usize")?;
         let mut prover = FlatFileProver::new(
-            client,
+            client.clone(),
+            header_index.clone(),
             &forest_path,
+            subdir("forest.journal").into(),
             &leaf_map_path,
-            proof_file,
-            proof_index,
+            proof_file.clone(),
+            proof_index.clone(),
             hints.stop_height(),
             !cli_options.forest_no_mlock,
-            kill_signal,
+            pollard_memory_limit,
+            shutdown,
             block_notifier_tx,
+        )?;
+        let legacy_proof_forest_rows =
+            proof_index.legacy_proof_forest_rows(prover.forest_rows()?)?;
+        start_p2p(
+            cli_options.network,
+            view.clone(),
+            proof_index,
+            ProofBackend::CompactProofs(proof_file),
+            Some(client),
+            Some(header_index),
+            Some(legacy_proof_forest_rows),
+            block_notifier_rx,
         )?;
         return prover.keep_up();
     }
 
-    let view = open_chain_view(cli_options.network);
-
-    // This database stores some useful information about the blocks, but not
-    // the blocks themselves.
-    let index_store = open_index(subdir("index/"));
-
-    // Put it into an Arc so we can share it between threads
-    let index_store = Arc::new(index_store);
-    // This database stores the blocks themselves, it's a collection of flat files
-    // that are indexed by the index above. They are stored in the `blocks/` directory
-    // and are serialized as bitcoin blocks, so we don't need to do any parsing
-    // before sending to a peer.
-    let blocks = Arc::new(RwLock::new(
-        BlockFile::new(subdir("blocks").into(), 10_000_000_000).expect("Could not open block file"),
-    ));
-
-    // The prover needs some way to pull blocks from a trusted source, we can use anything
-    // implementing the [Blockchain] trait, for example a bitcoin core node or an esplora
-    // instance.
-    let client = get_chain_provider()?;
-
-    // Create a prover, this module will download blocks from the bitcoin core
-    // node and save them to disk. It will also create proofs for the blocks
-    // and save them to disk.
-    let leaf_data = DiskLeafStorage::new(&subdir("leaf_data"));
-
-    // a signal used to stop the prover
-    let kill_signal = Arc::new(Mutex::new(false));
-
-    //let leaf_data = HashMap::new(); // In-memory leaf storage,
-    // faster than leaf_data but uses more memory
-
-    let (block_notifier_tx, block_notifier_rx) = std::sync::mpsc::channel();
-    let mut prover = prover::Prover::new(
-        client,
-        index_store.clone(),
-        blocks.clone(),
-        view.clone(),
-        leaf_data,
-        cli_options.initial_state_path.map(Into::into),
-        cli_options.start_height,
-        cli_options.acc_snapshot_every_n_blocks,
-        kill_signal.clone(),
-        cli_options.save_proofs_after.unwrap_or(0),
-        block_notifier_tx,
-    );
-
-    start_p2p(
-        cli_options.network,
-        view.clone(),
-        index_store.clone(),
-        ProofBackend::LegacyBlocks(blocks.clone()),
-        block_notifier_rx,
-    );
-
-    let (sender, receiver) = channel(1024);
-    // This is our implementation of the json-rpc api, it will listen for
-    // incoming connections and serve some Utreexo data to clients.
-    info!("Starting api");
-    let host = env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1:3000".into());
-    std::thread::spawn(move || {
-        actix_rt::System::new()
-            .block_on(api::create_api(sender, view, &host))
-            .unwrap()
-    });
-
-    // Keep the prover running in the background, it will download blocks and
-    // create proofs for them as they are mined.
-    info!("Running prover");
-    std::thread::spawn(move || {
-        actix_rt::System::new().block_on(async {
-            let _ = ctrl_c().await;
-            warn!("Received a stop signal");
-            *kill_signal.lock().unwrap() = true;
-        })
-    });
-
-    prover.keep_up(receiver)
+    anyhow::bail!("either --build-forest or --steady-state is required")
 }
 
-fn open_chain_view(network: bitcoin::Network) -> Arc<chainview::ChainView> {
+fn open_chain_view(network: bitcoin::Network) -> anyhow::Result<Arc<chainview::ChainView>> {
     let store = kv::Store::new(kv::Config {
         path: subdir("chain_view").into(),
         temporary: false,
@@ -215,48 +156,51 @@ fn open_chain_view(network: bitcoin::Network) -> Arc<chainview::ChainView> {
         flush_every_ms: None,
         cache_capacity: None,
         segment_size: None,
-    })
-    .expect("Failed to open chainview database");
+    })?;
     let view = Arc::new(chainview::ChainView::new(store));
     let genesis = genesis_block(network);
-    if view.get_height(genesis.block_hash()).is_err() {
-        view.save_header(genesis.block_hash(), serialize(&genesis.header))
-            .expect("Failed to save genesis header");
-        view.save_height(genesis.header.block_hash(), 0)
-            .expect("Failed to save genesis height");
+    if view.get_height(genesis.block_hash())? != Some(0) {
+        view.save_header(genesis.block_hash(), serialize(&genesis.header))?;
+        view.save_height(genesis.header.block_hash(), 0)?;
     }
-    view
+    Ok(view)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_p2p(
     network: bitcoin::Network,
     view: Arc<chainview::ChainView>,
     proof_index: Arc<BlocksIndex>,
     proof_backend: ProofBackend,
+    header_source: Option<Arc<dyn Blockchain>>,
+    header_index: Option<Arc<HeaderIndex>>,
+    proof_forest_rows: Option<u8>,
     block_notifier: std::sync::mpsc::Receiver<bitcoin::BlockHash>,
-) {
-    info!("Starting BIP 183 proof server");
+) -> anyhow::Result<()> {
+    info!("Starting P2PV2-only BIP 183 proof server");
     let p2p_port = env::var("P2P_PORT").unwrap_or_else(|_| "8333".into());
     let p2p_address = format!(
         "{}:{}",
         env::var("P2P_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
         p2p_port
-    );
+    )
+    .parse()
+    .context("invalid P2P listen address")?;
     let worker_context = WorkerContext {
         chainview: view,
         magic: network.magic(),
         proof_index,
         proof_backend,
+        header_index,
+        header_source,
+        proof_forest_rows,
     };
-    node::Node::run(
-        p2p_address.parse().expect("invalid P2P listen address"),
-        worker_context,
-        block_notifier,
-    );
+    node::Node::run(p2p_address, worker_context, block_notifier);
+    Ok(())
 }
 
-fn open_index(path: String) -> BlocksIndex {
-    BlocksIndex {
+fn open_index(path: String) -> anyhow::Result<BlocksIndex> {
+    Ok(BlocksIndex {
         database: kv::Store::new(kv::Config {
             path: path.into(),
             temporary: false,
@@ -264,7 +208,6 @@ fn open_index(path: String) -> BlocksIndex {
             flush_every_ms: Some(1000),
             cache_capacity: Some(1_000_000),
             segment_size: None,
-        })
-        .expect("Failed to open proof index"),
-    }
+        })?,
+    })
 }
