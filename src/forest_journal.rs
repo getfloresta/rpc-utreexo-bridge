@@ -76,6 +76,14 @@ impl JournalEntry {
             .checked_sub(self.added.len() as u64)
             .context("journal addition count exceeds numleaves")
     }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        encode_entry(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        decode_entry(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,7 +186,7 @@ impl ForestJournal {
 
     /// Appends a complete page-aligned entry without flushing it.
     pub fn append(&mut self, entry: JournalEntry) -> Result<usize> {
-        let payload = encode_entry(&entry)?;
+        let payload = entry.encode()?;
         if payload.len() > MAX_RECORD_BYTES {
             bail!("journal entry is too large: {} bytes", payload.len());
         }
@@ -480,7 +488,7 @@ impl ForestJournal {
                 break;
             }
             self.records.push(JournalRecord {
-                entry: decode_entry(&payload)?,
+                entry: JournalEntry::decode(&payload)?,
                 status,
                 offset,
                 span,
@@ -535,8 +543,11 @@ fn decode_entry(bytes: &[u8]) -> Result<JournalEntry> {
     let num_leaves = take_u64(&mut reader)?;
     let height = take_u32(&mut reader)?;
     let previous_block_hash = BlockHash::from_byte_array(take_array(&mut reader)?);
-    let forest_len = take_len(&mut reader)?;
-    let mut forest = Vec::with_capacity(forest_len);
+    let forest_len = take_len(&mut reader, 74)?;
+    let mut forest = Vec::new();
+    forest
+        .try_reserve_exact(forest_len)
+        .context("journal forest delta allocation failed")?;
     for _ in 0..forest_len {
         forest.push(JournalForestDelta {
             position: take_u64(&mut reader)?,
@@ -544,13 +555,19 @@ fn decode_entry(bytes: &[u8]) -> Result<JournalEntry> {
             after: decode_state(&mut reader)?,
         });
     }
-    let removed_len = take_len(&mut reader)?;
-    let mut removed = Vec::with_capacity(removed_len);
+    let removed_len = take_len(&mut reader, 44)?;
+    let mut removed = Vec::new();
+    removed
+        .try_reserve_exact(removed_len)
+        .context("journal removed-index allocation failed")?;
     for _ in 0..removed_len {
         removed.push(decode_index_delta(&mut reader)?);
     }
-    let added_len = take_len(&mut reader)?;
-    let mut added = Vec::with_capacity(added_len);
+    let added_len = take_len(&mut reader, 44)?;
+    let mut added = Vec::new();
+    added
+        .try_reserve_exact(added_len)
+        .context("journal added-index allocation failed")?;
     for _ in 0..added_len {
         added.push(decode_index_delta(&mut reader)?);
     }
@@ -610,8 +627,15 @@ fn push_len(bytes: &mut Vec<u8>, length: usize) -> Result<()> {
     Ok(())
 }
 
-fn take_len(reader: &mut &[u8]) -> Result<usize> {
-    Ok(take_u32(reader)? as usize)
+fn take_len(reader: &mut &[u8], element_size: usize) -> Result<usize> {
+    let length = take_u32(reader)? as usize;
+    if length > reader.len() / element_size {
+        bail!(
+            "journal vector length {length} exceeds remaining {}-byte payload",
+            reader.len()
+        );
+    }
+    Ok(length)
 }
 
 fn take_u32(reader: &mut &[u8]) -> Result<u32> {
