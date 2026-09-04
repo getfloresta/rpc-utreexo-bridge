@@ -10,11 +10,9 @@ WORKDIR /app
 
 COPY --from=build /app/target/release/bridge /app/bridge
 
-EXPOSE 8000
-EXPOSE 9000
+EXPOSE 8333
 
 VOLUME /app/data
-
 ENV DATA_DIR=/app/data
 
-CMD ["/app/bridge"]
+ENTRYPOINT ["/app/bridge"]
