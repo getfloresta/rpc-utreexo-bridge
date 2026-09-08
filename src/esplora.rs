@@ -45,12 +45,6 @@ impl Blockchain for EsploraBlockchain {
         Ok(consensus::deserialize::<Block>(&block)?)
     }
 
-    fn get_transaction(&self, txid: bitcoin::Txid) -> Result<bitcoin::Transaction> {
-        let url = format!("{}/tx/{}/raw", self.url, txid);
-        let tx = self.client.get(url).send()?.bytes()?;
-        Ok(consensus::deserialize::<bitcoin::Transaction>(&tx)?)
-    }
-
     fn get_block_height(&self, block_hash: BlockHash) -> Result<u32> {
         let url = format!("{}/block/{}", self.url, block_hash);
         let block = self.client.get(url).send()?.text()?;
@@ -190,7 +184,7 @@ mod tests {
         let tx: serde_json::Value = serde_json::from_str(&tx).unwrap();
 
         let tx_hex = client
-            .get(&format!(
+            .get(format!(
                 "{}/tx/{}/hex",
                 base_url, "5c6574473085c1b25fc53d95f85cfdf3b6ba64fffe88893c62bc5bfd99028e89"
             ))

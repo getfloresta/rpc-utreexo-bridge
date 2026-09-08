@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use bitcoin::consensus;
-use bitcoin::consensus::encode::Error;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
-use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::ScriptBuf;
 use bitcoin::Txid;
@@ -50,6 +48,28 @@ pub struct CompactLeafData {
     pub amount: u64,
     /// The type of the locking script for this UTXO
     pub spk_ty: ScriptPubkeyType,
+}
+
+impl From<&LeafContext> for CompactLeafData {
+    fn from(leaf: &LeafContext) -> Self {
+        let spk_ty = if leaf.pk_script.is_p2pkh() {
+            ScriptPubkeyType::PubKeyHash
+        } else if leaf.pk_script.is_p2sh() {
+            ScriptPubkeyType::ScriptHash
+        } else if leaf.pk_script.is_p2wpkh() {
+            ScriptPubkeyType::WitnessV0PubKeyHash
+        } else if leaf.pk_script.is_p2wsh() {
+            ScriptPubkeyType::WitnessV0ScriptHash
+        } else {
+            ScriptPubkeyType::Other(leaf.pk_script.to_bytes().into_boxed_slice())
+        };
+
+        Self {
+            header_code: (leaf.block_height << 1) | u32::from(leaf.is_coinbase),
+            amount: leaf.value,
+            spk_ty,
+        }
+    }
 }
 
 /// A recoverable scriptPubkey type, this avoids copying over data that are already
@@ -144,129 +164,80 @@ pub struct BatchProof {
     pub hashes: Vec<BlockHash>,
 }
 
-/// UData contains data needed to prove the existence and validity of all inputs
-/// for a Bitcoin block.  With this data, a full node may only keep the utreexo
-/// roots and still be able to fully validate a block.
+/// A block proof retained independently from the block fetched through Bitcoin Core.
+///
+/// Its consensus encoding is exactly `<targets><proof hashes><leaf data>`.
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
-pub struct UData {
-    /// All the indexes of new utxos to remember.
-    pub remember_idx: Vec<u64>,
-    /// AccProof is the utreexo accumulator proof for all the inputs.
+pub struct CompactBlockProof {
     pub proof: BatchProof,
-    /// LeafData are the tx validation data for every input.
     pub leaves: Vec<CompactLeafData>,
 }
 
-/// A block plus some udata
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub struct UtreexoBlock {
-    /// A actual block
-    pub block: Block,
-    /// The utreexo specific data
-    pub udata: Option<UData>,
-}
-
-impl Decodable for UtreexoBlock {
-    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
-        reader: &mut R,
-    ) -> Result<Self, consensus::encode::Error> {
-        let block = Block::consensus_decode(reader)?;
-
-        if let Err(Error::Io(_remember)) = VarInt::consensus_decode(reader) {
-            return Ok(block.into());
-        };
-
-        let n_positions = VarInt::consensus_decode(reader)?;
-        let mut targets = vec![];
-        for _ in 0..n_positions.0 {
-            let pos = VarInt::consensus_decode(reader)?;
-            targets.push(pos);
-        }
-
-        let n_hashes = VarInt::consensus_decode(reader)?;
-        let mut hashes = vec![];
-        for _ in 0..n_hashes.0 {
-            let hash = BlockHash::consensus_decode(reader)?;
-            hashes.push(hash);
-        }
-
-        let n_leaves = VarInt::consensus_decode(reader)?;
-        let mut leaves = vec![];
-        for _ in 0..n_leaves.0 {
-            let header_code = u32::consensus_decode(reader)?;
-            let amount = u64::consensus_decode(reader)?;
-            let spk_ty = ScriptPubkeyType::consensus_decode(reader)?;
-
-            leaves.push(CompactLeafData {
-                header_code,
-                amount,
-                spk_ty,
-            });
-        }
-
-        Ok(Self {
-            block,
-            udata: Some(UData {
-                remember_idx: vec![],
-                proof: BatchProof { targets, hashes },
-                leaves,
-            }),
-        })
-    }
-}
-
-impl Encodable for UtreexoBlock {
+impl Encodable for CompactBlockProof {
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
     ) -> Result<usize, bitcoin::io::Error> {
-        let mut len = self.block.consensus_encode(writer)?;
-
-        if let Some(udata) = &self.udata {
-            len += VarInt(udata.remember_idx.len() as u64).consensus_encode(writer)?;
-            len += VarInt(udata.proof.targets.len() as u64).consensus_encode(writer)?;
-            for target in &udata.proof.targets {
-                len += target.consensus_encode(writer)?;
-            }
-
-            len += VarInt(udata.proof.hashes.len() as u64).consensus_encode(writer)?;
-            for hash in &udata.proof.hashes {
-                len += hash.consensus_encode(writer)?;
-            }
-
-            len += VarInt(udata.leaves.len() as u64).consensus_encode(writer)?;
-            for leaf in &udata.leaves {
-                len += leaf.header_code.consensus_encode(writer)?;
-                len += leaf.amount.consensus_encode(writer)?;
-                len += leaf.spk_ty.consensus_encode(writer)?;
-            }
+        let mut len = VarInt(self.proof.targets.len() as u64).consensus_encode(writer)?;
+        for target in &self.proof.targets {
+            len += target.consensus_encode(writer)?;
         }
-
+        len += VarInt(self.proof.hashes.len() as u64).consensus_encode(writer)?;
+        for hash in &self.proof.hashes {
+            len += hash.consensus_encode(writer)?;
+        }
+        len += VarInt(self.leaves.len() as u64).consensus_encode(writer)?;
+        for leaf in &self.leaves {
+            len += leaf.header_code.consensus_encode(writer)?;
+            len += leaf.amount.consensus_encode(writer)?;
+            len += leaf.spk_ty.consensus_encode(writer)?;
+        }
         Ok(len)
     }
 }
 
-impl From<UtreexoBlock> for Block {
-    fn from(block: UtreexoBlock) -> Self {
-        block.block
+impl Decodable for CompactBlockProof {
+    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, consensus::encode::Error> {
+        let target_count = VarInt::consensus_decode(reader)?.0;
+        let mut targets = Vec::with_capacity(target_count as usize);
+        for _ in 0..target_count {
+            targets.push(VarInt::consensus_decode(reader)?);
+        }
+
+        let hash_count = VarInt::consensus_decode(reader)?.0;
+        let mut hashes = Vec::with_capacity(hash_count as usize);
+        for _ in 0..hash_count {
+            hashes.push(BlockHash::consensus_decode(reader)?);
+        }
+
+        let leaf_count = VarInt::consensus_decode(reader)?.0;
+        let mut leaves = Vec::with_capacity(leaf_count as usize);
+        for _ in 0..leaf_count {
+            leaves.push(CompactLeafData {
+                header_code: u32::consensus_decode(reader)?,
+                amount: u64::consensus_decode(reader)?,
+                spk_ty: ScriptPubkeyType::consensus_decode(reader)?,
+            });
+        }
+
+        Ok(Self {
+            proof: BatchProof { targets, hashes },
+            leaves,
+        })
     }
 }
 
-impl From<Block> for UtreexoBlock {
-    fn from(block: Block) -> Self {
-        UtreexoBlock { block, udata: None }
-    }
-}
-
-#[cfg(not(feature = "shinigami"))]
 pub mod bitcoin_leaf_data {
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::Encodable;
+    use bitcoin::hashes::Hash;
     use bitcoin::Amount;
     use bitcoin::BlockHash;
     use bitcoin::OutPoint;
     use bitcoin::TxOut;
-    use rustreexo::accumulator::node_hash::BitcoinNodeHash;
+    use rustreexo::node_hash::BitcoinNodeHash;
     use serde::Deserialize;
     use serde::Serialize;
     use sha2::Digest;
@@ -308,6 +279,50 @@ pub mod bitcoin_leaf_data {
         pub utxo: TxOut,
     }
 
+    pub(crate) fn get_leaf_hash_from_parts(
+        block_hash: [u8; 32],
+        txid: [u8; 32],
+        vout: u32,
+        header_code: u32,
+        value: u64,
+        script_pubkey: &[u8],
+    ) -> BitcoinNodeHash {
+        let mut compact_size = [0u8; 9];
+        let compact_size_len = match script_pubkey.len() as u64 {
+            value @ 0..=0xfc => {
+                compact_size[0] = value as u8;
+                1
+            }
+            value @ 0xfd..=0xffff => {
+                compact_size[0] = 0xfd;
+                compact_size[1..3].copy_from_slice(&(value as u16).to_le_bytes());
+                3
+            }
+            value @ 0x1_0000..=0xffff_ffff => {
+                compact_size[0] = 0xfe;
+                compact_size[1..5].copy_from_slice(&(value as u32).to_le_bytes());
+                5
+            }
+            value => {
+                compact_size[0] = 0xff;
+                compact_size[1..9].copy_from_slice(&value.to_le_bytes());
+                9
+            }
+        };
+        let leaf_hash = Sha512_256::new()
+            .chain_update(UTREEXO_TAG_V1)
+            .chain_update(UTREEXO_TAG_V1)
+            .chain_update(block_hash)
+            .chain_update(txid)
+            .chain_update(vout.to_le_bytes())
+            .chain_update(header_code.to_le_bytes())
+            .chain_update(value.to_le_bytes())
+            .chain_update(&compact_size[..compact_size_len])
+            .chain_update(script_pubkey)
+            .finalize();
+        BitcoinNodeHash::from(leaf_hash.as_slice())
+    }
+
     impl BitcoinLeafData {
         pub fn get_leaf_hashes(leaf: &LeafContext) -> BitcoinNodeHash {
             let leaf_data = BitcoinLeafData::from(leaf.clone());
@@ -315,18 +330,14 @@ pub mod bitcoin_leaf_data {
         }
 
         fn compute_hash(&self) -> BitcoinNodeHash {
-            let mut ser_utxo = vec![];
-            let _ = self.utxo.consensus_encode(&mut ser_utxo);
-            let leaf_hash = Sha512_256::new()
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(UTREEXO_TAG_V1)
-                .chain_update(self.block_hash)
-                .chain_update(self.prevout.txid)
-                .chain_update(self.prevout.vout.to_le_bytes())
-                .chain_update(self.header_code.to_le_bytes())
-                .chain_update(ser_utxo)
-                .finalize();
-            BitcoinNodeHash::from(leaf_hash.as_slice())
+            get_leaf_hash_from_parts(
+                self.block_hash.to_byte_array(),
+                self.prevout.txid.to_byte_array(),
+                self.prevout.vout,
+                self.header_code,
+                self.utxo.value.to_sat(),
+                self.utxo.script_pubkey.as_bytes(),
+            )
         }
     }
 
@@ -385,270 +396,4 @@ pub mod bitcoin_leaf_data {
     }
 }
 
-#[cfg(feature = "shinigami")]
-pub mod shinigami_udata {
-    use bitcoin::consensus::Encodable;
-    use bitcoin::hashes::Hash;
-    use bitcoin::Script;
-    use bitcoin::Txid;
-    use rustreexo::accumulator::node_hash::AccumulatorHash;
-    use serde::Serialize;
-    use starknet_crypto::poseidon_hash;
-    use starknet_crypto::poseidon_hash_many;
-    use starknet_crypto::Felt;
-
-    use super::LeafContext;
-
-    #[derive(Debug, Clone)]
-    pub struct ByteArray {
-        pub data: Vec<Felt>,
-        pub pending_word: Felt,
-        pub pending_word_len: usize,
-    }
-
-    #[derive(Debug, Clone)]
-    #[allow(dead_code)]
-    pub struct ShinigamiLeafData {
-        txid: Txid,
-        vout: u32,
-        value: u64,
-        pk_script: ByteArray,
-        block_height: u32,
-        median_time_past: u32,
-        is_coinbase: bool,
-    }
-
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    /// We need a stateful wrapper around the actual hash, this is because we use those different
-    /// values inside our accumulator. Here we use an enum to represent the different states, you
-    /// may want to use a struct with more data, depending on your needs.
-    pub enum PoseidonHash {
-        /// This means this holds an actual value
-        ///
-        /// It usually represents a node in the accumulator that haven't been deleted.
-        Hash(Felt),
-        /// Placeholder is a value that haven't been deleted, but we don't have the actual value.
-        /// The only thing that matters about it is that it's not empty. You can implement this
-        /// the way you want, just make sure that [BitcoinNodeHash::is_placeholder] and [NodeHash::placeholder]
-        /// returns sane values (that is, if we call [BitcoinNodeHash::placeholder] calling [NodeHash::is_placeholder]
-        /// on the result should return true).
-        Placeholder,
-        /// This is an empty value, it represents a node that was deleted from the accumulator.
-        ///
-        /// Same as the placeholder, you can implement this the way you want, just make sure that
-        /// [BitcoinNodeHash::is_empty] and [NodeHash::empty] returns sane values.
-        #[default]
-        Empty,
-    }
-
-    // you'll need to implement Display for your hash type, so you can print it.
-    impl std::fmt::Display for PoseidonHash {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                PoseidonHash::Hash(h) => write!(f, "Hash({})", h.to_hex_string()),
-                PoseidonHash::Placeholder => write!(f, "Placeholder"),
-                PoseidonHash::Empty => write!(f, "Empty"),
-            }
-        }
-    }
-
-    // this is the implementation of the BitcoinNodeHash trait for our custom hash type. And it's the only
-    // thing you need to do to use your custom hash type with the accumulator data structures.
-    impl AccumulatorHash for PoseidonHash {
-        // returns a new placeholder type such that is_placeholder returns true
-        fn placeholder() -> Self {
-            PoseidonHash::Placeholder
-        }
-
-        // returns an empty hash such that is_empty returns true
-        fn empty() -> Self {
-            PoseidonHash::Empty
-        }
-
-        // returns true if this is a placeholder. This should be true iff this type was created by
-        // calling placeholder.
-        fn is_placeholder(&self) -> bool {
-            matches!(self, PoseidonHash::Placeholder)
-        }
-
-        // returns true if this is an empty hash. This should be true iff this type was created by
-        // calling empty.
-        fn is_empty(&self) -> bool {
-            matches!(self, PoseidonHash::Empty)
-        }
-
-        // used for serialization, writes the hash to the writer
-        //
-        // if you don't want to use serialization, you can just return an error here.
-        fn write<W>(&self, writer: &mut W) -> std::io::Result<()>
-        where
-            W: std::io::Write,
-        {
-            match self {
-                PoseidonHash::Hash(h) => writer.write_all(&h.to_bytes_be()),
-                PoseidonHash::Placeholder => writer.write_all(&[0u8; 32]),
-                PoseidonHash::Empty => writer.write_all(&[0u8; 32]),
-            }
-        }
-
-        // used for deserialization, reads the hash from the reader
-        //
-        // if you don't want to use serialization, you can just return an error here.
-        fn read<R>(reader: &mut R) -> std::io::Result<Self>
-        where
-            R: std::io::Read,
-        {
-            let mut buf = [0u8; 32];
-            reader.read_exact(&mut buf)?;
-            if buf.iter().all(|&b| b == 0) {
-                Ok(PoseidonHash::Empty)
-            } else {
-                Ok(PoseidonHash::Hash(Felt::from_bytes_be(&buf)))
-            }
-        }
-
-        // the main thing about the hash type, it returns the next node's hash, given it's children.
-        // The implementation of this method is highly consensus critical, so everywhere should use the
-        // exact same algorithm to calculate the next hash. Rustreexo won't call this method, unless
-        // **both** children are not empty.
-        fn parent_hash(left: &Self, right: &Self) -> Self {
-            if let (PoseidonHash::Hash(left), PoseidonHash::Hash(right)) = (left, right) {
-                return PoseidonHash::Hash(poseidon_hash(*left, *right));
-            }
-
-            // This should never happen, since rustreexo won't call this method unless both children
-            // are not empty.
-            unreachable!()
-        }
-    }
-
-    impl Serialize for PoseidonHash {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            match self {
-                PoseidonHash::Hash(h) => {
-                    let inner = h.to_fixed_hex_string();
-                    inner.serialize(serializer)
-                }
-                PoseidonHash::Placeholder => serializer.serialize_none(),
-                PoseidonHash::Empty => serializer.serialize_none(),
-            }
-        }
-    }
-
-    impl Encodable for PoseidonHash {
-        fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
-            &self,
-            writer: &mut W,
-        ) -> Result<usize, bitcoin::io::Error> {
-            match self {
-                PoseidonHash::Hash(h) => {
-                    let inner = h.to_bytes_be();
-                    inner.consensus_encode(writer)
-                }
-                PoseidonHash::Placeholder => Ok(0),
-                PoseidonHash::Empty => Ok(0),
-            }
-        }
-    }
-
-    fn convert_hash256_to_felt(hash: [u8; 32]) -> [Felt; 2] {
-        let (hight, low) = hash.split_at(16);
-
-        [
-            Felt::from_bytes_be_slice(hight),
-            Felt::from_bytes_be_slice(low),
-        ]
-    }
-
-    fn convert_spk_to_byte_array(pk_script: &Script) -> ByteArray {
-        let mut iter = pk_script.as_bytes().chunks_exact(31);
-        let mut data = vec![];
-
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(chunk) = iter.next() {
-            let mut word = [0u8; 31];
-            word.copy_from_slice(chunk);
-            data.push(Felt::from_bytes_be_slice(&word));
-        }
-
-        let pending_word = iter.remainder();
-        let pending_word_len = pending_word.len();
-        let pending_word = if pending_word_len > 0 {
-            let mut word = [0u8; 31];
-            word[(31 - pending_word_len)..].copy_from_slice(pending_word);
-            Felt::from_bytes_be_slice(&word)
-        } else {
-            Felt::from(0u64)
-        };
-
-        ByteArray {
-            data,
-            pending_word,
-            pending_word_len,
-        }
-    }
-
-    impl ShinigamiLeafData {
-        pub fn get_leaf_hashes(data: &LeafContext) -> PoseidonHash {
-            // rouding up to the next multiple of 2
-            let mut data_to_hash = Vec::with_capacity(16);
-            let pk_script = convert_spk_to_byte_array(&data.pk_script);
-            let mut txid = data.txid.to_byte_array();
-            txid.reverse();
-
-            data_to_hash.extend(convert_hash256_to_felt(txid));
-            data_to_hash.push(Felt::from(data.vout));
-            data_to_hash.push(Felt::from(data.value));
-            data_to_hash.push(Felt::from(pk_script.data.len()));
-            data_to_hash.extend(pk_script.data);
-            data_to_hash.push(pk_script.pending_word);
-            data_to_hash.push(Felt::from(pk_script.pending_word_len as u64));
-            data_to_hash.push(Felt::from(data.block_height));
-            data_to_hash.push(Felt::from(data.median_time_past));
-            data_to_hash.push(Felt::from(data.is_coinbase as u64));
-
-            let leaf_hash = poseidon_hash_many(&data_to_hash);
-
-            PoseidonHash::Hash(leaf_hash)
-        }
-    }
-}
-
-#[cfg(not(feature = "shinigami"))]
 pub use bitcoin_leaf_data::BitcoinLeafData as LeafData;
-#[cfg(feature = "shinigami")]
-pub use shinigami_udata::ShinigamiLeafData as LeafData;
-
-#[cfg(all(feature = "shinigami", test))]
-mod shinigami_tests {
-    use bitcoin::ScriptBuf;
-    use starknet_crypto::Felt;
-
-    use super::LeafContext;
-    use crate::udata::shinigami_udata::PoseidonHash;
-
-    #[test]
-    fn test_node_hash() {
-        let leaf = LeafContext {
-            txid: "0437cd7f8525ceed2324359c2d0ba26006d92d856a9c20fa0241106ee5a597c9".parse().unwrap(),
-            vout: 0,
-            value: 5000000000,
-            pk_script:  ScriptBuf::from_hex("410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac").unwrap(),
-            block_height: 9,
-            median_time_past: 1231473279,
-            is_coinbase: true,
-            block_hash: "00000000839a8e6886ab5951d76f4114754285bd7a81a48d0d722cb5b0c5e3a7".parse().unwrap(), // unused here
-        };
-
-        let leaf_hash = super::LeafData::get_leaf_hashes(&leaf);
-        let expected = PoseidonHash::Hash(
-            Felt::from_hex("3945D2584EE5EF0B482B70CD63E0E8CD18827CB348F839D1E6EB8ECBB2B397D")
-                .unwrap(),
-        );
-
-        assert_eq!(leaf_hash, expected);
-    }
-}
