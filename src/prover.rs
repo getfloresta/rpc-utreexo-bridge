@@ -184,6 +184,19 @@ struct CachedPollardLeaf {
     position: u64,
     hash: BitcoinNodeHash,
 }
+
+#[derive(Clone)]
+struct CachedLeaf {
+    context: LeafContext,
+    position: u64,
+}
+
+fn cached_bottom_position(
+    pollard_position: Option<u64>,
+    cached_leaf: Option<&CachedLeaf>,
+) -> Option<u64> {
+    pollard_position.or_else(|| cached_leaf.map(|leaf| leaf.position))
+}
 fn pollard_from_stump_roots(
     mut roots: Vec<BitcoinNodeHash>,
     leaves: u64,
@@ -248,7 +261,7 @@ pub struct FlatFileProver {
     bootstrap_height: u32,
     shutdown_flag: Arc<AtomicBool>,
     block_notification: Sender<BlockHash>,
-    leaf_data: HashMap<OutPoint, LeafContext>,
+    leaf_data: HashMap<OutPoint, CachedLeaf>,
     block_hash_cache: HashMap<u32, BlockHash>,
     pending_apply: Option<PendingApply>,
     journal: ForestJournal,
@@ -369,7 +382,16 @@ impl FlatFileProver {
             indexed_height,
             bootstrap_height,
         )?;
-        acc.replay_journal(&journal)?;
+        if acc.replay_journal(&journal)? {
+            if !journal.records().is_empty() {
+                info!(
+                    "replayed {} journal records after an incomplete shutdown",
+                    journal.records().len()
+                );
+            }
+        } else {
+            info!("skipped forest journal replay after a clean shutdown");
+        }
         for record in journal.records() {
             match record.status {
                 JournalStatus::Forward => {
@@ -645,7 +667,7 @@ impl FlatFileProver {
     pub fn keep_up(&mut self) -> anyhow::Result<()> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
-                self.sync()?;
+                self.sync_for_shutdown()?;
                 return Ok(());
             }
             self.sync_to_tip()?;
@@ -958,7 +980,7 @@ impl FlatFileProver {
         creating_block_hashes: &HashMap<u32, BlockHash>,
     ) -> anyhow::Result<(u64, LeafContext)> {
         let leaf = if let Some(leaf) = self.leaf_data.get(&outpoint) {
-            leaf.clone()
+            leaf.context.clone()
         } else if let Some(prevout) = prevouts.get(&outpoint) {
             let block_hash = creating_block_hashes
                 .get(&prevout.height)
@@ -1080,15 +1102,17 @@ impl FlatFileProver {
             .filter_map(|outpoint| {
                 self.leaf_data
                     .get(outpoint)
-                    .map(|leaf| (*outpoint, LeafData::get_leaf_hashes(leaf)))
+                    .map(|leaf| (*outpoint, LeafData::get_leaf_hashes(&leaf.context)))
             })
             .collect::<HashMap<_, _>>();
         let cached_bottom_positions = cached_leaf_hashes
             .iter()
             .filter_map(|(outpoint, hash)| {
-                self.pollard
-                    .leaf_position(hash)
-                    .map(|position| (*outpoint, position))
+                cached_bottom_position(
+                    self.pollard.leaf_position(hash),
+                    self.leaf_data.get(outpoint),
+                )
+                .map(|position| (*outpoint, position))
             })
             .collect::<HashMap<_, _>>();
         timings.position_cache_hits = cached_bottom_positions.len();
@@ -1339,8 +1363,6 @@ impl FlatFileProver {
                 }
             };
         timings.journal_append = started.elapsed();
-        self.pollard_leaves
-            .extend(cached_pollard_leaves.into_iter().map(Reverse));
         let pending = PendingApply {
             completion,
             journal_index,
@@ -1351,10 +1373,25 @@ impl FlatFileProver {
         for (outpoint, _) in &deletions {
             self.leaf_data.remove(outpoint);
         }
-        self.leaf_data.extend(added_leaf_data);
+        self.leaf_data.extend(
+            added_leaf_data
+                .into_iter()
+                .zip(cached_pollard_leaves.iter())
+                .map(|((outpoint, context), cached)| {
+                    (
+                        outpoint,
+                        CachedLeaf {
+                            context,
+                            position: cached.position,
+                        },
+                    )
+                }),
+        );
         let oldest_cached_height = height.saturating_sub(LEAF_CACHE_BLOCKS.saturating_sub(1));
         self.leaf_data
-            .retain(|_, leaf| leaf.block_height >= oldest_cached_height);
+            .retain(|_, leaf| leaf.context.block_height >= oldest_cached_height);
+        self.pollard_leaves
+            .extend(cached_pollard_leaves.into_iter().map(Reverse));
         timings.cache_update = started.elapsed();
 
         Ok((
@@ -1390,6 +1427,11 @@ impl FlatFileProver {
         }
         self.proof_file.sync()?;
         Ok(())
+    }
+
+    fn sync_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.sync()?;
+        self.journal.mark_clean_shutdown()
     }
 }
 
@@ -1445,12 +1487,12 @@ fn eligible_block_leaves(
 }
 
 fn cached_leaf_context(
-    cache: &HashMap<OutPoint, LeafContext>,
+    cache: &HashMap<OutPoint, CachedLeaf>,
     outpoint: OutPoint,
     fetch: impl FnOnce() -> anyhow::Result<LeafContext>,
 ) -> anyhow::Result<(LeafContext, bool)> {
     match cache.get(&outpoint) {
-        Some(leaf) => Ok((leaf.clone(), true)),
+        Some(leaf) => Ok((leaf.context.clone(), true)),
         None => fetch().map(|leaf| (leaf, false)),
     }
 }
@@ -1618,7 +1660,13 @@ mod tests {
             vout: 2,
         };
         let mut cache = HashMap::new();
-        cache.insert(outpoint, leaf(outpoint));
+        cache.insert(
+            outpoint,
+            CachedLeaf {
+                context: leaf(outpoint),
+                position: 7,
+            },
+        );
         let mut fetched = false;
 
         let (cached, hit) = cached_leaf_context(&cache, outpoint, || {
@@ -1631,6 +1679,25 @@ mod tests {
         assert!(!fetched);
         assert_eq!(cached.txid, outpoint.txid);
         assert_eq!(cached.vout, outpoint.vout);
+    }
+
+    #[test]
+    fn steady_leaf_position_cache_survives_pollard_eviction() {
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([3; 32]),
+            vout: 4,
+        };
+        let cached = CachedLeaf {
+            context: leaf(outpoint),
+            position: 7,
+        };
+
+        assert_eq!(cached_bottom_position(None, Some(&cached)), Some(7));
+        assert_eq!(
+            cached_bottom_position(Some(9), Some(&cached)),
+            Some(9),
+            "the Pollard remains the preferred position cache"
+        );
     }
 
     #[test]

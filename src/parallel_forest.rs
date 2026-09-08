@@ -1789,7 +1789,14 @@ impl SteadyStateForest {
         Ok(())
     }
 
-    pub fn replay_journal(&mut self, journal: &ForestJournal) -> Result<()> {
+    /// Restores the durable forest after an interrupted update.
+    ///
+    /// A clean shutdown marker proves the durable forest already reflects every retained record,
+    /// so replaying it would only rewrite the same state.
+    pub fn replay_journal(&mut self, journal: &ForestJournal) -> Result<bool> {
+        if !journal.needs_replay() {
+            return Ok(false);
+        }
         for record in journal.records().iter().rev() {
             self.apply_backward(&record.entry)?;
         }
@@ -1801,7 +1808,7 @@ impl SteadyStateForest {
         if !journal.records().is_empty() {
             self.sync()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -3483,10 +3490,15 @@ mod tests {
 
             journal.mark_rolled_back(second_index).unwrap();
             journal.mark_rolled_back(first_index).unwrap();
-            forest.replay_journal(&journal).unwrap();
+            assert!(forest.replay_journal(&journal).unwrap());
             assert_eq!(forest.roots().unwrap(), expected_roots);
             assert_eq!(forest.leaf_position(&first).unwrap(), first_position);
             assert_eq!(forest.leaf_position(&second).unwrap(), second_position);
+            journal.mark_clean_shutdown().unwrap();
+            drop(journal);
+
+            let journal = ForestJournal::open(&journal_path).unwrap();
+            assert!(!forest.replay_journal(&journal).unwrap());
         }
 
         std::fs::remove_file(journal_path).unwrap();

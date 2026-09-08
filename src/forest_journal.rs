@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,6 +31,9 @@ const STATUS_OFFSET: u64 = 10;
 const COMPACT_ON_OPEN_STALE_BYTES: u64 = 1 << 30;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
 const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
+const CLEAN_SHUTDOWN_MARKER: &[u8] = b"BRJNL-CLEAN-1";
+const CLEAN_SHUTDOWN_SUFFIX: &str = ".clean";
+const CLEAN_SHUTDOWN_TEMP_SUFFIX: &str = ".tmp";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalNodeState {
@@ -126,6 +130,7 @@ pub struct ForestJournal {
     flushed_size: Arc<AtomicU64>,
     hole_punch_supported: Option<bool>,
     stale_bytes: u64,
+    needs_replay: bool,
 }
 
 pub struct ForestJournalFlusher {
@@ -144,6 +149,7 @@ impl ForestJournal {
         {
             std::fs::create_dir_all(parent)?;
         }
+        let needs_replay = !take_clean_shutdown_marker(path)?;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -161,6 +167,7 @@ impl ForestJournal {
             flushed_size: Arc::new(AtomicU64::new(0)),
             hole_punch_supported: None,
             stale_bytes: 0,
+            needs_replay,
         };
         journal.scan()?;
         if journal.stale_bytes >= COMPACT_ON_OPEN_STALE_BYTES {
@@ -174,6 +181,44 @@ impl ForestJournal {
 
     pub fn records(&self) -> &[JournalRecord] {
         &self.records
+    }
+
+    /// Returns whether the forest must be rebuilt from this journal before use.
+    ///
+    /// Opening the journal consumes a clean-shutdown marker, so any later interruption is
+    /// conservatively recovered from the journal.
+    pub fn needs_replay(&self) -> bool {
+        self.needs_replay
+    }
+
+    /// Records that every journal entry has been reflected in the durable forest state.
+    ///
+    /// Callers must first flush the forest, leaf map, journal, and all related durable state.
+    pub fn mark_clean_shutdown(&self) -> Result<()> {
+        let marker_path = clean_shutdown_marker_path(&self.path);
+        let temporary_path = append_path_suffix(&marker_path, CLEAN_SHUTDOWN_TEMP_SUFFIX);
+        let mut marker = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)
+            .with_context(|| {
+                format!(
+                    "failed to create clean-shutdown marker {}",
+                    temporary_path.display()
+                )
+            })?;
+        marker.write_all(CLEAN_SHUTDOWN_MARKER)?;
+        marker.sync_all()?;
+        drop(marker);
+        std::fs::rename(&temporary_path, &marker_path).with_context(|| {
+            format!(
+                "failed to install clean-shutdown marker {}",
+                marker_path.display()
+            )
+        })?;
+        sync_parent_directory(&marker_path)?;
+        Ok(())
     }
 
     pub fn latest_forward(&self) -> Option<(usize, &JournalRecord)> {
@@ -229,6 +274,7 @@ impl ForestJournal {
             offset,
             span,
         });
+        self.needs_replay = true;
         self.published_size.store(end, Ordering::Release);
         Ok(self.records.len() - 1)
     }
@@ -272,6 +318,7 @@ impl ForestJournal {
         )?;
         self.file.sync_data()?;
         record.status = JournalStatus::RolledBack;
+        self.needs_replay = true;
         Ok(())
     }
 
@@ -498,6 +545,51 @@ impl ForestJournal {
         Ok(())
     }
 }
+
+fn take_clean_shutdown_marker(path: &Path) -> Result<bool> {
+    let marker_path = clean_shutdown_marker_path(path);
+    let marker = match std::fs::read(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read clean-shutdown marker {}",
+                    marker_path.display()
+                )
+            });
+        }
+    };
+    std::fs::remove_file(&marker_path).with_context(|| {
+        format!(
+            "failed to consume clean-shutdown marker {}",
+            marker_path.display()
+        )
+    })?;
+    sync_parent_directory(&marker_path)?;
+    Ok(marker == CLEAN_SHUTDOWN_MARKER)
+}
+
+fn clean_shutdown_marker_path(path: &Path) -> PathBuf {
+    append_path_suffix(path, CLEAN_SHUTDOWN_SUFFIX)
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .with_context(|| format!("failed to open journal parent {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync journal parent {}", parent.display()))
+}
 impl ForestJournalFlusher {
     pub fn flush_through(&self, size: u64) -> Result<()> {
         let published_size = self.published_size.load(Ordering::Acquire);
@@ -723,6 +815,31 @@ mod tests {
         assert_eq!(journal.records().len(), 1);
         assert_eq!(journal.records()[0].entry, entry(1));
         assert_eq!(journal.records()[0].status, JournalStatus::RolledBack);
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clean_shutdown_marker_is_consumed_on_open() {
+        let path = path("clean-shutdown");
+        let marker_path = clean_shutdown_marker_path(&path);
+        let temporary_marker_path = append_path_suffix(&marker_path, CLEAN_SHUTDOWN_TEMP_SUFFIX);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&marker_path);
+        let _ = std::fs::remove_file(&temporary_marker_path);
+
+        let mut journal = ForestJournal::open(&path).unwrap();
+        journal.append(entry(1)).unwrap();
+        journal.flush().unwrap();
+        journal.mark_clean_shutdown().unwrap();
+        drop(journal);
+
+        let journal = ForestJournal::open(&path).unwrap();
+        assert!(!journal.needs_replay());
+        drop(journal);
+
+        let journal = ForestJournal::open(&path).unwrap();
+        assert!(journal.needs_replay());
         drop(journal);
         std::fs::remove_file(path).unwrap();
     }
