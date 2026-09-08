@@ -369,7 +369,16 @@ impl FlatFileProver {
             indexed_height,
             bootstrap_height,
         )?;
-        acc.replay_journal(&journal)?;
+        if acc.replay_journal(&journal)? {
+            if !journal.records().is_empty() {
+                info!(
+                    "replayed {} journal records after an incomplete shutdown",
+                    journal.records().len()
+                );
+            }
+        } else {
+            info!("skipped forest journal replay after a clean shutdown");
+        }
         for record in journal.records() {
             match record.status {
                 JournalStatus::Forward => {
@@ -645,7 +654,7 @@ impl FlatFileProver {
     pub fn keep_up(&mut self) -> anyhow::Result<()> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
-                self.sync()?;
+                self.sync_for_shutdown()?;
                 return Ok(());
             }
             self.sync_to_tip()?;
@@ -1390,6 +1399,11 @@ impl FlatFileProver {
         }
         self.proof_file.sync()?;
         Ok(())
+    }
+
+    fn sync_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.sync()?;
+        self.journal.mark_clean_shutdown()
     }
 }
 
