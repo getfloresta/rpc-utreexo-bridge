@@ -371,9 +371,13 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                     .map_err(|_| anyhow::anyhow!("Error sending response"))?;
             }
 
-            if let Err(e) = self.check_tip(&mut last_tip_update) {
-                error!("Error checking tip: {}", e);
-                continue;
+            if last_tip_update.elapsed() >= std::time::Duration::from_secs(10) {
+                let result = self.check_tip();
+                // Wait between attempts even when the tip is unchanged or the backend fails.
+                last_tip_update = std::time::Instant::now();
+                if let Err(e) = result {
+                    error!("Error checking tip: {}", e);
+                }
             }
 
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -384,11 +388,7 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
         Ok(())
     }
 
-    fn check_tip(&mut self, last_tip_update: &mut std::time::Instant) -> anyhow::Result<()> {
-        if last_tip_update.elapsed() < std::time::Duration::from_secs(10) {
-            return Ok(());
-        }
-
+    fn check_tip(&mut self) -> anyhow::Result<()> {
         let height = self.rpc.get_block_count()? as u32;
         if height == self.height {
             self.ibd = false; // we'll flip it once, and keep it false for the rest of the time
@@ -402,7 +402,6 @@ impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage>
                 .expect("could not save the acc to disk");
             self.storage.update_height(height as usize);
         }
-        *last_tip_update = std::time::Instant::now();
         Ok(())
     }
 
