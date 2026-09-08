@@ -13,7 +13,7 @@ It contains multiple components:
 
 ### Requirements
 
-- Rust 1.51.0 or later
+- Rust 1.85.0 or later
 - Linux or MacOS
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
