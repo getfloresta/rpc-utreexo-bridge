@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 
 use actix_rt::signal::ctrl_c;
+use anyhow::Context;
 use bitcoin::consensus::serialize;
 use bitcoin::constants::genesis_block;
 use clap::Parser;
@@ -121,7 +122,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
         block_notifier_tx,
     );
 
-    info!("Starting p2p node");
+    info!("Starting P2PV2-only BIP 183 proof server");
 
     // This is our implementation of the Bitcoin p2p protocol, it will listen
     // for incoming connections and serve blocks and proofs to peers.
@@ -139,11 +140,8 @@ pub fn run_bridge() -> anyhow::Result<()> {
         proof_backend: blocks.clone(),
     };
 
-    node::Node::run(
-        p2p_address.parse().unwrap(),
-        worker_context,
-        block_notifier_rx,
-    );
+    let p2p_address = p2p_address.parse().context("invalid P2P listen address")?;
+    node::Node::run(p2p_address, worker_context, block_notifier_rx)?;
 
     let (sender, receiver) = channel(1024);
     // This is our implementation of the json-rpc api, it will listen for

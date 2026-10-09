@@ -4,7 +4,7 @@ This is a special propose Bridge node. Bridges are Bitcoin nodes that holds the 
 
 It contains multiple components:
 
-    - A Bitcoin node that accepts connections from other nodes and clients and can serve proofs for blocks and transactions.
+    - A BIP324 P2PV2-only Bitcoin server that serves BIP183 block inclusion proofs.
     - A REST API that can be used to query the node for proofs.
     - A websocket that serves as lightweight replacement to the bitcoin p2p. It notifies clients about new blocks, sending the necessary proofs.
     - The actual proof generation code.
@@ -52,7 +52,11 @@ Assuming you have a Bitcoin node running, just start the bridge as follows:
 ./target/release/bridge
 ```
 
-The bridge will start listening on port 8333 for incoming connections from other nodes and clients. It will also start a websocket server on port 8334. API runs on port 8335. See [the API docs](docs/API.md) for more information.
+The bridge listens on port 8333 for BIP324 P2PV2 connections and serves Utreexo inclusion proofs with the BIP183 `getuproof`/`uproof` messages. It also starts a websocket server on port 8334. API runs on port 8335. See [the API docs](docs/API.md) for more information.
+
+Inbound peers are capped at 64 connections. Handshakes expire after 10 seconds and are limited to 1 MiB/64 packets; established peers are disconnected for packets over 256 KiB, oversized request batches, or sustained rates above 100 packets per second.
+Every minute, the node logs the connected-peer total and groups identified peers by their sanitized, self-reported software name, for example `Floresta=10 Satoshi=10`.
+
 ## Building with esplora backends
 
 You can use esplora backends to grab blocks and transactions. To do so, you'll need to enable the `esplora` feature when building the node:
