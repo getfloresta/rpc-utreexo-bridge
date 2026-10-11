@@ -106,7 +106,7 @@ fn init_logger(log_file: Option<&str>, log_level: log::LevelFilter, log_to_term:
     let _ = simplelog::CombinedLogger::init(loggers);
 }
 
-fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
+fn get_chain_provider(bitcoin_datadir: Option<&str>) -> Result<Box<dyn Blockchain>> {
     #[cfg(feature = "esplora")]
     if let Ok(esplora_url) = env::var("ESPLORA_URL") {
         return Ok(Box::new(esplora::EsploraBlockchain::new(esplora_url)));
@@ -131,9 +131,12 @@ fn get_chain_provider() -> Result<Box<dyn Blockchain>> {
     }
     // fallback to cookie auth. This is the default for core, but discouraged for security reasons
     let cookie = env::var("BITCOIN_CORE_COOKIE_FILE").unwrap_or_else(|_| {
-        env::var("HOME")
-            .map(|home| format!("{}/.bitcoin/.cookie", home))
-            .expect("Failed to find $HOME")
+        if let Some(datadir) = bitcoin_datadir {
+            format!("{}/.cookie", datadir)
+        } else {
+            let home = env::var("HOME").expect("Failed to find $HOME");
+            format!("{}/.bitcoin/.cookie", home)
+        }
     });
     info!("Using cookie file at {}", cookie);
     let client = Client::new(&rpc_url, Auth::CookieFile(cookie.clone().into()));
