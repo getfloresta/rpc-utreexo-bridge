@@ -65,7 +65,6 @@ pub(crate) fn is_unspendable(script: &Script) -> bool {
 struct SteadyBlockTimings {
     rpc_block_hash: Duration,
     rpc_block: Duration,
-    rpc_mtp: Duration,
     scan_prevouts: Duration,
     positions: Duration,
     position_cache_hits: usize,
@@ -125,6 +124,11 @@ impl JournalApplyWorker {
                         let journal_flush = started.elapsed();
                         let started = Instant::now();
                         forest.apply_forward(&entry)?;
+                        // This worker owns the forest exclusively, so relocation cannot race
+                        // foreground position lookups or journal mutations.
+                        if entry.height % 1_000 == 0 {
+                            forest.compact_leaf_map()?;
+                        }
                         let apply = started.elapsed();
                         let started = Instant::now();
                         forest.sync()?;
@@ -772,9 +776,6 @@ impl FlatFileProver {
                     self.tip_hash
                 );
             }
-            let started = Instant::now();
-            let median_time_past = self.rpc.get_mtp(block.header.prev_blockhash)?;
-            timings.rpc_mtp = started.elapsed();
             let (
                 compact_proof,
                 leaf_cache_hits,
@@ -782,7 +783,7 @@ impl FlatFileProver {
                 prevout_creation_heights,
                 process_timings,
                 pending,
-            ) = self.process_block(&block, &prevouts, height, median_time_past)?;
+            ) = self.process_block(&block, &prevouts, height)?;
             timings.scan_prevouts = process_timings.scan_prevouts;
             timings.positions = process_timings.positions;
             timings.position_cache_hits = process_timings.position_cache_hits;
@@ -879,11 +880,10 @@ impl FlatFileProver {
                 self.pollard_memory_limit
             );
             debug!(
-                "steady-state-timings height={height} hash={block_hash} total={:?} rpc_block_hash={:?} rpc_block_v3={:?} rpc_mtp={:?} scan_prevouts={:?} positions={:?} proof_build={:?} prevout_block_hashes={:?} leaf_resolution={:?} proof_verify={:?} additions={:?} stump_update={:?} plan_update={:?} journal_append={:?} header_store={:?} cache_update={:?} proof_store={:?} proof_index_write={:?}",
+                "steady-state-timings height={height} hash={block_hash} total={:?} rpc_block_hash={:?} rpc_block_v3={:?} scan_prevouts={:?} positions={:?} proof_build={:?} prevout_block_hashes={:?} leaf_resolution={:?} proof_verify={:?} additions={:?} stump_update={:?} plan_update={:?} journal_append={:?} header_store={:?} cache_update={:?} proof_store={:?} proof_index_write={:?}",
                 timings.total,
                 timings.rpc_block_hash,
                 timings.rpc_block,
-                timings.rpc_mtp,
                 timings.scan_prevouts,
                 timings.positions,
                 timings.proof_build,
@@ -1005,7 +1005,6 @@ impl FlatFileProver {
         block: &Block,
         prevouts: &HashMap<OutPoint, PrevoutInfo>,
         height: u32,
-        median_time_past: u32,
     ) -> anyhow::Result<(
         CompactBlockProof,
         usize,
@@ -1052,7 +1051,6 @@ impl FlatFileProver {
                 }
                 addition_contexts.push(LeafContext {
                     block_hash,
-                    median_time_past,
                     txid,
                     vout: outpoint.vout,
                     value: output.value.to_sat(),
@@ -1121,6 +1119,12 @@ impl FlatFileProver {
             .acc
             .as_ref()
             .context("steady forest unavailable while planning a block")?;
+        let uncached_outpoints: Vec<_> = external_outpoints
+            .iter()
+            .filter(|outpoint| !cached_bottom_positions.contains_key(outpoint))
+            .copied()
+            .collect();
+        let mut uncached_positions = acc.leaf_positions(&uncached_outpoints)?.into_iter();
         let mut deletions = Vec::with_capacity(external_outpoints.len());
         let mut proof_targets = Vec::with_capacity(external_outpoints.len());
         let mut recovered_leaf_data = HashMap::new();
@@ -1128,7 +1132,10 @@ impl FlatFileProver {
         for outpoint in external_outpoints {
             let bottom_position = match cached_bottom_positions.get(&outpoint) {
                 Some(position) => *position,
-                None => match acc.leaf_position(&outpoint) {
+                None => match uncached_positions
+                    .next()
+                    .context("leaf-map batch omitted an uncached outpoint")?
+                {
                     Ok(position) => position,
                     Err(map_error) => {
                         let (position, leaf) = self
@@ -1240,7 +1247,10 @@ impl FlatFileProver {
                                 "failed to recover {outpoint} after hash mismatch at position {bottom_position}"
                             )
                         })?;
-                    acc.repair_leaf_position(outpoint, recovered_position)?;
+                    self.acc
+                        .as_mut()
+                        .context("steady forest unavailable during position repair")?
+                        .repair_leaf_position(outpoint, recovered_position)?;
                     anyhow::bail!(
                         "repaired leaf-map position for {outpoint}: {bottom_position} -> {recovered_position}; retry the block"
                     );
@@ -1504,7 +1514,6 @@ fn leaf_context_from_prevout(
 ) -> LeafContext {
     LeafContext {
         block_hash,
-        median_time_past: 0,
         block_height: prevout.height,
         is_coinbase: prevout.is_coinbase,
         pk_script: prevout.script_pubkey.clone(),
@@ -1534,7 +1543,6 @@ fn leaf_context_from_transaction(
         })?;
     Ok(LeafContext {
         block_hash,
-        median_time_past: 0,
         block_height: transaction.height,
         is_coinbase: transaction.is_coinbase,
         pk_script: output.script_pubkey.clone(),
@@ -1561,7 +1569,6 @@ mod tests {
             value: 42,
             pk_script: ScriptBuf::new(),
             block_height: 10,
-            median_time_past: 0,
             is_coinbase: false,
         }
     }
@@ -1584,7 +1591,7 @@ mod tests {
         header_13.nonce = 13;
         let hash_13 = header_13.block_hash();
         let header_index =
-            HeaderIndex::create(&root.join("headers"), &root.join("header-index"), 13, 1).unwrap();
+            HeaderIndex::create(&root.join("headers"), &root.join("header-index"), 13).unwrap();
         for (height, header) in [(11, &header_11), (12, &header_12), (13, &header_13)] {
             header_index.put(height, header).unwrap();
         }

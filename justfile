@@ -18,8 +18,8 @@ test:
 
 # Run clippy for supported backends with the MSRV
 clippy:
-    cargo +1.85.0 clippy
-    cargo +1.85.0 clippy --features esplora
+    cargo +1.89.0 clippy
+    cargo +1.89.0 clippy --features esplora
 
 # Run all checks
 ci: check test clippy fmt-check

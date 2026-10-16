@@ -2273,10 +2273,6 @@ mod tests {
         ) -> anyhow::Result<crate::chaininterface::TransactionInfo> {
             anyhow::bail!("unexpected get_raw_transaction_info")
         }
-
-        fn get_mtp(&self, _block_hash: BlockHash) -> anyhow::Result<u32> {
-            anyhow::bail!("unexpected get_mtp")
-        }
     }
 
     fn header_chain(length: usize) -> Vec<Header> {
@@ -2332,7 +2328,7 @@ mod tests {
             std::env::temp_dir().join(format!("bridge-node-header-index-{}", std::process::id()));
         let mut context = test_worker_context(&root);
         let index =
-            HeaderIndex::create(&root.join("headers.dat"), &root.join("hashes"), 7, 1).unwrap();
+            HeaderIndex::create(&root.join("headers.dat"), &root.join("hashes"), 7).unwrap();
         for (height, header) in headers.iter().enumerate() {
             index.put(height as u32, header).unwrap();
         }

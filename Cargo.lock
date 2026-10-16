@@ -363,8 +363,8 @@ dependencies = [
  "bitcoinkernel",
  "clap",
  "ctrlc",
- "db-experiment",
  "dotenv",
+ "floresta-db",
  "hex",
  "hintsfile",
  "jemallocator",
@@ -425,7 +425,6 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "chacha20-poly1305"
 version = "0.1.2"
-
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b4b0fc281743d80256607bd65e8beedc42cb0787ea119c85b81b4c0eab85e5f"
 
@@ -555,10 +554,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "db-experiment"
-version = "0.1.0"
-
-[[package]]
 name = "deranged"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -603,6 +598,10 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "floresta-db"
+version = "0.1.0"
 
 [[package]]
 name = "fnv"
@@ -1080,6 +1079,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
 ]
