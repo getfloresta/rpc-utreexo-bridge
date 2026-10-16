@@ -155,8 +155,6 @@ pub trait Blockchain: Send + Sync {
     fn get_block_count(&self) -> Result<u64>;
     /// Returns the raw transaction info, given a transaction id.
     fn get_raw_transaction_info(&self, txid: &Txid) -> Result<TransactionInfo>;
-    /// Returns the median time past of the block with the given hash.
-    fn get_mtp(&self, block_hash: BlockHash) -> Result<u32>;
 }
 
 impl Blockchain for Client {
@@ -224,11 +222,6 @@ impl Blockchain for Client {
             is_coinbase,
         })
     }
-
-    fn get_mtp(&self, block_hash: BlockHash) -> Result<u32> {
-        let info = self.get_block_info(&block_hash)?;
-        Ok(info.mediantime.unwrap_or(info.time) as u32)
-    }
 }
 #[derive(Debug)]
 pub struct TransactionInfo {
@@ -266,10 +259,6 @@ impl<T: Blockchain + Sized> Blockchain for Box<T> {
     fn get_raw_transaction_info(&self, txid: &Txid) -> Result<TransactionInfo> {
         (**self).get_raw_transaction_info(txid)
     }
-
-    fn get_mtp(&self, block_hash: BlockHash) -> Result<u32> {
-        (**self).get_mtp(block_hash)
-    }
 }
 
 impl<T: Blockchain> Blockchain for &Box<T> {
@@ -299,10 +288,6 @@ impl<T: Blockchain> Blockchain for &Box<T> {
 
     fn get_raw_transaction_info(&self, txid: &Txid) -> Result<TransactionInfo> {
         (**self).get_raw_transaction_info(txid)
-    }
-
-    fn get_mtp(&self, block_hash: BlockHash) -> Result<u32> {
-        (**self).get_mtp(block_hash)
     }
 }
 

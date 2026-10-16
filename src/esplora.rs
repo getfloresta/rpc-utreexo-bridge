@@ -92,11 +92,6 @@ impl Blockchain for EsploraBlockchain {
             tx: consensus::deserialize(&hex::decode(tx_hex)?)?,
         })
     }
-
-    fn get_mtp(&self, _block_hash: BlockHash) -> Result<u32> {
-        // esplora does not have a way to get the median time past
-        Ok(0)
-    }
 }
 #[derive(Debug)]
 pub enum EsploraError {

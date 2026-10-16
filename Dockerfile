@@ -1,4 +1,4 @@
-FROM rust:1.85.0-slim-bullseye as build
+FROM rust:1.89.0-slim-bullseye as build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

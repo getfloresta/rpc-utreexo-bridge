@@ -19,7 +19,6 @@ pub struct LeafContext {
     pub value: u64,
     pub pk_script: ScriptBuf,
     pub block_height: u32,
-    pub median_time_past: u32,
     pub is_coinbase: bool,
 }
 

@@ -12,12 +12,15 @@ It contains three components:
 
 ### Requirements
 
-- Rust 1.85.0 or later
+- Rust 1.89.0 or later (required by the local database's batch implementation)
 - Linux x86-64
 - A C++ toolchain, CMake, and Boost to compile `rust-bitcoinkernel`
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
+- Sibling `../ultra-fast-database` (`floresta-db`) and `../rustreexo` checkouts.
+  The accumulator checkout must include the bridge's position-addressed Pollard
+  cache APIs (the local `bridge` branch); an upstream-only checkout is insufficient.
 
 ### From source
 
@@ -139,17 +142,25 @@ where an entire upper row is smaller. A deleted child promotes its surviving sib
 parent; two deleted children mark the parent deleted, recursively promoting surviving subtrees
 through roots. Independent ranges apply these rules concurrently with leaf publication.
 
-The leaf-map database uses an insert-only range writer: one writer is created per fetched range,
-keys are published directly with a bucket-head CAS, and no lookup, hazard registration,
-replacement, deletion, or reclamation runs on the hot path. The fixed eight-byte position is
-stored inline in the body node, so no blob files are created. Mutable bucket heads stay in memory
-during construction and are serialized sequentially only during clean close.
+The `floresta-db` leaf map uses an insert-only range writer, batching eligible
+outputs once per block with `WriteOnlyWriter::put_batch`. Header mappings are
+batched once per fetched range. The database groups keys by bucket before CAS
+publication; fixed eight-byte positions and heights are stored inline. Mutable
+bucket heads stay in memory during construction and are serialized during sync
+or clean close.
 
-Leaf-map keys are the 32-byte internal txid followed by little-endian `vout`; values are
-little-endian `u64` bottom-row positions. Only unspent leaves are indexed. A promoted leaf keeps
-its original bottom-row value permanently—the parent chasers never update the map. On clean
-completion, the mutable runtime files are synced and closed directly; no checkpoint snapshot is
-created. Crash recovery for interrupted builds is intentionally deferred.
+Leaf-map keys are the first 16 bytes of SHA-256 over the 32-byte internal txid
+followed by little-endian `vout`; values are little-endian `u64` bottom-row
+positions. Header-index keys are the first 16 bytes of the internal block hash,
+with inline `u64` heights; lookups verify the full hash against the stored header.
+Only unspent leaves are indexed. A promoted leaf keeps its original bottom-row
+value permanently—the parent chasers never update the map.
+
+These indexes use `floresta-db` format v7. Existing variable-width-key leaf maps
+and header indexes are incompatible: rebuild the bootstrap into fresh output
+paths before running steady state. Do not mix an old index with a new forest.
+On clean completion, runtime files are synced and closed directly without a
+checkpoint snapshot. Crash recovery for interrupted builds remains unsupported.
 
 The output has no header. A node at forest position `N` starts at
 `N * size_of::<ForestNode>()`. Each 33-byte node contains a 32-byte hash and one flags byte:
@@ -186,8 +197,9 @@ After bootstrap, continue from the hintsfile stop height with the same forest an
     --pollard-memory-mib 250
 ```
 Bitcoin Core must be running with `txindex=1`. Each height uses `getblock` verbosity 3, which
-returns the block transactions and every input's prevout in one RPC response. Cache hits bypass
-prevout reconstruction. Creating block hashes are resolved exclusively from the in-memory cache
+returns the block transactions and every input's prevout in one RPC response. No additional
+previous-block request is made for median-time-past: it is not used in leaf commitments or proofs.
+Cache hits bypass prevout reconstruction. Creating block hashes are resolved exclusively from the in-memory cache
 and persistent header index; steady-state proving never calls `getblockhash` for prevouts. A
 missing height means the bootstrap header files do not match the forest. Providers without
 verbosity-three support retain the per-transaction compatibility fallback. After resolving leaf
@@ -202,8 +214,9 @@ threshold. Addition positions no longer repeat leaf-map membership lookups alrea
 the serialized block update.
 The steady-state `Pollard` starts from the flat forest roots and keeps stable bottom positions for
 remembered leaves. Cached spends resolve through that internal index without querying the
-persistent leaf map or rereading the leaf hash. A cache miss first waits for the background
-flusher, then consults the durable leaf map. The Pollard reports uncached target and proof
+persistent leaf map or rereading the leaf hash. Cache misses first wait for the
+background flusher, then resolve together through one ordered `batch_fetch`.
+The Pollard reports uncached target and proof
 positions, and only those hashes are read from the flat forest and ingested. The Pollard is
 modified immediately and is the source of truth while journal records are pending.
 `--pollard-memory-mib` sets its cache quota and defaults to 250 MiB. Before cached leaves are
@@ -219,6 +232,18 @@ changes remain exclusively inside Pollard until the worker updates the persisten
 proof generation maps bottom positions into the promoted sparse forest, including promotions
 above live branches. The runtime map is given 1 GiB of append headroom; older bootstrap maps are
 extended in place before they are opened.
+
+Journal application and rollback use `batch_delete` and `put_batch`. They remove
+the union of affected keys before reinsertion so replay remains idempotent even
+though the database's append-only batch writer retains duplicate keys.
+
+After applying each steady-state block with `height % 1_000 == 0`, the background
+worker compacts leaf-map pages below half occupancy (16,384 live nodes per
+1 MiB page), then syncs the forest and database before publishing completion.
+The worker owns the forest exclusively during deletion and compaction; foreground
+lookups cannot retain stale node offsets. Compaction failures abort the apply
+job rather than marking the height durable. Header reads and steady-state index
+replacement/removal are coordinated separately by a read/write lock.
 
 Online growth doubles the bottom-row capacity without restarting the bridge. Pending journal
 applications are drained first, internal rows are relocated into the enlarged positional layout,

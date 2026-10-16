@@ -65,7 +65,7 @@ fn init_logger(log_file: Option<&str>, log_to_term: bool) -> anyhow::Result<()> 
     }
     if log_to_term {
         loggers.push(simplelog::TermLogger::new(
-            log::LevelFilter::Info,
+            log::LevelFilter::Debug,
             Config::default(),
             simplelog::TerminalMode::Mixed,
             simplelog::ColorChoice::Auto,
