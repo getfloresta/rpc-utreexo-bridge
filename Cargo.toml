@@ -45,6 +45,7 @@ memmap2 = "0.9"
 jemallocator = "0.5.4"
 clap = { version = "4.5.20", features = ["derive"] }
 ahash = "0.8.11"
+parking_lot = "0.11.2"
 ctrlc = "3.4.5"
 dotenv = "0.15.0"
 

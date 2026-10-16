@@ -373,6 +373,7 @@ dependencies = [
  "log",
  "memmap2",
  "mio",
+ "parking_lot",
  "rayon",
  "reqwest",
  "rustreexo",

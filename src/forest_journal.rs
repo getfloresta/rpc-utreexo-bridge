@@ -8,8 +8,6 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::bail;
@@ -115,7 +113,7 @@ impl JournalStatus {
 
 #[derive(Clone, Debug)]
 pub struct JournalRecord {
-    pub entry: JournalEntry,
+    pub entry: Arc<JournalEntry>,
     pub status: JournalStatus,
     offset: u64,
     span: u64,
@@ -126,18 +124,9 @@ pub struct ForestJournal {
     path: PathBuf,
     page_size: u64,
     records: Vec<JournalRecord>,
-    published_size: Arc<AtomicU64>,
-    flushed_size: Arc<AtomicU64>,
     hole_punch_supported: Option<bool>,
     stale_bytes: u64,
     needs_replay: bool,
-}
-
-pub struct ForestJournalFlusher {
-    file: File,
-    path: PathBuf,
-    published_size: Arc<AtomicU64>,
-    flushed_size: Arc<AtomicU64>,
 }
 
 impl ForestJournal {
@@ -163,8 +152,6 @@ impl ForestJournal {
             path: path.to_path_buf(),
             page_size,
             records: Vec::new(),
-            published_size: Arc::new(AtomicU64::new(0)),
-            flushed_size: Arc::new(AtomicU64::new(0)),
             hole_punch_supported: None,
             stale_bytes: 0,
             needs_replay,
@@ -173,9 +160,6 @@ impl ForestJournal {
         if journal.stale_bytes >= COMPACT_ON_OPEN_STALE_BYTES {
             journal.compact()?;
         }
-        let size = journal.file.metadata()?.len();
-        journal.published_size.store(size, Ordering::Release);
-        journal.flushed_size.store(size, Ordering::Release);
         Ok(journal)
     }
 
@@ -230,7 +214,8 @@ impl ForestJournal {
     }
 
     /// Appends a complete page-aligned entry without flushing it.
-    pub fn append(&mut self, entry: JournalEntry) -> Result<usize> {
+    pub fn append(&mut self, entry: impl Into<Arc<JournalEntry>>) -> Result<usize> {
+        let entry = entry.into();
         let payload = entry.encode()?;
         if payload.len() > MAX_RECORD_BYTES {
             bail!("journal entry is too large: {} bytes", payload.len());
@@ -275,35 +260,13 @@ impl ForestJournal {
             span,
         });
         self.needs_replay = true;
-        self.published_size.store(end, Ordering::Release);
         Ok(self.records.len() - 1)
     }
 
     pub fn flush(&self) -> Result<()> {
-        let published_size = self.published_size.load(Ordering::Acquire);
         self.file
             .sync_data()
-            .with_context(|| format!("failed to flush forest journal {}", self.path.display()))?;
-        self.flushed_size
-            .fetch_max(published_size, Ordering::Release);
-        Ok(())
-    }
-
-    pub fn published_size(&self) -> u64 {
-        self.published_size.load(Ordering::Acquire)
-    }
-
-    pub fn is_flushed_through(&self, size: u64) -> bool {
-        self.flushed_size.load(Ordering::Acquire) >= size
-    }
-
-    pub fn flusher(&self) -> Result<ForestJournalFlusher> {
-        Ok(ForestJournalFlusher {
-            file: self.file.try_clone()?,
-            path: self.path.clone(),
-            published_size: Arc::clone(&self.published_size),
-            flushed_size: Arc::clone(&self.flushed_size),
-        })
+            .with_context(|| format!("failed to flush forest journal {}", self.path.display()))
     }
 
     /// Durably changes a committed entry into an undo operation before state is rolled back.
@@ -535,7 +498,7 @@ impl ForestJournal {
                 break;
             }
             self.records.push(JournalRecord {
-                entry: JournalEntry::decode(&payload)?,
+                entry: Arc::new(JournalEntry::decode(&payload)?),
                 status,
                 offset,
                 span,
@@ -589,21 +552,6 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to open journal parent {}", parent.display()))?
         .sync_all()
         .with_context(|| format!("failed to sync journal parent {}", parent.display()))
-}
-impl ForestJournalFlusher {
-    pub fn flush_through(&self, size: u64) -> Result<()> {
-        let published_size = self.published_size.load(Ordering::Acquire);
-        if published_size < size {
-            bail!(
-                "journal bytes through {size} are not published; current size is {published_size}"
-            );
-        }
-        self.file
-            .sync_data()
-            .with_context(|| format!("failed to flush forest journal {}", self.path.display()))?;
-        self.flushed_size.fetch_max(size, Ordering::Release);
-        Ok(())
-    }
 }
 
 fn encode_entry(entry: &JournalEntry) -> Result<Vec<u8>> {
@@ -813,7 +761,7 @@ mod tests {
 
         let journal = ForestJournal::open(&path).unwrap();
         assert_eq!(journal.records().len(), 1);
-        assert_eq!(journal.records()[0].entry, entry(1));
+        assert_eq!(*journal.records()[0].entry, entry(1));
         assert_eq!(journal.records()[0].status, JournalStatus::RolledBack);
         drop(journal);
         std::fs::remove_file(path).unwrap();
@@ -893,20 +841,17 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
     #[test]
-    fn publishes_complete_records_before_background_flush() {
+    fn flushed_records_reopen_completely() {
         let path = path("background-flush");
         let _ = std::fs::remove_file(&path);
         let mut journal = ForestJournal::open(&path).unwrap();
-        let flusher = journal.flusher().unwrap();
 
         journal.append(entry(1)).unwrap();
-        let published_size = journal.published_size();
-        assert!(published_size > 0);
-        assert!(!journal.is_flushed_through(published_size));
-        assert!(flusher.flush_through(published_size + 1).is_err());
-        flusher.flush_through(published_size).unwrap();
-        assert!(journal.is_flushed_through(published_size));
+        journal.flush().unwrap();
 
+        drop(journal);
+        let journal = ForestJournal::open(&path).unwrap();
+        assert_eq!(*journal.records()[0].entry, entry(1));
         drop(journal);
         std::fs::remove_file(path).unwrap();
     }

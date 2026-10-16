@@ -2,16 +2,19 @@
 
 //! Pollard-backed steady-state proof generation over the persistent flat forest.
 
+use parking_lot::Mutex;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -41,12 +44,15 @@ use crate::chaininterface::Blockchain;
 use crate::chaininterface::PrevoutInfo;
 use crate::chaininterface::TransactionInfo;
 use crate::forest_journal::ForestJournal;
-use crate::forest_journal::ForestJournalFlusher;
 use crate::forest_journal::JournalEntry;
 use crate::forest_journal::JournalStatus;
 use crate::header_index::HeaderIndex;
 use crate::parallel_forest::tree_rows;
+use crate::parallel_forest::ForestOverlay;
+use crate::parallel_forest::ForestView;
 use crate::parallel_forest::SteadyStateForest;
+use crate::position_timing::PositionTimer;
+use crate::position_timing::PositionTiming;
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
 use crate::udata::BatchProof;
 use crate::udata::CompactBlockProof;
@@ -67,6 +73,11 @@ struct SteadyBlockTimings {
     rpc_block: Duration,
     scan_prevouts: Duration,
     positions: Duration,
+    position_cache: PositionTiming,
+    position_leaf_map: PositionTiming,
+    position_validation: PositionTiming,
+    position_resolution: PositionTiming,
+    position_traversal: PositionTiming,
     position_cache_hits: usize,
     position_cache_misses: usize,
     forest_positions_loaded: usize,
@@ -77,103 +88,409 @@ struct SteadyBlockTimings {
     additions: Duration,
     stump_update: Duration,
     plan_update: Duration,
-    journal_append: Duration,
-    header_store: Duration,
+    persistence_enqueue: Duration,
     cache_update: Duration,
-    proof_store: Duration,
-    proof_index_write: Duration,
     total: Duration,
 }
 
+const MAX_PENDING_BLOCKS: usize = 8;
+const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Default)]
-pub(crate) struct ApplyTimings {
-    pub(crate) journal_flush: Duration,
-    pub(crate) apply: Duration,
-    pub(crate) state_flush: Duration,
-}
-type ApplyResult = anyhow::Result<(SteadyStateForest, ApplyTimings)>;
-
-struct ApplyJob {
-    entry: JournalEntry,
-    published_size: u64,
-    forest: SteadyStateForest,
-    completion: std::sync::mpsc::SyncSender<ApplyResult>,
+struct ApplyTimings {
+    blocks: usize,
+    journal_flush: Duration,
+    apply: Duration,
+    state_flush: Duration,
+    proof_store: Duration,
+    header_store: Duration,
+    proof_index_write: Duration,
+    height_commit: Duration,
 }
 
-pub(crate) struct JournalApplyWorker {
-    sender: Option<std::sync::mpsc::Sender<ApplyJob>>,
+struct DurableTip {
+    height: u32,
+    hash: BlockHash,
+    leaves: u64,
+    roots: Vec<BitcoinNodeHash>,
+}
+
+struct PersistenceBlock {
+    entry: Arc<JournalEntry>,
+    header: bitcoin::block::Header,
+    proof: CompactBlockProof,
+    proof_forest_rows: u8,
+}
+
+enum PersistenceCommand {
+    Block(PersistenceBlock),
+    Barrier {
+        operation: PersistenceBarrier,
+        completion: std::sync::mpsc::SyncSender<anyhow::Result<DurableTip>>,
+    },
+}
+
+enum PersistenceBarrier {
+    Sync { clean_shutdown: bool },
+    Resize(u64),
+    Rollback { height: u32, hash: BlockHash },
+    Repair { outpoint: OutPoint, position: u64 },
+}
+
+#[cfg(test)]
+type PersistenceHook = Arc<dyn Fn(&str, u32) -> anyhow::Result<()> + Send + Sync>;
+
+/// The only steady-state writer. No foreground lock is held across durability I/O.
+struct PersistenceState {
+    forest: Arc<RwLock<SteadyStateForest>>,
+    journal: ForestJournal,
+    proof_file: Arc<ProofFile>,
+    proof_index: Arc<BlocksIndex>,
+    header_index: Arc<HeaderIndex>,
+    block_notification: Sender<BlockHash>,
+    height: u32,
+    tip_hash: BlockHash,
+    bootstrap_height: u32,
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<PersistenceHook>>>,
+}
+
+impl PersistenceState {
+    fn persist(&mut self, blocks: &[PersistenceBlock]) -> anyhow::Result<ApplyTimings> {
+        let last = blocks.last().context("empty persistence batch")?;
+        let mut height = self.height;
+        let mut hash = self.tip_hash;
+        for block in blocks {
+            if block.entry.height != height + 1 || block.entry.previous_block_hash != hash {
+                anyhow::bail!("persistence batch does not extend the durable tip");
+            }
+            height = block.entry.height;
+            hash = block.entry.block_hash;
+        }
+        let mut timings = ApplyTimings {
+            blocks: blocks.len(),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        for block in blocks {
+            self.journal.append(Arc::clone(&block.entry))?;
+        }
+        self.journal.flush()?;
+        timings.journal_flush = started.elapsed();
+        #[cfg(test)]
+        self.checkpoint("journal", last.entry.height)?;
+
+        let started = Instant::now();
+        let mut indexes = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let mut index = self.proof_file.append(&block.proof)?;
+            if self.proof_file.get(&index).as_ref() != Some(&block.proof) {
+                anyhow::bail!(
+                    "failed to read back compact proof for {}",
+                    block.entry.block_hash
+                );
+            }
+            index.proof_forest_rows = Some(block.proof_forest_rows);
+            indexes.push((index, block.entry.block_hash));
+        }
+        self.proof_file.sync()?;
+        timings.proof_store = started.elapsed();
+        let started = Instant::now();
+        for block in blocks {
+            self.header_index.put(block.entry.height, &block.header)?;
+        }
+        self.header_index.sync()?;
+        timings.header_store = started.elapsed();
+        let started = Instant::now();
+        self.proof_index.append_batch(&indexes)?;
+        timings.proof_index_write = started.elapsed();
+
+        let started = Instant::now();
+        {
+            let mut forest = self
+                .forest
+                .write()
+                .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+            for block in blocks {
+                forest.apply_forward(&block.entry)?;
+                if block.entry.height % 1_000 == 0 {
+                    forest.compact_leaf_map()?;
+                }
+            }
+        }
+        timings.apply = started.elapsed();
+        let started = Instant::now();
+        {
+            // Shared with foreground readers, excluding mutation/remapping during sync.
+            let forest = self
+                .forest
+                .read()
+                .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+            #[cfg(test)]
+            self.checkpoint("state_flush", last.entry.height)?;
+            forest.sync()?;
+        }
+        timings.state_flush = started.elapsed();
+        let started = Instant::now();
+        self.proof_index.update_height(last.entry.height as usize)?;
+        timings.height_commit = started.elapsed();
+        self.height = last.entry.height;
+        self.tip_hash = last.entry.block_hash;
+        if let Err(error) = self.journal.prune(144) {
+            warn!("journal pruning failed; retaining older recovery records: {error:#}");
+        }
+        for block in blocks {
+            let _ = self.block_notification.send(block.entry.block_hash);
+        }
+        Ok(timings)
+    }
+
+    #[cfg(test)]
+    fn checkpoint(&self, stage: &str, height: u32) -> anyhow::Result<()> {
+        let hook = self.hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(stage, height)?;
+        }
+        Ok(())
+    }
+
+    fn finish_failed(&self, mut error: anyhow::Error) -> anyhow::Error {
+        // Runtime database allocators retain their current page and bucket heads in
+        // memory until sync. Seal them before an orderly failed worker exits so the
+        // durable journal can be replayed on reopen. This does not commit a height
+        // or certify a clean shutdown, and cannot replace hard-crash recovery.
+        let forest_result = self
+            .forest
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned during error finalization"))
+            .and_then(|forest| forest.sync());
+        if let Err(cleanup) = forest_result {
+            error = error.context(format!(
+                "failed to finalize forest after persistence error: {cleanup:#}"
+            ));
+        }
+        if let Err(cleanup) = self.header_index.sync() {
+            error = error.context(format!(
+                "failed to finalize header index after persistence error: {cleanup:#}"
+            ));
+        }
+        error
+    }
+
+    fn barrier(&mut self, operation: PersistenceBarrier) -> anyhow::Result<DurableTip> {
+        let clean_shutdown = matches!(
+            &operation,
+            PersistenceBarrier::Sync {
+                clean_shutdown: true
+            }
+        );
+        match operation {
+            PersistenceBarrier::Sync { .. } => {
+                self.forest
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .sync()?;
+                self.journal.flush()?;
+                self.proof_file.sync()?;
+                self.header_index.sync()?;
+                self.proof_index.update_height(self.height as usize)?;
+            }
+            PersistenceBarrier::Resize(leaves) => {
+                self.forest
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .ensure_leaf_capacity(leaves)?;
+            }
+            PersistenceBarrier::Repair { outpoint, position } => {
+                self.forest
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .repair_leaf_position(&outpoint, position)?;
+            }
+            PersistenceBarrier::Rollback { height, hash } => {
+                if (height, hash) != (self.height, self.tip_hash) {
+                    anyhow::bail!("rollback does not match the durable tip");
+                }
+                let (index, record) = self
+                    .journal
+                    .latest_forward()
+                    .context("reorg exceeds retained journal; rebuild from a newer bootstrap")?;
+                let entry = record.entry.clone();
+                if (entry.height, entry.block_hash) != (height, hash) {
+                    anyhow::bail!("rollback journal does not match the durable tip");
+                }
+                self.journal.mark_rolled_back(index)?;
+                {
+                    let mut forest = self
+                        .forest
+                        .write()
+                        .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+                    forest.apply_backward(&entry)?;
+                    forest.sync()?;
+                }
+                self.header_index.remove(height, hash)?;
+                self.header_index.sync()?;
+                self.proof_index.remove(hash)?;
+                let previous_height = height.saturating_sub(1);
+                let previous_index = if previous_height > self.bootstrap_height {
+                    Some(
+                        self.proof_index
+                            .get_index(entry.previous_block_hash)?
+                            .context("proof index is missing rollback destination")?,
+                    )
+                } else {
+                    None
+                };
+                self.proof_file.truncate_after(previous_index.as_ref())?;
+                self.proof_index.update_height(previous_height as usize)?;
+                self.height = previous_height;
+                self.tip_hash = entry.previous_block_hash;
+            }
+        }
+        let forest = self
+            .forest
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+        let tip = DurableTip {
+            height: self.height,
+            hash: self.tip_hash,
+            leaves: forest.leaves(),
+            roots: forest.roots()?,
+        };
+        drop(forest);
+        if clean_shutdown {
+            self.journal.mark_clean_shutdown()?;
+        }
+        Ok(tip)
+    }
+}
+
+struct PersistenceWorker {
+    sender: Option<std::sync::mpsc::SyncSender<PersistenceCommand>>,
+    completions: std::sync::mpsc::Receiver<anyhow::Result<ApplyTimings>>,
+    error: Arc<Mutex<Option<String>>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<PersistenceHook>>>,
 }
 
-impl JournalApplyWorker {
-    pub(crate) fn new(flusher: ForestJournalFlusher) -> anyhow::Result<Self> {
-        let (sender, receiver) = std::sync::mpsc::channel::<ApplyJob>();
+impl PersistenceWorker {
+    fn new(mut state: PersistenceState) -> anyhow::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(MAX_PENDING_BLOCKS);
+        let (completed, completions) = std::sync::mpsc::channel();
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&error);
+        #[cfg(test)]
+        let hook = Arc::clone(&state.hook);
         let handle = std::thread::Builder::new()
-            .name("bridge-journal-apply".to_string())
+            .name("bridge-persistence".to_string())
             .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let ApplyJob {
-                        entry,
-                        published_size,
-                        mut forest,
-                        completion,
-                    } = job;
-                    let result = (|| -> ApplyResult {
-                        let started = Instant::now();
-                        flusher.flush_through(published_size)?;
-                        let journal_flush = started.elapsed();
-                        let started = Instant::now();
-                        forest.apply_forward(&entry)?;
-                        // This worker owns the forest exclusively, so relocation cannot race
-                        // foreground position lookups or journal mutations.
-                        if entry.height % 1_000 == 0 {
-                            forest.compact_leaf_map()?;
+                let mut deferred = None;
+                loop {
+                    let command = match deferred.take().map(Ok).unwrap_or_else(|| receiver.recv()) {
+                        Ok(command) => command,
+                        Err(_) => break,
+                    };
+                    let (failure, shutdown) = match command {
+                        PersistenceCommand::Block(block) => {
+                            let mut batch = Vec::with_capacity(MAX_PENDING_BLOCKS);
+                            batch.push(block);
+                            while batch.len() < MAX_PENDING_BLOCKS {
+                                match receiver.try_recv() {
+                                    Ok(PersistenceCommand::Block(block)) => batch.push(block),
+                                    Ok(barrier) => {
+                                        deferred = Some(barrier);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let result = state.persist(&batch);
+                            let result = result.map_err(|error| {
+                                *worker_error.lock() = Some(format!("{error:#}"));
+                                state.finish_failed(error)
+                            });
+                            let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                            if let Some(error) = &failure {
+                                *worker_error.lock() = Some(error.clone());
+                            }
+                            let _ = completed.send(result);
+                            (failure, false)
                         }
-                        let apply = started.elapsed();
-                        let started = Instant::now();
-                        forest.sync()?;
-                        let timings = ApplyTimings {
-                            journal_flush,
-                            apply,
-                            state_flush: started.elapsed(),
-                        };
-                        Ok((forest, timings))
-                    })();
-                    let failed = result.is_err();
-                    let _ = completion.send(result);
-                    if failed {
+                        PersistenceCommand::Barrier {
+                            operation,
+                            completion,
+                        } => {
+                            let shutdown = matches!(
+                                operation,
+                                PersistenceBarrier::Sync {
+                                    clean_shutdown: true
+                                }
+                            );
+                            let result = state.barrier(operation);
+                            let result = result.map_err(|error| {
+                                *worker_error.lock() = Some(format!("{error:#}"));
+                                state.finish_failed(error)
+                            });
+                            let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                            if let Some(error) = &failure {
+                                *worker_error.lock() = Some(error.clone());
+                            }
+                            let _ = completion.send(result);
+                            (failure, shutdown)
+                        }
+                    };
+                    if failure.is_some() || shutdown {
                         break;
                     }
                 }
             })?;
         Ok(Self {
             sender: Some(sender),
+            completions,
+            error,
             handle: Some(handle),
+            #[cfg(test)]
+            hook,
         })
     }
 
-    pub(crate) fn enqueue(
-        &self,
-        entry: JournalEntry,
-        published_size: u64,
-        forest: SteadyStateForest,
-    ) -> anyhow::Result<std::sync::mpsc::Receiver<ApplyResult>> {
-        let (completion, receiver) = std::sync::mpsc::sync_channel(1);
+    fn check(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.error.lock().as_ref() {
+            anyhow::bail!("background persistence failed: {error}");
+        }
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            anyhow::bail!("background persistence worker stopped");
+        }
+        Ok(())
+    }
+
+    fn send(&self, command: PersistenceCommand) -> anyhow::Result<()> {
+        self.check()?;
         self.sender
             .as_ref()
-            .context("journal apply worker stopped")?
-            .send(ApplyJob {
-                entry,
-                published_size,
-                forest,
-                completion,
-            })
-            .map_err(|_| anyhow::anyhow!("journal apply worker stopped"))?;
-        Ok(receiver)
+            .context("persistence worker stopped")?
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("persistence worker stopped"))
+    }
+
+    fn barrier(&self, operation: PersistenceBarrier) -> anyhow::Result<DurableTip> {
+        let (completion, receiver) = std::sync::mpsc::sync_channel(1);
+        self.send(PersistenceCommand::Barrier {
+            operation,
+            completion,
+        })?;
+        receiver
+            .recv()
+            .context("persistence worker stopped during barrier")?
     }
 }
 
-impl Drop for JournalApplyWorker {
+impl Drop for PersistenceWorker {
     fn drop(&mut self) {
         self.sender.take();
         if let Some(handle) = self.handle.take() {
@@ -244,31 +561,71 @@ fn evict_pollard_cache(
 }
 
 struct PendingApply {
-    completion: std::sync::mpsc::Receiver<ApplyResult>,
-    journal_index: usize,
-    height: u32,
+    entry: Arc<JournalEntry>,
+    bytes: usize,
+}
+
+struct PreparedBlock {
+    entry: JournalEntry,
     proof_forest_rows: u8,
+}
+
+fn pending_memory(entry: &JournalEntry, proof: &CompactBlockProof) -> usize {
+    // Include the shared journal entry, overlay hash tables, and queued proof buffers.
+    entry
+        .forest
+        .capacity()
+        .saturating_mul(320)
+        .saturating_add(
+            entry
+                .added
+                .capacity()
+                .saturating_add(entry.removed.capacity())
+                .saturating_mul(256),
+        )
+        .saturating_add(
+            proof
+                .proof
+                .targets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<VarInt>()),
+        )
+        .saturating_add(proof.proof.hashes.capacity().saturating_mul(32))
+        .saturating_add(
+            proof
+                .leaves
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CompactLeafData>()),
+        )
+        .saturating_add(
+            proof
+                .leaves
+                .iter()
+                .map(|leaf| match &leaf.spk_ty {
+                    crate::udata::ScriptPubkeyType::Other(script) => script.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+        )
 }
 
 /// Sequential steady-state prover backed by the bootstrapped flat forest and persistent leaf map.
 pub struct FlatFileProver {
     rpc: Arc<dyn Blockchain>,
     header_index: Arc<HeaderIndex>,
-    apply_worker: JournalApplyWorker,
-    acc: Option<SteadyStateForest>,
+    persistence: PersistenceWorker,
+    acc: Arc<RwLock<SteadyStateForest>>,
+    overlay: ForestOverlay,
     pollard: Pollard<BitcoinNodeHash>,
     pollard_leaves: BinaryHeap<Reverse<CachedPollardLeaf>>,
     pollard_memory_limit: usize,
-    proof_file: Arc<ProofFile>,
-    proof_index: Arc<BlocksIndex>,
     height: u32,
-    bootstrap_height: u32,
+    legacy_proof_forest_rows: u8,
     shutdown_flag: Arc<AtomicBool>,
-    block_notification: Sender<BlockHash>,
     leaf_data: HashMap<OutPoint, CachedLeaf>,
     block_hash_cache: HashMap<u32, BlockHash>,
-    pending_apply: Option<PendingApply>,
-    journal: ForestJournal,
+    pending_apply: VecDeque<PendingApply>,
+    pending_bytes: usize,
     tip_hash: BlockHash,
 }
 
@@ -374,6 +731,11 @@ impl FlatFileProver {
         if pollard_memory_limit == 0 {
             anyhow::bail!("Pollard memory limit must be greater than zero");
         }
+        let (acc, journal, height, tip_hash, legacy_proof_forest_rows) = std::thread::scope(
+            |scope| -> anyhow::Result<_> {
+                let recovery = std::thread::Builder::new()
+                    .name("bridge-recovery".to_string())
+                    .spawn_scoped(scope, || -> anyhow::Result<_> {
         let indexed_height =
             u32::try_from(proof_index.load_height()?).context("proof height exceeds u32")?;
         let mut acc = SteadyStateForest::open(forest_path, leaf_map_path, lock_pages)?;
@@ -467,6 +829,15 @@ impl FlatFileProver {
             acc.leaves(),
             journal.records().len()
         );
+                        let legacy_proof_forest_rows =
+                            proof_index.legacy_proof_forest_rows(acc.forest_rows())?;
+                        Ok((acc, journal, height, tip_hash, legacy_proof_forest_rows))
+                    })?;
+                recovery
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("startup recovery worker panicked"))?
+            },
+        )?;
         let mut block_hash_cache = HashMap::new();
         block_hash_cache.insert(height, tip_hash);
         let forest_roots = acc.roots()?;
@@ -474,39 +845,46 @@ impl FlatFileProver {
         if pollard_stump_roots(&pollard) != forest_roots {
             anyhow::bail!("Pollard roots do not match the recovered flat forest");
         }
-        let flusher = journal.flusher()?;
-        let apply_worker = JournalApplyWorker::new(flusher)?;
-        let prover = Self {
-            rpc,
-            header_index,
-            apply_worker,
-            acc: Some(acc),
-            pollard,
+        let acc = Arc::new(RwLock::new(acc));
+        let persistence = PersistenceWorker::new(PersistenceState {
+            forest: Arc::clone(&acc),
+            journal,
             proof_file,
             proof_index,
+            header_index: Arc::clone(&header_index),
+            block_notification,
+            height,
+            tip_hash,
+            bootstrap_height,
+            #[cfg(test)]
+            hook: Arc::new(Mutex::new(None)),
+        })?;
+        Ok(Self {
+            rpc,
+            header_index,
+            persistence,
+            acc,
+            overlay: ForestOverlay::default(),
+            pollard,
             pollard_leaves: BinaryHeap::new(),
             pollard_memory_limit,
             height,
-            bootstrap_height,
+            legacy_proof_forest_rows,
             shutdown_flag,
-            block_notification,
             leaf_data: HashMap::new(),
             block_hash_cache,
-            pending_apply: None,
-            journal,
+            pending_apply: VecDeque::new(),
+            pending_bytes: 0,
             tip_hash,
-        };
-        prover.verify_durable_tip()?;
-        Ok(prover)
+        })
     }
 
     fn enforce_pollard_memory_limit(&mut self) -> anyhow::Result<()> {
         if self.pollard.estimated_memory_usage() < self.pollard_memory_limit {
             return Ok(());
         }
-        // Once cached Pollard leaves are forgotten, a later miss falls back to the flat forest.
-        // Make that durable state authoritative before reclaiming anything from the Pollard.
-        self.drain_pending_apply()?;
+        // Cache misses remain correct through the pending overlay; eviction is not a
+        // durability barrier.
         let (evicted, initial_usage, final_usage) = evict_pollard_cache(
             &mut self.pollard,
             &mut self.pollard_leaves,
@@ -528,111 +906,89 @@ impl FlatFileProver {
         Ok(())
     }
 
-    fn drain_pending_apply(&mut self) -> anyhow::Result<()> {
-        if let Some(pending) = self.pending_apply.take() {
-            let result = pending
-                .completion
-                .recv()
-                .map_err(|_| anyhow::anyhow!("journal apply worker stopped"))?;
-            let (forest, timings) = result?;
-            if self.acc.replace(forest).is_some() {
-                anyhow::bail!("background apply returned a forest while one was already present");
-            }
-            let height_commit_started = Instant::now();
-            self.proof_index.update_height(pending.height as usize)?;
-            let height_commit = height_commit_started.elapsed();
-            debug!(
-                "background-journal-apply height={} journal_index={} journal_flush={:?} apply={:?} state_flush={:?} height_commit={height_commit:?}",
-                pending.height,
-                pending.journal_index,
-                timings.journal_flush,
-                timings.apply,
-                timings.state_flush
-            );
+    fn retire_apply(&mut self, timings: ApplyTimings) -> anyhow::Result<()> {
+        let first_height = self
+            .pending_apply
+            .front()
+            .context("unexpected persistence completion")?
+            .entry
+            .height;
+        let mut height = first_height;
+        for _ in 0..timings.blocks {
+            let pending = self
+                .pending_apply
+                .pop_front()
+                .context("persistence batch exceeds pending blocks")?;
+            self.overlay.retire(&pending.entry);
+            self.pending_bytes -= pending.bytes;
+            height = pending.entry.height;
         }
-        if let Err(error) = self.journal.prune(144) {
-            warn!("journal pruning failed; retaining older recovery records: {error:#}");
-        }
-        self.verify_durable_tip()
-    }
-
-    pub(crate) fn forest_rows(&self) -> anyhow::Result<u8> {
-        self.acc
-            .as_ref()
-            .map(SteadyStateForest::forest_rows)
-            .context("steady forest unavailable without a pending apply")
-    }
-
-    fn truncate_proofs_to(&self, height: u32, tip_hash: BlockHash) -> anyhow::Result<()> {
-        let index = if height > self.bootstrap_height {
-            Some(
-                self.proof_index
-                    .get_index(tip_hash)?
-                    .ok_or_else(|| anyhow::anyhow!("proof index is missing height {height}"))?,
-            )
-        } else {
-            None
-        };
-        self.proof_file.truncate_after(index.as_ref())?;
+        debug!(
+            "background-persistence height={height} first_height={first_height} blocks={} journal_flush={:?} apply={:?} state_flush={:?} proof_store={:?} header_store={:?} proof_index_write={:?} height_commit={:?}",
+            timings.blocks, timings.journal_flush, timings.apply, timings.state_flush,
+            timings.proof_store, timings.header_store, timings.proof_index_write, timings.height_commit
+        );
         Ok(())
     }
 
-    fn verify_durable_tip(&self) -> anyhow::Result<()> {
-        if self.pending_apply.is_some() {
-            return Ok(());
-        }
-        let proof_height =
-            u32::try_from(self.proof_index.load_height()?).context("proof height exceeds u32")?;
-        if proof_height != self.height {
-            anyhow::bail!(
-                "durable forest height {} does not match proof height {proof_height}",
-                self.height
-            );
-        }
-        let (journal_height, journal_hash, expected_leaves) = match self.journal.latest_forward() {
-            Some((_, record)) => (
-                record.entry.height,
-                record.entry.block_hash,
-                record.entry.num_leaves,
-            ),
-            None if !self.journal.records().is_empty() => {
-                let first = &self.journal.records()[0].entry;
-                (
-                    first.height.saturating_sub(1),
-                    first.previous_block_hash,
-                    first.previous_num_leaves()?,
-                )
+    fn collect_completed(&mut self) -> anyhow::Result<()> {
+        self.persistence.check()?;
+        loop {
+            match self.persistence.completions.try_recv() {
+                Ok(result) => self.retire_apply(result?)?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("persistence completion channel closed");
+                }
             }
-            None => (self.bootstrap_height, self.tip_hash, self.pollard.leaves()),
-        };
-        if (journal_height, journal_hash) != (self.height, self.tip_hash) {
-            anyhow::bail!(
-                "journal tip {journal_height}:{journal_hash} does not match prover tip {}:{}",
-                self.height,
-                self.tip_hash
-            );
         }
-        let forest = self
-            .acc
-            .as_ref()
-            .context("steady forest unavailable without a pending apply")?;
-        if forest.leaves() != expected_leaves
-            || forest.leaves() != self.pollard.leaves()
-            || forest.roots()? != pollard_stump_roots(&self.pollard)
+    }
+
+    fn wait_for_apply(&mut self) -> anyhow::Result<()> {
+        let result = self
+            .persistence
+            .completions
+            .recv()
+            .context("persistence worker stopped with outstanding blocks")?;
+        self.retire_apply(result?)
+    }
+
+    fn drain_pending_apply(&mut self) -> anyhow::Result<()> {
+        while !self.pending_apply.is_empty() {
+            self.wait_for_apply()?;
+        }
+        self.persistence.check()
+    }
+
+    fn reserve_persistence(&mut self, bytes: usize) -> anyhow::Result<()> {
+        self.collect_completed()?;
+        // A single oversized block is admitted alone; both its working set and the
+        // retained journal have protocol/record limits, rather than an unbounded queue.
+        while !self.pending_apply.is_empty()
+            && (self.pending_apply.len() >= MAX_PENDING_BLOCKS
+                || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_BYTES)
         {
-            anyhow::bail!("durable forest, journal, and Pollard states diverged");
-        }
-        if self.height > self.bootstrap_height {
-            let index = self
-                .proof_index
-                .get_index(self.tip_hash)?
-                .ok_or_else(|| anyhow::anyhow!("proof index is missing height {}", self.height))?;
-            if self.proof_file.get(&index).is_none() {
-                anyhow::bail!(
-                    "proof data for height {} is missing or corrupt",
-                    self.height
-                );
+            #[cfg(test)]
+            {
+                let hook = self.persistence.hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook("backpressure", self.height)?;
+                }
             }
+            self.wait_for_apply()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn legacy_proof_forest_rows(&self) -> u8 {
+        self.legacy_proof_forest_rows
+    }
+
+    fn verify_durable_tip(&self, tip: &DurableTip) -> anyhow::Result<()> {
+        if (tip.height, tip.hash, tip.leaves) != (self.height, self.tip_hash, self.pollard.leaves())
+            || tip.roots != pollard_stump_roots(&self.pollard)
+        {
+            anyhow::bail!("durable forest and producer state diverged");
         }
         Ok(())
     }
@@ -645,27 +1001,18 @@ impl FlatFileProver {
             .context("steady-state leaf count overflow")?;
         let current_capacity = self
             .acc
-            .as_ref()
-            .context("steady forest unavailable during capacity check")?
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
             .leaf_capacity()?;
         if required_leaves <= current_capacity {
             return Ok(());
         }
 
         self.drain_pending_apply()?;
-        let forest = self
-            .acc
-            .as_mut()
-            .context("steady forest unavailable during resize")?;
-        if forest.leaves() != self.pollard.leaves() {
-            anyhow::bail!(
-                "flat forest has {} leaves before resize, Pollard has {}",
-                forest.leaves(),
-                self.pollard.leaves()
-            );
-        }
-        forest.ensure_leaf_capacity(required_leaves)?;
-        Ok(())
+        let tip = self
+            .persistence
+            .barrier(PersistenceBarrier::Resize(required_leaves))?;
+        self.verify_durable_tip(&tip)
     }
 
     pub fn keep_up(&mut self) -> anyhow::Result<()> {
@@ -680,7 +1027,7 @@ impl FlatFileProver {
     }
 
     fn reconcile_chain(&mut self) -> anyhow::Result<u32> {
-        self.drain_pending_apply()?;
+        self.collect_completed()?;
         let mut rolled_back = 0u32;
         loop {
             let core_tip = self.rpc.get_block_count()? as u32;
@@ -692,53 +1039,26 @@ impl FlatFileProver {
             if active {
                 break;
             }
-            let (entry, leaves, roots) = {
-                let Some((index, record)) = self.journal.latest_forward() else {
-                    anyhow::bail!(
-                        "reorg exceeds retained journal at height {}; rebuild from a newer bootstrap",
-                        self.height
-                    );
-                };
-                let entry = record.entry.clone();
-                if entry.height != self.height || entry.block_hash != self.tip_hash {
-                    anyhow::bail!(
-                        "journal tip {}:{} does not match prover tip {}:{}",
-                        entry.height,
-                        entry.block_hash,
-                        self.height,
-                        self.tip_hash
-                    );
-                }
-                self.journal.mark_rolled_back(index)?;
-                let forest = self
-                    .acc
-                    .as_mut()
-                    .context("steady forest unavailable during reorg")?;
-                forest.apply_backward(&entry)?;
-                self.header_index.remove(entry.height, entry.block_hash)?;
-                forest.sync()?;
-                self.header_index.sync()?;
-                (entry, forest.leaves(), forest.roots()?)
-            };
-            self.pollard = pollard_from_stump_roots(roots, leaves);
+            self.drain_pending_apply()?;
+            let orphan_height = self.height;
+            let orphan_hash = self.tip_hash;
+            let tip = self.persistence.barrier(PersistenceBarrier::Rollback {
+                height: self.height,
+                hash: self.tip_hash,
+            })?;
+            self.pollard = pollard_from_stump_roots(tip.roots, tip.leaves);
             self.pollard_leaves.clear();
-            let previous_height = entry.height.saturating_sub(1);
-            let previous_hash = entry.previous_block_hash;
-            self.proof_index.remove(entry.block_hash)?;
-            self.truncate_proofs_to(previous_height, previous_hash)?;
-            self.proof_index.update_height(previous_height as usize)?;
-            self.height = previous_height;
-            self.tip_hash = previous_hash;
+            self.height = tip.height;
+            self.tip_hash = tip.hash;
             self.block_hash_cache
-                .retain(|height, _| *height <= previous_height);
+                .retain(|height, _| *height <= tip.height);
             self.leaf_data.clear();
             rolled_back += 1;
             info!(
-                "rolled back orphaned block height={} hash={} leaves={leaves}",
-                entry.height, entry.block_hash
+                "rolled back orphaned block height={orphan_height} hash={orphan_hash} leaves={}",
+                tip.leaves
             );
         }
-        self.verify_durable_tip()?;
         Ok(rolled_back)
     }
 
@@ -755,12 +1075,14 @@ impl FlatFileProver {
 
     pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
         for height in start..=end {
-            self.drain_pending_apply()?;
+            let total_started = Instant::now();
+            let mut timings = SteadyBlockTimings::default();
+            let started = Instant::now();
+            self.reserve_persistence(0)?;
+            timings.persistence_enqueue = started.elapsed();
             if self.shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
-            let total_started = Instant::now();
-            let mut timings = SteadyBlockTimings::default();
             let started = Instant::now();
             let block_hash = self.rpc.get_block_hash(height as u64)?;
             timings.rpc_block_hash = started.elapsed();
@@ -786,6 +1108,11 @@ impl FlatFileProver {
             ) = self.process_block(&block, &prevouts, height)?;
             timings.scan_prevouts = process_timings.scan_prevouts;
             timings.positions = process_timings.positions;
+            timings.position_cache = process_timings.position_cache;
+            timings.position_leaf_map = process_timings.position_leaf_map;
+            timings.position_validation = process_timings.position_validation;
+            timings.position_resolution = process_timings.position_resolution;
+            timings.position_traversal = process_timings.position_traversal;
             timings.position_cache_hits = process_timings.position_cache_hits;
             timings.position_cache_misses = process_timings.position_cache_misses;
             timings.forest_positions_loaded = process_timings.forest_positions_loaded;
@@ -796,58 +1123,25 @@ impl FlatFileProver {
             timings.additions = process_timings.additions;
             timings.stump_update = process_timings.stump_update;
             timings.plan_update = process_timings.plan_update;
-            timings.journal_append = process_timings.journal_append;
             timings.cache_update = process_timings.cache_update;
-            let proof_forest_rows = pending.proof_forest_rows;
-            let persistence = (|| -> anyhow::Result<()> {
-                let started = Instant::now();
-                let mut index = self.proof_file.append(&compact_proof)?;
-                if self.proof_file.get(&index).as_ref() != Some(&compact_proof) {
-                    anyhow::bail!("failed to read back compact proof for {block_hash}");
-                }
-                self.proof_file.sync()?;
-                index.proof_forest_rows = Some(proof_forest_rows);
-                timings.proof_store = started.elapsed();
-
-                let started = Instant::now();
-                self.header_index.put(height, &block.header)?;
-                self.header_index.sync()?;
-                timings.header_store = started.elapsed();
-
-                let started = Instant::now();
-                self.proof_index.append(index, block_hash)?;
-                timings.proof_index_write = started.elapsed();
-                Ok(())
-            })();
-
-            if let Err(error) = persistence {
-                let apply_result = pending
-                    .completion
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("journal apply worker stopped"))?;
-                let (forest, _) = match apply_result {
-                    Ok(applied) => applied,
-                    Err(apply_error) => {
-                        return Err(error.context(format!(
-                            "persistence failed and background apply also failed: {apply_error:#}"
-                        )));
-                    }
-                };
-                if self.acc.replace(forest).is_some() {
-                    return Err(error.context(
-                        "background apply returned a forest while one was already present",
-                    ));
-                }
-                if let Err(rollback) =
-                    self.rollback_applied_journal(pending.journal_index, height, block_hash)
-                {
-                    return Err(error.context(format!(
-                        "failed to roll back journal after persistence failure: {rollback:#}"
-                    )));
-                }
-                return Err(error);
-            }
-            self.pending_apply = Some(pending);
+            let target_count = compact_proof.proof.targets.len();
+            let proof_hash_count = compact_proof.proof.hashes.len();
+            let leaf_count = compact_proof.leaves.len();
+            let started = Instant::now();
+            let bytes = pending_memory(&pending.entry, &compact_proof);
+            self.reserve_persistence(bytes)?;
+            let entry = Arc::new(pending.entry);
+            self.persistence
+                .send(PersistenceCommand::Block(PersistenceBlock {
+                    entry: Arc::clone(&entry),
+                    header: block.header,
+                    proof: compact_proof,
+                    proof_forest_rows: pending.proof_forest_rows,
+                }))?;
+            self.overlay.push(&entry);
+            self.pending_bytes += bytes;
+            self.pending_apply.push_back(PendingApply { entry, bytes });
+            timings.persistence_enqueue += started.elapsed();
             self.enforce_pollard_memory_limit()?;
 
             let started = Instant::now();
@@ -858,15 +1152,14 @@ impl FlatFileProver {
 
             timings.total = total_started.elapsed();
             let leaves = self.pollard.leaves();
-            let _ = self.block_notification.send(block_hash);
             info!(
                 "steady-state height={height} hash={block_hash} targets={} proof_hashes={} leaves={leaves}",
-                compact_proof.proof.targets.len(),
-                compact_proof.proof.hashes.len(),
+                target_count,
+                proof_hash_count,
             );
             debug!(
                 "steady-state-cache height={height} leaf_data={} leaf_cache_hits={} leaf_cache_misses={} leaf_cache_entries={} position_cache_hits={} position_cache_misses={} forest_positions_loaded={} prevout_creation_heights={} pollard_cached_nodes={} pollard_ingested_positions={} pollard_bytes={} pollard_quota={}",
-                compact_proof.leaves.len(),
+                leaf_count,
                 leaf_cache_hits,
                 leaf_cache_misses,
                 self.leaf_data.len(),
@@ -880,7 +1173,7 @@ impl FlatFileProver {
                 self.pollard_memory_limit
             );
             debug!(
-                "steady-state-timings height={height} hash={block_hash} total={:?} rpc_block_hash={:?} rpc_block_v3={:?} scan_prevouts={:?} positions={:?} proof_build={:?} prevout_block_hashes={:?} leaf_resolution={:?} proof_verify={:?} additions={:?} stump_update={:?} plan_update={:?} journal_append={:?} header_store={:?} cache_update={:?} proof_store={:?} proof_index_write={:?}",
+                "steady-state-timings height={height} hash={block_hash} total={:?} rpc_block_hash={:?} rpc_block_v3={:?} scan_prevouts={:?} positions={:?} proof_build={:?} prevout_block_hashes={:?} leaf_resolution={:?} proof_verify={:?} additions={:?} stump_update={:?} plan_update={:?} persistence_enqueue={:?} cache_update={:?}",
                 timings.total,
                 timings.rpc_block_hash,
                 timings.rpc_block,
@@ -893,56 +1186,23 @@ impl FlatFileProver {
                 timings.additions,
                 timings.stump_update,
                 timings.plan_update,
-                timings.journal_append,
-                timings.header_store,
-                timings.cache_update,
-                timings.proof_store,
-                timings.proof_index_write
+                timings.persistence_enqueue,
+                timings.cache_update
+            );
+            debug!(
+                "steady-state-position-timings height={height} cache={:?} cache_majflt={:?} leaf_map={:?} leaf_map_majflt={:?} validation={:?} validation_majflt={:?} resolution={:?} resolution_majflt={:?} traversal={:?} traversal_majflt={:?}",
+                timings.position_cache.elapsed,
+                timings.position_cache.major_faults,
+                timings.position_leaf_map.elapsed,
+                timings.position_leaf_map.major_faults,
+                timings.position_validation.elapsed,
+                timings.position_validation.major_faults,
+                timings.position_resolution.elapsed,
+                timings.position_resolution.major_faults,
+                timings.position_traversal.elapsed,
+                timings.position_traversal.major_faults,
             );
         }
-        Ok(())
-    }
-
-    fn rollback_applied_journal(
-        &mut self,
-        journal_index: usize,
-        height: u32,
-        block_hash: BlockHash,
-    ) -> anyhow::Result<()> {
-        let entry = {
-            let record = self.journal.records().get(journal_index).ok_or_else(|| {
-                anyhow::anyhow!("journal rollback index {journal_index} is out of bounds")
-            })?;
-            if record.entry.height != height || record.entry.block_hash != block_hash {
-                anyhow::bail!(
-                    "journal rollback entry {}:{} does not match {height}:{block_hash}",
-                    record.entry.height,
-                    record.entry.block_hash
-                );
-            }
-            let entry = record.entry.clone();
-            self.journal.mark_rolled_back(journal_index)?;
-            entry
-        };
-        self.proof_index.remove(block_hash)?;
-        self.header_index.remove(height, block_hash)?;
-        self.header_index.sync()?;
-        let (leaves, roots) = {
-            let forest = self
-                .acc
-                .as_mut()
-                .context("steady forest unavailable during rollback")?;
-            forest.apply_backward(&entry)?;
-            forest.sync()?;
-            (forest.leaves(), forest.roots()?)
-        };
-        self.truncate_proofs_to(self.height, self.tip_hash)?;
-        self.proof_index.update_height(self.height as usize)?;
-        self.block_hash_cache
-            .retain(|height, _| *height <= self.height);
-        self.pollard = pollard_from_stump_roots(roots, leaves);
-        self.pollard_leaves.clear();
-        self.leaf_data.clear();
         Ok(())
     }
 
@@ -959,7 +1219,7 @@ impl FlatFileProver {
     }
     fn recover_leaf_position(
         &self,
-        acc: &SteadyStateForest,
+        acc: &ForestView<'_>,
         outpoint: OutPoint,
         leaf: &LeafContext,
     ) -> anyhow::Result<u64> {
@@ -974,7 +1234,7 @@ impl FlatFileProver {
 
     fn recover_missing_leaf_position(
         &self,
-        acc: &SteadyStateForest,
+        acc: &ForestView<'_>,
         outpoint: OutPoint,
         prevouts: &HashMap<OutPoint, PrevoutInfo>,
         creating_block_hashes: &HashMap<u32, BlockHash>,
@@ -1011,7 +1271,7 @@ impl FlatFileProver {
         usize,
         usize,
         SteadyBlockTimings,
-        PendingApply,
+        PreparedBlock,
     )> {
         let mut timings = SteadyBlockTimings::default();
         let started = Instant::now();
@@ -1094,6 +1354,7 @@ impl FlatFileProver {
         }
         timings.prevout_block_hashes = started.elapsed();
         let started = Instant::now();
+        let timer = PositionTimer::start();
 
         let cached_leaf_hashes = external_outpoints
             .iter()
@@ -1115,16 +1376,23 @@ impl FlatFileProver {
             .collect::<HashMap<_, _>>();
         timings.position_cache_hits = cached_bottom_positions.len();
         timings.position_cache_misses = external_outpoints.len() - timings.position_cache_hits;
-        let acc = self
-            .acc
-            .as_ref()
-            .context("steady forest unavailable while planning a block")?;
+        let forest_handle = Arc::clone(&self.acc);
+        let forest = forest_handle
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+        self.persistence.check()?;
+        let acc = ForestView::new(&forest, &self.overlay, self.pollard.leaves());
         let uncached_outpoints: Vec<_> = external_outpoints
             .iter()
             .filter(|outpoint| !cached_bottom_positions.contains_key(outpoint))
             .copied()
             .collect();
-        let mut uncached_positions = acc.leaf_positions(&uncached_outpoints)?.into_iter();
+        timings.position_cache = timer.finish();
+        let lookup = acc.leaf_positions(&uncached_outpoints)?;
+        timings.position_leaf_map = lookup.fetch;
+        timings.position_validation = lookup.validation;
+        let timer = PositionTimer::start();
+        let mut uncached_positions = lookup.positions.into_iter();
         let mut deletions = Vec::with_capacity(external_outpoints.len());
         let mut proof_targets = Vec::with_capacity(external_outpoints.len());
         let mut recovered_leaf_data = HashMap::new();
@@ -1140,7 +1408,7 @@ impl FlatFileProver {
                     Err(map_error) => {
                         let (position, leaf) = self
                             .recover_missing_leaf_position(
-                                acc,
+                                &acc,
                                 outpoint,
                                 prevouts,
                                 &creating_block_hashes,
@@ -1159,13 +1427,18 @@ impl FlatFileProver {
                     }
                 },
             };
-            let proof_position = acc.proof_position(bottom_position)?;
-            if let Some(hash) = cached_leaf_hashes.get(&outpoint) {
-                cached_target_hashes.insert(proof_position, *hash);
-            }
             deletions.push((outpoint, bottom_position));
-            proof_targets.push(proof_position);
+            proof_targets.push(bottom_position);
         }
+        timings.position_resolution = timer.finish();
+        let timer = PositionTimer::start();
+        acc.translate_proof_positions(&mut proof_targets)?;
+        for ((outpoint, _), proof_position) in deletions.iter().zip(&proof_targets) {
+            if let Some(hash) = cached_leaf_hashes.get(outpoint) {
+                cached_target_hashes.insert(*proof_position, *hash);
+            }
+        }
+        timings.position_traversal = timer.finish();
         timings.positions = started.elapsed();
         let started = Instant::now();
 
@@ -1241,16 +1514,18 @@ impl FlatFileProver {
                 let stored_hash = acc.leaf_hash(*bottom_position)?;
                 if hash != stored_hash {
                     let recovered_position = self
-                        .recover_leaf_position(acc, *outpoint, &leaf)
+                        .recover_leaf_position(&acc, *outpoint, &leaf)
                         .with_context(|| {
                             format!(
                                 "failed to recover {outpoint} after hash mismatch at position {bottom_position}"
                             )
                         })?;
-                    self.acc
-                        .as_mut()
-                        .context("steady forest unavailable during position repair")?
-                        .repair_leaf_position(outpoint, recovered_position)?;
+                    drop(forest);
+                    self.drain_pending_apply()?;
+                    self.persistence.barrier(PersistenceBarrier::Repair {
+                        outpoint: *outpoint,
+                        position: recovered_position,
+                    })?;
                     anyhow::bail!(
                         "repaired leaf-map position for {outpoint}: {bottom_position} -> {recovered_position}; retry the block"
                     );
@@ -1275,7 +1550,7 @@ impl FlatFileProver {
             .map_err(anyhow::Error::msg)?;
         timings.stump_update = started.elapsed();
         let started = Instant::now();
-        let journal_entry = acc.plan_update_without_resize(
+        let journal_entry = acc.plan_update(
             height,
             block_hash,
             block.header.prev_blockhash,
@@ -1336,47 +1611,8 @@ impl FlatFileProver {
         }
         timings.plan_update = started.elapsed();
 
-        let started = Instant::now();
-        let journal_index = match self.journal.append(journal_entry.clone()) {
-            Ok(index) => index,
-            Err(error) => {
-                self.pollard =
-                    pollard_from_stump_roots(original_stump.roots.clone(), original_stump.leaves);
-                self.pollard_leaves.clear();
-                return Err(error);
-            }
-        };
-        let published_size = self.journal.published_size();
-        let forest = self
-            .acc
-            .take()
-            .context("steady forest unavailable before background apply")?;
-        let completion =
-            match self
-                .apply_worker
-                .enqueue(journal_entry.clone(), published_size, forest)
-            {
-                Ok(completion) => completion,
-                Err(error) => {
-                    let rollback = self.journal.mark_rolled_back(journal_index);
-                    self.pollard = pollard_from_stump_roots(
-                        original_stump.roots.clone(),
-                        original_stump.leaves,
-                    );
-                    self.pollard_leaves.clear();
-                    if let Err(rollback) = rollback {
-                        return Err(error.context(format!(
-                            "failed to roll back journal after apply enqueue failure: {rollback:#}"
-                        )));
-                    }
-                    return Err(error);
-                }
-            };
-        timings.journal_append = started.elapsed();
-        let pending = PendingApply {
-            completion,
-            journal_index,
-            height,
+        let pending = PreparedBlock {
+            entry: journal_entry,
             proof_forest_rows: tree_rows(original_stump.leaves),
         };
         let started = Instant::now();
@@ -1424,24 +1660,21 @@ impl FlatFileProver {
         ))
     }
 
+    #[cfg(test)]
     pub fn sync(&mut self) -> anyhow::Result<()> {
         self.drain_pending_apply()?;
-        self.acc
-            .as_ref()
-            .context("steady forest unavailable during sync")?
-            .sync()?;
-        let published_size = self.journal.published_size();
-        self.journal.flush()?;
-        if !self.journal.is_flushed_through(published_size) {
-            anyhow::bail!("forest journal did not flush through {published_size}");
-        }
-        self.proof_file.sync()?;
-        Ok(())
+        let tip = self.persistence.barrier(PersistenceBarrier::Sync {
+            clean_shutdown: false,
+        })?;
+        self.verify_durable_tip(&tip)
     }
 
     fn sync_for_shutdown(&mut self) -> anyhow::Result<()> {
-        self.sync()?;
-        self.journal.mark_clean_shutdown()
+        self.drain_pending_apply()?;
+        let tip = self.persistence.barrier(PersistenceBarrier::Sync {
+            clean_shutdown: true,
+        })?;
+        self.verify_durable_tip(&tip)
     }
 }
 
@@ -1560,6 +1793,513 @@ mod tests {
     use bitcoin::ScriptBuf;
 
     use super::*;
+
+    struct FixtureChain {
+        blocks: Mutex<Vec<Block>>,
+    }
+
+    impl Blockchain for FixtureChain {
+        fn get_block(&self, hash: BlockHash) -> anyhow::Result<Block> {
+            self.blocks
+                .lock()
+                .iter()
+                .find(|block| block.block_hash() == hash)
+                .cloned()
+                .context("fixture block missing")
+        }
+
+        fn get_block_with_prevouts(
+            &self,
+            hash: BlockHash,
+        ) -> anyhow::Result<crate::chaininterface::BlockWithPrevouts> {
+            let block = self.get_block(hash)?;
+            let mut prevouts = HashMap::new();
+            for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
+                for input in &tx.input {
+                    let previous = self.get_raw_transaction_info(&input.previous_output.txid)?;
+                    let output = &previous.tx.output[input.previous_output.vout as usize];
+                    prevouts.insert(
+                        input.previous_output,
+                        PrevoutInfo {
+                            height: previous.height,
+                            is_coinbase: previous.is_coinbase,
+                            value: output.value.to_sat(),
+                            script_pubkey: output.script_pubkey.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(crate::chaininterface::BlockWithPrevouts { block, prevouts })
+        }
+
+        fn get_block_hash(&self, height: u64) -> anyhow::Result<BlockHash> {
+            self.blocks
+                .lock()
+                .get(height as usize)
+                .map(Block::block_hash)
+                .context("fixture height missing")
+        }
+
+        fn get_block_height(&self, hash: BlockHash) -> anyhow::Result<u32> {
+            self.blocks
+                .lock()
+                .iter()
+                .position(|block| block.block_hash() == hash)
+                .map(|height| height as u32)
+                .context("fixture hash missing")
+        }
+
+        fn get_block_header(&self, hash: BlockHash) -> anyhow::Result<bitcoin::block::Header> {
+            Ok(self.get_block(hash)?.header)
+        }
+
+        fn get_block_count(&self) -> anyhow::Result<u64> {
+            Ok(self.blocks.lock().len() as u64 - 1)
+        }
+
+        fn get_raw_transaction_info(&self, txid: &Txid) -> anyhow::Result<TransactionInfo> {
+            let blocks = self.blocks.lock();
+            for (height, block) in blocks.iter().enumerate() {
+                if let Some(tx) = block.txdata.iter().find(|tx| tx.compute_txid() == *txid) {
+                    return Ok(TransactionInfo {
+                        tx: tx.clone(),
+                        height: height as u32,
+                        blockhash: Some(block.block_hash()),
+                        is_coinbase: tx.is_coinbase(),
+                    });
+                }
+            }
+            anyhow::bail!("fixture transaction missing")
+        }
+    }
+
+    struct PersistenceFixture {
+        root: PathBuf,
+        chain: Arc<FixtureChain>,
+    }
+
+    impl PersistenceFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "bridge-persistence-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut blocks = vec![genesis_block(Network::Signet)];
+            let input = |outpoint| bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            };
+            for height in 1..=10u32 {
+                let mut coinbase = blocks[0].txdata[0].clone();
+                coinbase.input[0].script_sig = ScriptBuf::from_bytes(height.to_le_bytes().to_vec());
+                coinbase.output = (0..if height == 1 { 4 } else { 1 })
+                    .map(|vout| bitcoin::TxOut {
+                        value: bitcoin::Amount::from_sat(1000 + u64::from(height) * 10 + vout),
+                        script_pubkey: ScriptBuf::new(),
+                    })
+                    .collect();
+                let mut txdata = vec![coinbase];
+                if height >= 2 {
+                    let previous_tx = blocks.last().unwrap().txdata.last().unwrap();
+                    let mut inputs = vec![input(OutPoint {
+                        txid: previous_tx.compute_txid(),
+                        vout: 0,
+                    })];
+                    if height == 3 {
+                        inputs.push(input(OutPoint {
+                            txid: blocks[1].txdata[0].compute_txid(),
+                            vout: 1,
+                        }));
+                    }
+                    txdata.push(bitcoin::Transaction {
+                        version: bitcoin::transaction::Version::TWO,
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: inputs,
+                        output: (0..2u64)
+                            .map(|vout| bitcoin::TxOut {
+                                value: bitcoin::Amount::from_sat(u64::from(height) * 100 + vout),
+                                script_pubkey: ScriptBuf::new(),
+                            })
+                            .collect(),
+                    });
+                }
+                let mut header = blocks[0].header;
+                header.prev_blockhash = blocks.last().unwrap().block_hash();
+                header.nonce = height;
+                blocks.push(Block { header, txdata });
+            }
+            let mut config = crate::parallel_forest::ParallelForestConfig::new(root.join("forest"));
+            config.leaf_map_path = root.join("leaf-map");
+            config.header_file_path = root.join("headers");
+            config.header_index_path = root.join("header-index");
+            config.minimum_leaf_capacity = Some(64);
+            config.leaf_workers = 1;
+            config.chaser_workers = 1;
+            config.lock_pages = false;
+            crate::parallel_forest::tests::bootstrap_fixture(blocks[1].clone(), config).unwrap();
+            Self {
+                root,
+                chain: Arc::new(FixtureChain {
+                    blocks: Mutex::new(blocks),
+                }),
+            }
+        }
+
+        fn open(
+            &self,
+        ) -> (
+            FlatFileProver,
+            Arc<ProofFile>,
+            Arc<BlocksIndex>,
+            std::sync::mpsc::Receiver<BlockHash>,
+        ) {
+            let header_index = Arc::new(
+                HeaderIndex::open(&self.root.join("headers"), &self.root.join("header-index"))
+                    .unwrap(),
+            );
+            let proof_file = Arc::new(ProofFile::new(self.root.join("proofs")).unwrap());
+            let proof_index = Arc::new(BlocksIndex {
+                database: kv::Store::new(kv::Config {
+                    path: self.root.join("proof-index"),
+                    temporary: false,
+                    use_compression: false,
+                    flush_every_ms: None,
+                    cache_capacity: None,
+                    segment_size: None,
+                })
+                .unwrap(),
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let prover = FlatFileProver::new(
+                self.chain.clone(),
+                header_index,
+                &self.root.join("forest"),
+                self.root.join("journal"),
+                &self.root.join("leaf-map"),
+                proof_file.clone(),
+                proof_index.clone(),
+                1,
+                false,
+                1 << 20,
+                Arc::new(AtomicBool::new(false)),
+                sender,
+            )
+            .unwrap();
+            (prover, proof_file, proof_index, receiver)
+        }
+    }
+
+    impl Drop for PersistenceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushGate {
+        released: Mutex<bool>,
+        changed: parking_lot::Condvar,
+    }
+
+    impl FlushGate {
+        fn wait(&self) {
+            let mut released = self.released.lock();
+            while !*released {
+                self.changed.wait(&mut released);
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn asynchronous_persistence_proves_during_flush_and_reopens() {
+        let fixture = Arc::new(PersistenceFixture::new());
+        let producer_fixture = Arc::clone(&fixture);
+        let (storage_tx, storage_rx) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new(FlushGate::default());
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let worker_gate = gate.clone();
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(1);
+        let batch_gate = Arc::new(FlushGate::default());
+        let worker_batch_gate = Arc::clone(&batch_gate);
+        let (batch_entered, batch_waiting) = std::sync::mpsc::sync_channel(1);
+        let flushes = Arc::new(Mutex::new(Vec::new()));
+        let worker_flushes = Arc::clone(&flushes);
+        let producer = std::thread::Builder::new()
+            .name("fixture-prover".into())
+            .spawn(move || {
+                let (mut prover, proof_file, proof_index, notifications) = producer_fixture.open();
+                *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                    if stage == "state_flush" {
+                        worker_flushes.lock().push(height);
+                    }
+                    if stage == "state_flush" && height == 4 {
+                        batch_entered.send(()).unwrap();
+                        worker_batch_gate.wait();
+                    }
+                    if stage == "state_flush" && height == 2 {
+                        entered.send(()).unwrap();
+                        worker_gate.wait();
+                    }
+                    Ok(())
+                }));
+                storage_tx
+                    .send((proof_file, proof_index, notifications))
+                    .unwrap();
+                println!("steady fixture proving starts tid={}", unsafe {
+                    libc::syscall(libc::SYS_gettid)
+                });
+                prover.prove_range(2, 2).unwrap();
+                continue_rx.recv().unwrap();
+                let block = prover
+                    .rpc
+                    .get_block(prover.rpc.get_block_hash(3).unwrap())
+                    .unwrap();
+                let inputs = &block.txdata[1].input;
+                assert!(prover.leaf_data.contains_key(&inputs[0].previous_output));
+                assert!(!prover.leaf_data.contains_key(&inputs[1].previous_output));
+                prover.pollard_memory_limit = 1;
+                prover.enforce_pollard_memory_limit().unwrap();
+                prover.prove_range(3, 3).unwrap();
+                // Remove the recent-leaf cache too: height four must resolve a not-yet-
+                // durable addition through the outpoint overlay, not either cache.
+                prover.leaf_data.clear();
+                prover.prove_range(4, 4).unwrap();
+                progress_tx
+                    .send((prover.height, prover.pending_apply.len()))
+                    .unwrap();
+                let roots = pollard_stump_roots(&prover.pollard);
+                prover.sync_for_shutdown().unwrap();
+                println!(
+                    "steady fixture proving ends height={} leaves={}",
+                    prover.height,
+                    prover.pollard.leaves()
+                );
+                roots
+            })
+            .unwrap();
+        let (proof_file, proof_index, notifications) = storage_rx.recv().unwrap();
+        let entered_result = waiting.recv_timeout(Duration::from_secs(10));
+        let premature_notification = notifications.try_recv().is_ok();
+        let height_during_flush = proof_index.load_height();
+        let _ = continue_tx.send(());
+        let progress = progress_rx.recv_timeout(Duration::from_secs(10));
+        gate.release();
+        let batch_result = batch_waiting.recv_timeout(Duration::from_secs(10));
+        let height_during_batch = proof_index.load_height();
+        let first_notification = notifications.recv_timeout(Duration::from_secs(2));
+        let premature_batch_notification = notifications.try_recv().is_ok();
+        batch_gate.release();
+        batch_result.unwrap();
+        assert_eq!(height_during_batch.unwrap(), 2);
+        assert_eq!(
+            first_notification.unwrap(),
+            fixture.chain.get_block_hash(2).unwrap()
+        );
+        assert!(
+            !premature_batch_notification,
+            "batch must not publish a partial completion"
+        );
+        entered_result.unwrap();
+        assert!(
+            !premature_notification,
+            "uncommitted block must not be announced"
+        );
+        assert_eq!(height_during_flush.unwrap(), 1);
+        assert_eq!(
+            progress.unwrap(),
+            (4, 3),
+            "producer must advance while height two is flushing"
+        );
+        let roots = producer.join().unwrap();
+        assert_eq!(
+            *flushes.lock(),
+            [2, 4],
+            "queued heights three and four share one state flush"
+        );
+        println!(
+            "group commit: heights 2..=4 persisted in two batches; no partial batch publication"
+        );
+        assert_eq!(proof_index.load_height().unwrap(), 4);
+        let mut proofs = Vec::new();
+        for height in 2..=4 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            if height > 2 {
+                assert_eq!(
+                    notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    hash
+                );
+            }
+            let index = proof_index.get_index(hash).unwrap().unwrap();
+            proofs.push(proof_file.get(&index).unwrap());
+        }
+        assert!(fixture.root.join("journal.clean").exists());
+        drop(proof_file);
+        drop(proof_index);
+        let (mut reopened, proof_file, proof_index, _) = fixture.open();
+        assert_eq!(reopened.height, 4);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+        for (height, expected) in (2..=4).zip(proofs) {
+            let index = proof_index
+                .get_index(fixture.chain.get_block_hash(height).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof_file.get(&index).unwrap(), expected);
+        }
+        reopened.sync_for_shutdown().unwrap();
+        println!("steady fixture reopened durable height=4, all three compact proofs identical");
+    }
+
+    #[test]
+    fn failed_group_commit_recovers_only_a_contiguous_proof_prefix() {
+        for failure_stage in ["journal", "state_flush"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, proofs, index, notifications) = fixture.open();
+            let gate = Arc::new(FlushGate::default());
+            let worker_gate = Arc::clone(&gate);
+            let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+            *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                if stage == "state_flush" && height == 2 {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                if stage == failure_stage && height == 4 {
+                    anyhow::bail!("injected batch persistence failure");
+                }
+                Ok(())
+            }));
+            prover.prove_range(2, 2).unwrap();
+            let at_two = pollard_stump_roots(&prover.pollard);
+            let entered = waiting.recv_timeout(Duration::from_secs(10));
+            if entered.is_err() {
+                gate.release();
+            }
+            entered.unwrap();
+            let produced = prover.prove_range(3, 4);
+            let at_four = pollard_stump_roots(&prover.pollard);
+            gate.release();
+            produced.unwrap();
+            assert!(format!("{:#}", prover.sync().unwrap_err()).contains("injected batch"));
+            assert_eq!(index.load_height().unwrap(), 2);
+            assert_eq!(
+                notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
+                fixture.chain.get_block_hash(2).unwrap()
+            );
+            assert!(notifications.try_recv().is_err());
+            assert!(prover.sync_for_shutdown().is_err());
+            drop(prover);
+            assert!(!fixture.root.join("journal.clean").exists());
+            drop(proofs);
+            drop(index);
+            let (mut reopened, _, _, _) = fixture.open();
+            let (height, roots) = if failure_stage == "journal" {
+                (2, at_two)
+            } else {
+                (4, at_four)
+            };
+            assert_eq!(reopened.height, height);
+            assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+            reopened.sync_for_shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn orderly_persistence_failures_stop_publication_and_recover() {
+        for stage in ["journal", "state_flush"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, proof_file, proof_index, notifications) = fixture.open();
+            let baseline = pollard_stump_roots(&prover.pollard);
+            *prover.persistence.hook.lock() = Some(Arc::new(move |at, _| {
+                if at == stage {
+                    anyhow::bail!("injected {stage} failure");
+                }
+                Ok(())
+            }));
+            prover.prove_range(2, 2).unwrap();
+            let advanced = pollard_stump_roots(&prover.pollard);
+            let failure = prover.sync().unwrap_err();
+            assert!(format!("{failure:#}").contains(&format!("injected {stage} failure")));
+            assert!(prover.prove_range(3, 3).is_err());
+            assert!(prover.sync_for_shutdown().is_err());
+            assert!(notifications.try_recv().is_err());
+            assert!(!fixture.root.join("journal.clean").exists());
+            drop(prover);
+            drop(proof_file);
+            drop(proof_index);
+            let (mut reopened, _, _, _) = fixture.open();
+            let (height, roots) = if stage == "journal" {
+                (1, baseline)
+            } else {
+                (2, advanced)
+            };
+            assert_eq!(reopened.height, height);
+            assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+            reopened.sync_for_shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_pipeline_drains_before_reorg() {
+        let fixture = Arc::new(PersistenceFixture::new());
+        let producer_fixture = Arc::clone(&fixture);
+        let gate = Arc::new(FlushGate::default());
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (limited_tx, limited_rx) = std::sync::mpsc::channel();
+        let worker_gate = gate.clone();
+        let (full_tx, full_rx) = std::sync::mpsc::sync_channel(1);
+        let producer = std::thread::spawn(move || {
+            let (mut prover, _, proof_index, _) = producer_fixture.open();
+            let baseline = pollard_stump_roots(&prover.pollard);
+            *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                if stage == "state_flush" && height == 2 {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                if stage == "backpressure" {
+                    let _ = limited_tx.send(());
+                }
+                Ok(())
+            }));
+            prover.prove_range(2, 9).unwrap();
+            full_tx.send(prover.pending_apply.len()).unwrap();
+            prover.prove_range(10, 10).unwrap();
+            producer_fixture.chain.blocks.lock().truncate(2);
+            assert_eq!(prover.reconcile_chain().unwrap(), 9);
+            assert_eq!(prover.height, 1);
+            assert_eq!(pollard_stump_roots(&prover.pollard), baseline);
+            assert_eq!(proof_index.load_height().unwrap(), 1);
+            assert_eq!(
+                std::fs::metadata(producer_fixture.root.join("proofs"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            prover.sync_for_shutdown().unwrap();
+            baseline
+        });
+        let entered_result = waiting.recv_timeout(Duration::from_secs(10));
+        let full = full_rx.recv_timeout(Duration::from_secs(10));
+        let limited = limited_rx.recv_timeout(Duration::from_secs(10));
+        gate.release();
+        entered_result.unwrap();
+        assert_eq!(full.unwrap(), MAX_PENDING_BLOCKS);
+        limited.unwrap();
+        let baseline = producer.join().unwrap();
+        let (mut reopened, _, _, _) = fixture.open();
+        assert_eq!(reopened.height, 1);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), baseline);
+        reopened.sync_for_shutdown().unwrap();
+    }
 
     fn leaf(outpoint: OutPoint) -> LeafContext {
         LeafContext {

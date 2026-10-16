@@ -132,12 +132,26 @@ impl BlocksIndex {
     }
 
     /// Appends a new block entry to the index.
+    #[cfg(test)]
     pub fn append<'a>(&'a self, index: BlockIndex, block: BlockHash) -> Result<(), kv::Error> {
         let bucket = self
             .database
             .bucket::<&'a [u8], IndexEntry>(Some("index"))?;
         let key: [u8; 32] = *block.as_byte_array();
         bucket.set(&key.as_slice(), &IndexEntry::Index(index))?;
+        bucket.flush()?;
+        Ok(())
+    }
+
+    /// Publishes a group of proof indexes with a single durability flush.
+    pub fn append_batch(&self, indexes: &[(BlockIndex, BlockHash)]) -> Result<(), kv::Error> {
+        let bucket = self.database.bucket::<&[u8], IndexEntry>(Some("index"))?;
+        for (index, block) in indexes {
+            bucket.set(
+                &block.as_byte_array().as_slice(),
+                &IndexEntry::Index(*index),
+            )?;
+        }
         bucket.flush()?;
         Ok(())
     }
