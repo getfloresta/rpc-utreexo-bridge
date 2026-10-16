@@ -13,6 +13,7 @@ mod header_index;
 mod node;
 
 mod parallel_forest;
+mod position_timing;
 mod prover;
 
 mod block_index;

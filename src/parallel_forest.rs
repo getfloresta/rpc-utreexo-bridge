@@ -36,6 +36,8 @@ use crate::forest_journal::JournalIndexDelta;
 use crate::forest_journal::JournalNodeState;
 use crate::header_index::HeaderBuildWriter;
 use crate::header_index::HeaderIndex;
+use crate::position_timing::PositionTimer;
+use crate::position_timing::PositionTiming;
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
 use ahash::AHashMap;
 use ahash::AHashSet;
@@ -189,6 +191,13 @@ pub struct ForestBuildSummary {
     pub pages_locked: bool,
     pub roots: Vec<ForestRoot>,
     pub statistics: BuildStatistics,
+}
+
+/// Batch positions and the separate costs of database access and forest validation.
+pub(crate) struct LeafPositions {
+    pub(crate) positions: Vec<Result<u64>>,
+    pub(crate) fetch: PositionTiming,
+    pub(crate) validation: PositionTiming,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1109,12 +1118,222 @@ fn leaf_map_key(txid: [u8; 32], vout: u32) -> [u8; LEAF_MAP_KEY_SIZE] {
     key
 }
 
-/// A single-threaded mutable view of a completed flat-forest bootstrap.
+/// A completed flat forest: mutation requires exclusive access, while reads and sync may share it.
 pub struct SteadyStateForest {
     forest: FlatForest,
     leaf_map: Database,
     leaves: u64,
     forest_rows: u8,
+}
+
+/// Foreground state newer than the durability worker's forest. Entries are retired by
+/// height only after the worker acknowledges the complete persistence transaction.
+#[derive(Default)]
+pub(crate) struct ForestOverlay {
+    nodes: AHashMap<u64, JournalNodeState>,
+    node_heights: AHashMap<u64, u32>,
+    positions: AHashMap<OutPoint, (u32, Option<u64>)>,
+}
+
+impl ForestOverlay {
+    pub(crate) fn push(&mut self, entry: &JournalEntry) {
+        for delta in &entry.forest {
+            self.nodes.insert(delta.position, delta.after);
+            self.node_heights.insert(delta.position, entry.height);
+        }
+        for delta in &entry.removed {
+            self.positions.insert(delta.outpoint, (entry.height, None));
+        }
+        for delta in &entry.added {
+            self.positions
+                .insert(delta.outpoint, (entry.height, Some(delta.position)));
+        }
+    }
+
+    pub(crate) fn retire(&mut self, entry: &JournalEntry) {
+        for delta in &entry.forest {
+            if self.node_heights.get(&delta.position) == Some(&entry.height) {
+                self.nodes.remove(&delta.position);
+                self.node_heights.remove(&delta.position);
+            }
+        }
+        for delta in entry.removed.iter().chain(&entry.added) {
+            if self
+                .positions
+                .get(&delta.outpoint)
+                .is_some_and(|(height, _)| *height == entry.height)
+            {
+                self.positions.remove(&delta.outpoint);
+            }
+        }
+    }
+}
+
+/// A read-locked physical forest plus the producer's not-yet-durable mutations.
+/// The lock excludes mmap writes/remapping, but is shared with background fsync.
+pub(crate) struct ForestView<'a> {
+    forest: &'a SteadyStateForest,
+    overlay: &'a ForestOverlay,
+    leaves: u64,
+}
+
+impl<'a> ForestView<'a> {
+    pub(crate) fn new(
+        forest: &'a SteadyStateForest,
+        overlay: &'a ForestOverlay,
+        leaves: u64,
+    ) -> Self {
+        Self {
+            forest,
+            overlay,
+            leaves,
+        }
+    }
+
+    pub(crate) fn leaf_positions(&self, outpoints: &[OutPoint]) -> Result<LeafPositions> {
+        let timer = PositionTimer::start();
+        let keys: Vec<_> = outpoints
+            .iter()
+            .filter(|outpoint| !self.overlay.positions.contains_key(outpoint))
+            .map(|outpoint| leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout))
+            .collect();
+        let values = self
+            .forest
+            .leaf_map
+            .batch_fetch(keys.iter().map(|key| key.as_slice()))
+            .context("failed to query leaf map batch")?;
+        let fetch = timer.finish();
+        let timer = PositionTimer::start();
+        let mut values = values.into_iter();
+        let positions = outpoints
+            .iter()
+            .map(|outpoint| {
+                let position = match self.overlay.positions.get(outpoint) {
+                    Some((_, position)) => {
+                        position.ok_or_else(|| anyhow!("outpoint {outpoint} is spent"))?
+                    }
+                    None => {
+                        let value = values
+                            .next()
+                            .context("leaf-map batch omitted an outpoint")?
+                            .ok_or_else(|| anyhow!("outpoint {outpoint} is not in the leaf map"))?;
+                        let bytes: [u8; LEAF_MAP_VALUE_SIZE] = value
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow!("leaf position has {} bytes", value.len()))?;
+                        u64::from_le_bytes(bytes)
+                    }
+                };
+                if position >= self.leaves {
+                    bail!("outpoint {outpoint} maps beyond {} leaves", self.leaves);
+                }
+                self.leaf_hash(position)?;
+                Ok(position)
+            })
+            .collect();
+        Ok(LeafPositions {
+            positions,
+            fetch,
+            validation: timer.finish(),
+        })
+    }
+
+    pub(crate) fn leaf_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
+        let node = self
+            .forest
+            .read_with_overlay(position, &self.overlay.nodes)?;
+        if node.spent {
+            bail!("leaf position {position} is spent");
+        }
+        Ok(BitcoinNodeHash::from(node.hash))
+    }
+
+    pub(crate) fn translate_proof_positions(&self, positions: &mut [u64]) -> Result<()> {
+        translate_proof_positions(
+            positions,
+            self.leaves,
+            self.forest.forest_rows,
+            |position| {
+                Ok(self
+                    .forest
+                    .read_with_overlay(position, &self.overlay.nodes)?
+                    .spent)
+            },
+        )
+    }
+
+    pub(crate) fn position_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
+        self.forest
+            .position_hash_with_overlay(position, self.leaves, &self.overlay.nodes)
+    }
+
+    pub(crate) fn recover_leaf_position_from_block(
+        &self,
+        target: OutPoint,
+        target_hash: BitcoinNodeHash,
+        block_leaves: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<u64> {
+        let target_index = block_leaves
+            .iter()
+            .position(|(outpoint, _)| *outpoint == target)
+            .context("outpoint is not an eligible leaf in its block")?
+            as u64;
+        let outpoints: Vec<_> = block_leaves.iter().map(|(outpoint, _)| *outpoint).collect();
+        let positions = self.leaf_positions(&outpoints)?.positions;
+        for (local_index, (position, (_, hash))) in
+            positions.into_iter().zip(block_leaves).enumerate()
+        {
+            let Ok(position) = position else { continue };
+            if self.leaf_hash(position).ok().as_ref() != Some(hash) {
+                continue;
+            }
+            if let Some(candidate) = position
+                .checked_sub(local_index as u64)
+                .and_then(|start| start.checked_add(target_index))
+                .filter(|candidate| *candidate < self.leaves)
+            {
+                let node = self
+                    .forest
+                    .read_with_overlay(candidate, &self.overlay.nodes)?;
+                if !node.spent && node.hash == *target_hash {
+                    return Ok(candidate);
+                }
+            }
+        }
+        for position in 0..self.leaves {
+            let node = self
+                .forest
+                .read_with_overlay(position, &self.overlay.nodes)?;
+            if !node.spent && node.hash == *target_hash {
+                return Ok(position);
+            }
+        }
+        bail!("could not recover outpoint {target} from its creating block")
+    }
+
+    pub(crate) fn plan_update(
+        &self,
+        height: u32,
+        block_hash: BlockHash,
+        previous_block_hash: BlockHash,
+        deletions: &[(OutPoint, u64)],
+        additions: &[(OutPoint, BitcoinNodeHash)],
+    ) -> Result<JournalEntry> {
+        self.forest.plan_update_with_overlay(
+            height,
+            block_hash,
+            previous_block_hash,
+            self.leaves,
+            &self.overlay.nodes,
+            deletions,
+            additions,
+        )
+    }
+
+    pub(crate) fn roots_after(&self, entry: &JournalEntry) -> Result<Vec<BitcoinNodeHash>> {
+        self.forest
+            .roots_after_with_overlay(entry, self.leaves, &self.overlay.nodes)
+    }
 }
 
 struct PlannedNode {
@@ -1211,54 +1430,17 @@ impl SteadyStateForest {
         Ok(roots)
     }
 
-    /// Returns the stable bottom-row position stored for an outpoint.
+    #[cfg(test)]
     pub fn leaf_position(&self, outpoint: &OutPoint) -> Result<u64> {
-        let key = leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout);
-        let value = self
-            .leaf_map
-            .get(&key)
-            .context("failed to query leaf map")?;
-        self.validate_leaf_position(outpoint, value.as_deref())
+        self.leaf_positions(&[*outpoint])?
+            .positions
+            .pop()
+            .context("missing lookup result")?
     }
 
-    /// Looks up positions in input order, retaining missing or invalid entries as per-key errors.
-    /// Storage errors fail the whole lookup rather than being treated as recoverable misses.
-    pub fn leaf_positions(&self, outpoints: &[OutPoint]) -> Result<Vec<Result<u64>>> {
-        let keys: Vec<_> = outpoints
-            .iter()
-            .map(|outpoint| leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout))
-            .collect();
-        let values = self
-            .leaf_map
-            .batch_fetch(keys.iter().map(|key| key.as_slice()))
-            .context("failed to query leaf map batch")?;
-        Ok(outpoints
-            .iter()
-            .zip(values)
-            .map(|(outpoint, value)| self.validate_leaf_position(outpoint, value.as_deref()))
-            .collect())
-    }
-
-    fn validate_leaf_position(&self, outpoint: &OutPoint, value: Option<&[u8]>) -> Result<u64> {
-        let value = value.ok_or_else(|| anyhow!("outpoint {outpoint} is not in the leaf map"))?;
-        let value: [u8; LEAF_MAP_VALUE_SIZE] = value
-            .try_into()
-            .map_err(|_| anyhow!("leaf position has {} bytes", value.len()))?;
-        let position = u64::from_le_bytes(value);
-        if position >= self.leaves {
-            bail!(
-                "outpoint {outpoint} maps to position {position} beyond {} leaves",
-                self.leaves
-            );
-        }
-        let node = self
-            .forest
-            .try_read(position)?
-            .ok_or_else(|| anyhow!("leaf position {position} is uninitialized"))?;
-        if node.spent {
-            bail!("outpoint {outpoint} maps to spent position {position}");
-        }
-        Ok(position)
+    #[cfg(test)]
+    pub(crate) fn leaf_positions(&self, outpoints: &[OutPoint]) -> Result<LeafPositions> {
+        ForestView::new(self, &ForestOverlay::default(), self.leaves).leaf_positions(outpoints)
     }
 
     pub(crate) fn repair_leaf_position(
@@ -1278,108 +1460,34 @@ impl SteadyStateForest {
             .sync()
             .context("failed to sync repaired leaf map")
     }
+    #[cfg(test)]
     pub(crate) fn recover_leaf_position_from_block(
         &self,
         target: OutPoint,
         target_hash: BitcoinNodeHash,
         block_leaves: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<u64> {
-        let target_index = block_leaves
-            .iter()
-            .position(|(outpoint, _)| *outpoint == target)
-            .map(|index| index as u64)
-            .ok_or_else(|| anyhow!("outpoint {target} is not an eligible leaf in its block"))?;
-
-        let mut block_start = None;
-        for (local_index, (outpoint, leaf_hash)) in block_leaves.iter().enumerate() {
-            let Ok(position) = self.leaf_position(outpoint) else {
-                continue;
-            };
-            if self.leaf_hash(position).ok().as_ref() != Some(leaf_hash) {
-                continue;
-            }
-            let Some(start) = position.checked_sub(local_index as u64) else {
-                continue;
-            };
-            match block_start {
-                Some(previous) if previous != start => {
-                    block_start = None;
-                    break;
-                }
-                None => block_start = Some(start),
-                _ => {}
-            }
-        }
-
-        if let Some(block_start) = block_start {
-            let position = block_start
-                .checked_add(target_index)
-                .context("recovered leaf position overflow")?;
-            if self
-                .forest
-                .try_read(position)?
-                .is_some_and(|node| !node.spent && node.hash == *target_hash)
-            {
-                return Ok(position);
-            }
-        }
-
-        for position in 0..self.leaves {
-            let Some(node) = self.forest.try_read(position)? else {
-                continue;
-            };
-            if !node.spent && node.hash == *target_hash {
-                return Ok(position);
-            }
-        }
-        bail!(
-            "could not recover outpoint {target} from its {}-leaf block range",
-            block_leaves.len()
-        )
+        ForestView::new(self, &ForestOverlay::default(), self.leaves)
+            .recover_leaf_position_from_block(target, target_hash, block_leaves)
     }
 
+    #[cfg(test)]
     pub fn leaf_hash(&self, bottom_position: u64) -> Result<BitcoinNodeHash> {
-        let node = self
-            .forest
-            .try_read(bottom_position)?
-            .ok_or_else(|| anyhow!("leaf position {bottom_position} is uninitialized"))?;
-        if node.spent {
-            bail!("leaf position {bottom_position} is spent");
-        }
-        Ok(BitcoinNodeHash::from(node.hash))
+        ForestView::new(self, &ForestOverlay::default(), self.leaves).leaf_hash(bottom_position)
     }
 
     /// Converts a stable bottom position into its position in the promoted, sparse forest.
+    #[cfg(test)]
     pub fn proof_position(&self, bottom_position: u64) -> Result<u64> {
-        self.proof_position_with_overlay(bottom_position, self.leaves, &AHashMap::new())
+        let mut positions = [bottom_position];
+        self.translate_proof_positions(&mut positions)?;
+        Ok(positions[0])
     }
 
-    pub(crate) fn proof_position_with_overlay(
-        &self,
-        bottom_position: u64,
-        leaves: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
-    ) -> Result<u64> {
-        let mut original_position = bottom_position;
-        let mut branch_directions = Vec::new();
-        while !is_root_position(original_position, leaves, self.forest_rows) {
-            let sibling_position = original_position ^ 1;
-            let sibling = self.read_with_overlay(sibling_position, overlay)?;
-            if !sibling.spent {
-                branch_directions.push(original_position & 1 != 0);
-            }
-            original_position = parent(original_position, self.forest_rows);
-        }
-
-        // Preallocated storage rows are not part of the Utreexo proof coordinate system. Convert
-        // the physical root and descent to the canonical row count implied by numleaves.
-        let root_row = detect_row(original_position, self.forest_rows);
-        let logical_rows = tree_rows(leaves);
-        let mut promoted_position = root_position(leaves, root_row, logical_rows);
-        for is_right in branch_directions.into_iter().rev() {
-            promoted_position = left_child(promoted_position, logical_rows) + u64::from(is_right);
-        }
-        Ok(promoted_position)
+    #[cfg(test)]
+    pub(crate) fn translate_proof_positions(&self, positions: &mut [u64]) -> Result<()> {
+        ForestView::new(self, &ForestOverlay::default(), self.leaves)
+            .translate_proof_positions(positions)
     }
 
     fn read_with_overlay(
@@ -1483,10 +1591,6 @@ impl SteadyStateForest {
         Ok(Proof::new_with_hash(targets, hashes))
     }
 
-    pub(crate) fn position_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
-        self.position_hash_with_overlay(position, self.leaves, &AHashMap::new())
-    }
-
     pub(crate) fn position_hash_with_overlay(
         &self,
         position: u64,
@@ -1566,6 +1670,7 @@ impl SteadyStateForest {
         )
     }
 
+    #[cfg(test)]
     ///
     /// Deletion positions must come from this forest's leaf map in the same serialized update.
     pub(crate) fn plan_update_without_resize(
@@ -1739,6 +1844,7 @@ impl SteadyStateForest {
         })
     }
 
+    #[cfg(test)]
     pub fn roots_after(&self, entry: &JournalEntry) -> Result<Vec<BitcoinNodeHash>> {
         self.roots_after_with_overlay(entry, self.leaves, &AHashMap::new())
     }
@@ -1872,8 +1978,17 @@ impl SteadyStateForest {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.forest.flush()?;
-        self.leaf_map.sync().context("failed to sync leaf map")
+        // Seal the runtime allocator even if flushing the forest fails, so an
+        // orderly error does not leave the leaf map impossible to reopen.
+        let forest_result = self.forest.flush();
+        let leaf_map_result = self.leaf_map.sync().context("failed to sync leaf map");
+        match (forest_result, leaf_map_result) {
+            (Err(forest), Err(leaf_map)) => Err(forest.context(format!(
+                "leaf-map synchronization also failed: {leaf_map:#}"
+            ))),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -2629,6 +2744,79 @@ fn is_root_position(position: u64, leaves: u64, forest_rows: u8) -> bool {
     leaves & (1 << row) != 0 && root_position(leaves, row, forest_rows) == position
 }
 
+fn proof_position_from_spent(
+    bottom_position: u64,
+    leaves: u64,
+    forest_rows: u8,
+    mut sibling_spent: impl FnMut(u64) -> Result<bool>,
+) -> Result<u64> {
+    let mut position = bottom_position;
+    let mut directions = 0u64;
+    let mut depth = 0;
+    while !is_root_position(position, leaves, forest_rows) {
+        if !sibling_spent(position ^ 1)? {
+            directions |= (position & 1) << depth;
+            depth += 1;
+        }
+        position = parent(position, forest_rows);
+    }
+
+    // Preallocated storage rows are not part of the canonical proof coordinates.
+    let logical_rows = tree_rows(leaves);
+    let mut promoted = root_position(leaves, detect_row(position, forest_rows), logical_rows);
+    for shift in (0..depth).rev() {
+        promoted = left_child(promoted, logical_rows) + ((directions >> shift) & 1);
+    }
+    Ok(promoted)
+}
+
+fn translate_proof_positions(
+    positions: &mut [u64],
+    leaves: u64,
+    forest_rows: u8,
+    mut read_spent: impl FnMut(u64) -> Result<bool>,
+) -> Result<()> {
+    let mut frontier = positions.to_vec();
+    frontier.sort_unstable();
+    frontier.dedup();
+    let mut spent = AHashMap::with_capacity(frontier.len());
+    let mut to_load = Vec::with_capacity(frontier.len());
+    let mut index = 0;
+    while index < frontier.len() {
+        let position = frontier[index];
+        index += 1;
+        if is_root_position(position, leaves, forest_rows) {
+            continue;
+        }
+        let sibling = position ^ 1;
+        if frontier.get(index) == Some(&sibling) {
+            // Both branches contain live targets. Neither can be spent, so merge
+            // them without fetching either node, and visit their parent only once.
+            spent.insert(position, false);
+            spent.insert(sibling, false);
+            index += 1;
+        } else {
+            to_load.push(sibling);
+        }
+        // Row-major positions put parents after all children. Sorted children
+        // therefore append sorted parents, preserving the detwinning frontier.
+        frontier.push(parent(position, forest_rows));
+    }
+    to_load.sort_unstable();
+    for position in to_load {
+        spent.insert(position, read_spent(position)?);
+    }
+    for position in positions {
+        *position = proof_position_from_spent(*position, leaves, forest_rows, |sibling| {
+            spent
+                .get(&sibling)
+                .copied()
+                .ok_or_else(|| anyhow!("detwinned traversal omitted sibling {sibling}"))
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn get_proof_positions(targets: &[u64], leaves: u64, forest_rows: u8) -> Vec<u64> {
     let mut proof_positions = BTreeSet::new();
@@ -2678,7 +2866,7 @@ fn start_position_at_row(row: u8, forest_rows: u8) -> Result<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::sync::atomic::AtomicU64;
@@ -2707,6 +2895,71 @@ mod tests {
     use rustreexo::stump::Stump;
 
     use super::*;
+
+    #[test]
+    fn detwinned_traversal_fetches_only_sorted_external_siblings() {
+        let mut targets = [3, 0, 2, 1, 7, 0];
+        let mut reads = Vec::new();
+        translate_proof_positions(&mut targets, 8, 3, |position| {
+            reads.push(position);
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(targets, [3, 0, 2, 1, 7, 0]);
+        assert_eq!(reads, [6, 10]);
+
+        let mut full_subtree = [3, 0, 7, 2, 6, 1, 5, 4];
+        translate_proof_positions(&mut full_subtree, 8, 3, |_| {
+            panic!("all siblings are represented by targets");
+        })
+        .unwrap();
+        assert_eq!(full_subtree, [3, 0, 7, 2, 6, 1, 5, 4]);
+        translate_proof_positions(&mut [], 0, 0, |_| panic!("empty traversal")).unwrap();
+    }
+
+    #[test]
+    fn detwinned_traversal_preserves_targets_on_fetch_error() {
+        let mut targets = [7, 0, 1];
+        let error = translate_proof_positions(&mut targets, 8, 3, |_| bail!("unreadable sibling"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unreadable sibling");
+        assert_eq!(targets, [7, 0, 1]);
+    }
+
+    #[test]
+    fn detwinned_traversal_proves_promoted_targets_across_preallocated_roots() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &(1..=11).collect::<Vec<_>>())],
+        };
+        let hints = bridge_hints(&[0, 11], &[vec![], vec![0, 4, 7, 8, 10]]);
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.minimum_leaf_capacity = Some(32);
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+        {
+            let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let bottoms = [10, 7, 0, 4, 8];
+            let mut targets = bottoms;
+            forest.translate_proof_positions(&mut targets).unwrap();
+            assert_eq!(targets, [10, 19, 24, 18, 20]);
+            let proof = forest.prove(&targets).unwrap();
+            let hashes = bottoms
+                .iter()
+                .map(|position| forest.leaf_hash(*position).unwrap())
+                .collect::<Vec<_>>();
+            assert!(Stump {
+                leaves: forest.leaves(),
+                roots: forest.roots().unwrap(),
+            }
+            .verify(&proof, &hashes)
+            .unwrap());
+        }
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
 
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2880,6 +3133,25 @@ mod tests {
         BridgeHints::from_reader(&mut Cursor::new(encoded)).unwrap()
     }
 
+    pub(crate) fn bootstrap_fixture(
+        block: Block,
+        config: ParallelForestConfig,
+    ) -> Result<ForestBuildSummary> {
+        let leaves = block
+            .txdata
+            .iter()
+            .map(|tx| tx.output.len() as u32)
+            .sum::<u32>();
+        let hints = bridge_hints(&[0, leaves], &[Vec::new(), (0..leaves).collect()]);
+        build_with_source(
+            &MockSource {
+                blocks: vec![block],
+            },
+            &hints,
+            config,
+        )
+    }
+
     fn mock_block(nonce: u32, values: &[u64]) -> Block {
         let transaction = Transaction {
             version: transaction::Version::ONE,
@@ -2972,7 +3244,7 @@ mod tests {
                         .map(|(key, value)| (key.as_slice(), value.as_slice())),
                 )
                 .unwrap();
-            let positions = forest
+            let LeafPositions { positions, .. } = forest
                 .leaf_positions(&[
                     outpoint(2),
                     outpoint(1),
@@ -3007,7 +3279,7 @@ mod tests {
                     assert!(forest.leaf_position(&outpoint(vout)).is_err());
                 }
             }
-            assert!(forest.leaf_positions(&[]).unwrap().is_empty());
+            assert!(forest.leaf_positions(&[]).unwrap().positions.is_empty());
         }
         remove_bootstrap_files(&path, &leaf_map_path);
     }
@@ -3078,7 +3350,7 @@ mod tests {
     }
 
     #[test]
-    fn background_worker_compacts_only_at_thousand_block_boundaries() {
+    fn leaf_map_compaction_preserves_positions_and_roots() {
         fn make_sparse_pages(forest: &mut SteadyStateForest, generation: u8) -> Vec<OutPoint> {
             let count = (2 * LEAF_MAP_BLOCK_SIZE / 32) as u32;
             let txid = Txid::from_byte_array([generation; 32]);
@@ -3119,7 +3391,6 @@ mod tests {
         build_with_source(&source, &hints, config).unwrap();
         let journal_path = path.with_extension("journal");
         let mut journal = ForestJournal::open(&journal_path).unwrap();
-        let worker = crate::prover::JournalApplyWorker::new(journal.flusher().unwrap()).unwrap();
         let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
         let mut survivors = make_sparse_pages(&mut forest, 99);
         let roots = forest.roots().unwrap();
@@ -3142,12 +3413,12 @@ mod tests {
                 )
                 .unwrap();
             journal.append(entry.clone()).unwrap();
-            (forest, _) = worker
-                .enqueue(entry, journal.published_size(), forest)
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap()
-                .unwrap();
+            journal.flush().unwrap();
+            forest.apply_forward(&entry).unwrap();
+            if height % 1_000 == 0 {
+                forest.compact_leaf_map().unwrap();
+            }
+            forest.sync().unwrap();
             let after = forest.leaf_map.stats().unwrap().body;
             assert_eq!(after.live_allocations, before.live_allocations);
             if height == 1_000 {
@@ -3158,17 +3429,16 @@ mod tests {
                 assert_eq!(after.empty_pages, before.empty_pages);
             }
             assert_eq!(forest.roots().unwrap(), roots);
-            let positions = forest.leaf_positions(&survivors).unwrap();
+            let positions = forest.leaf_positions(&survivors).unwrap().positions;
             assert_eq!(positions.len(), survivors.len());
             for position in positions {
                 assert_eq!(position.unwrap(), 0);
             }
         }
-        drop(worker);
         drop(journal);
         drop(forest);
         let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
-        for position in forest.leaf_positions(&survivors).unwrap() {
+        for position in forest.leaf_positions(&survivors).unwrap().positions {
             assert_eq!(position.unwrap(), 0);
         }
         drop(forest);
@@ -3824,7 +4094,7 @@ mod tests {
     }
 
     #[test]
-    fn background_worker_replays_a_durable_journal_entry() {
+    fn durable_journal_replays_deletions() {
         let path = temp_forest_path();
         let source = MockSource {
             blocks: vec![mock_block(1, &[10, 20, 30]), mock_block(2, &[40, 50, 60])],
@@ -3846,7 +4116,7 @@ mod tests {
             vout: 1,
         };
 
-        let (expected_roots, entry, published_size, flusher) = {
+        let expected_roots = {
             let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
             let position = steady.leaf_position(&outpoint).unwrap();
             let entry = steady
@@ -3861,25 +4131,16 @@ mod tests {
             let expected = steady.roots_after(&entry).unwrap();
             let mut journal = crate::forest_journal::ForestJournal::open(&journal_path).unwrap();
             journal.append(entry.clone()).unwrap();
-            let published_size = journal.published_size();
-            let flusher = journal.flusher().unwrap();
-            (expected, entry, published_size, flusher)
+            journal.flush().unwrap();
+            expected
         };
 
-        let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
-        let worker = crate::prover::JournalApplyWorker::new(flusher).unwrap();
-        let (forest, timings) = worker
-            .enqueue(entry, published_size, forest)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
-        assert!(timings.journal_flush < Duration::from_secs(2));
-        assert!(timings.apply < Duration::from_secs(2));
-        assert!(timings.state_flush < Duration::from_secs(2));
+        let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+        let journal = ForestJournal::open(&journal_path).unwrap();
+        forest.replay_journal(&journal).unwrap();
         assert_eq!(forest.roots().unwrap(), expected_roots);
         assert!(forest.leaf_position(&outpoint).is_err());
-        drop(worker);
+        drop(journal);
         drop(forest);
 
         std::fs::remove_file(journal_path).unwrap();

@@ -214,24 +214,44 @@ threshold. Addition positions no longer repeat leaf-map membership lookups alrea
 the serialized block update.
 The steady-state `Pollard` starts from the flat forest roots and keeps stable bottom positions for
 remembered leaves. Cached spends resolve through that internal index without querying the
-persistent leaf map or rereading the leaf hash. Cache misses first wait for the
-background flusher, then resolve together through one ordered `batch_fetch`.
+persistent leaf map or rereading the leaf hash. Cache misses resolve against pending outpoint
+updates first, then query the unchanged portion of the leaf map in one ordered `batch_fetch`.
 The Pollard reports uncached target and proof
 positions, and only those hashes are read from the flat forest and ingested. The Pollard is
 modified immediately and is the source of truth while journal records are pending.
-`--pollard-memory-mib` sets its cache quota and defaults to 250 MiB. Before cached leaves are
-reclaimed, pending forest writes are flushed so a later miss cannot observe stale state.
+`--pollard-memory-mib` sets its cache quota and defaults to 250 MiB. Cache eviction does not wait
+for persistence: pending node and outpoint overlays keep subsequent cache misses current.
+Bottom-to-proof position conversion sorts and detwins the live target frontier before fetching
+sibling spentness. Sibling targets merge into one parent traversal without reading either sibling;
+remaining sibling nodes are fetched once each in ascending physical-position order. The resulting
+proof targets retain the original input order so they stay aligned with deletion hashes and leaf data.
 
-Per-block cache metrics, foreground timings, and completed background-apply timings are written at
+Per-block cache metrics, foreground timings, and completed `background-persistence` timings are written at
 debug level to `$DATA_DIR/debug.log`. Terminal logs report block height, hash, proof size, and
 important lifecycle events without timing noise.
 
-The persistent leaf map continues to hold stable bottom positions. Only forest-node changes from
-journal entries awaiting the background worker are overlaid in the foreground; position-index
-changes remain exclusively inside Pollard until the worker updates the persistent map. Pollard
-proof generation maps bottom positions into the promoted sparse forest, including promotions
-above live branches. The runtime map is given 1 GiB of append headroom; older bootstrap maps are
-extended in place before they are opened.
+`steady-state-timings` retains the aggregate `positions` duration. The accompanying
+`steady-state-position-timings` line splits it into:
+
+- `cache`: leaf hashing, cached bottom-position lookup, and uncached-input collection.
+- `leaf_map`: key preparation and the database batch fetch.
+- `validation`: checking fetched positions against forest bounds, readiness, and spentness.
+- `resolution`: assembling bottom positions, including explicit recovery for missing or invalid entries.
+- `traversal`: sorted, detwinned sibling fetching and conversion to canonical proof targets.
+
+Each phase has a matching `*_majflt` field. On Linux these are `RUSAGE_THREAD` major-page-fault
+deltas for the proving thread, excluding background workers: `Some(0)` means no major faults,
+while `None` means the counter was unavailable. Faults indicate paging that required I/O, not
+all storage waits; database syscalls and writeback stalls need not increment them. Measurements
+are taken at phase boundaries, not per input. Phase times exclude counter-sampling overhead
+and need not sum exactly to `positions`.
+
+The persistent leaf map continues to hold stable bottom positions. Pending forest-node and
+outpoint changes are overlaid in the foreground, including removals, so even a fully evicted
+Pollard can prove blocks while the durable forest lags. Overlay entries carry their producing
+height and are retired only when that height is acknowledged; retiring an earlier block cannot
+discard a later update to the same node or outpoint. The runtime map is given 1 GiB of append
+headroom; older bootstrap maps are extended in place before they are opened.
 
 Journal application and rollback use `batch_delete` and `put_batch`. They remove
 the union of affected keys before reinsertion so replay remains idempotent even
@@ -240,10 +260,11 @@ though the database's append-only batch writer retains duplicate keys.
 After applying each steady-state block with `height % 1_000 == 0`, the background
 worker compacts leaf-map pages below half occupancy (16,384 live nodes per
 1 MiB page), then syncs the forest and database before publishing completion.
-The worker owns the forest exclusively during deletion and compaction; foreground
-lookups cannot retain stale node offsets. Compaction failures abort the apply
-job rather than marking the height durable. Header reads and steady-state index
-replacement/removal are coordinated separately by a read/write lock.
+The worker holds an exclusive forest lock only during mutation, relocation, and compaction;
+foreground lookups cannot retain stale node offsets. During forest/database sync it holds a
+shared lock, allowing proof planning and cache misses to run concurrently. Compaction failures
+stop persistence rather than marking the height durable.
+Header reads and steady-state index replacement/removal are coordinated separately by a read/write lock.
 
 Online growth doubles the bottom-row capacity without restarting the bridge. Pending journal
 applications are drained first, internal rows are relocated into the enlarged positional layout,
@@ -256,17 +277,51 @@ Post-hints proofs are appended to `$DATA_DIR/proofs` and indexed by block hash u
 `$DATA_DIR/proof-index`. Records contain only targets, proof hashes, and compact leaf data—Bitcoin
 blocks are fetched from Core and are not retained.
 
-Every steady-state block is published first to `$DATA_DIR/forest.journal`. A page-aligned record
-starts with the block hash and post-block `numleaves`, then contains every changed forest position
-with its before/after hash and publication/spent flags. Added and removed outpoints include their
-stable bottom positions. The foreground writer completes the header, payload, checksum, and
-trailer before release-storing the new published journal size. No journal lock is shared with the
-background flusher. An acquire load prevents that worker from observing a partial record.
+Every steady-state block is queued to one persistence worker, which exclusively owns
+`$DATA_DIR/forest.journal` and all steady-state writes. A page-aligned journal record starts with
+the block hash and post-block `numleaves`, then contains every changed forest position with its
+before/after hash and publication/spent flags. Added and removed outpoints include their stable
+bottom positions.
 
-The foreground hands exclusive ownership of the forest to one background apply job; no forest
-mutex is shared between the threads. While that worker flushes the journal and applies and syncs
-the forest and leaf map, the foreground persists the proof, header, and proof index. The next block
-does not begin until ownership returns and the completed height is durably published.
+The worker groups up to eight consecutive blocks already waiting in the queue, without adding
+a batching delay. It never groups across a reorg, resize, repair, sync, or shutdown barrier.
+It appends all journal records and flushes the journal once **before changing the mapped forest
+or leaf map**. Proofs, headers, and proof-index entries are written for the group, with one sync
+per store. Forest mutations are applied in block order, followed by one forest/leaf-map sync
+and one durable-height commit for the group's final block. Notifications and completions for
+the group are published only after that commit succeeds. Journal pruning runs once per group.
+Foreground proving performs no journal, proof, header, index, or state writes/flushes.
+
+The producer can advance up to eight outstanding blocks. A 256 MiB estimated pending-memory
+budget includes journal data, overlay hash tables, and proofs; one block exceeding that budget
+is admitted only when no earlier block is outstanding. Backpressure waits only at these bounds,
+not after each block. `persistence_enqueue` includes this bounded backpressure; durability timings
+(`journal_flush`, `state_flush`, `proof_store`, `header_store`, `proof_index_write`, `height_commit`)
+are reported separately by `background-persistence`. Its `first_height`, `height` (last height),
+and `blocks` fields identify the group; durations are batch totals, not per-block times.
+Single blocks still commit immediately when there is no queued backlog. Backpressure can still
+occur if persistence cannot keep up, but queued blocks amortize the durability cost.
+
+Reorgs, capacity growth, explicit sync, position repair, and shutdown are ordered worker commands.
+They may wait for outstanding blocks, but all their persistence I/O remains on the worker.
+Normal active-chain checks and Pollard eviction do not drain the queue. Shutdown writes the
+clean marker only after every accepted block and all storage have been synced. A worker failure
+stops further submissions, propagates to the producer/barriers, and never writes a clean marker;
+restart uses the journal and contiguous proof range to recover the last complete publication.
+
+On an orderly worker error, it attempts to seal and sync the leaf-map and header-index runtime
+allocators before exiting; this does not advance the durable height, send notifications, or write
+a clean marker. The original error and any finalization failures are preserved.
+
+The underlying runtime database has a pre-existing crash-recovery limitation: a hard kill or
+power loss before allocator sync can leave unfinished pages or unpublished bucket heads, and
+`open_runtime` may then refuse to reopen. The bridge journal alone cannot repair that database
+format. Recovery from arbitrary hard crashes is therefore not guaranteed; the regression tests
+cover clean shutdown and injected **orderly** persistence failures, not SIGKILL durability.
+
+Storage opening and crash recovery also run on named startup workers, including legacy proof-row
+metadata initialization and proof truncation. Startup joins these workers before constructing the
+thread-local Pollard; no recovery flush is issued by the caller.
 
 Startup validates the contiguous proof-index range, reconstructs the retained journal window, and
 refuses to advance across a missing proof. Reorgs durably mark orphan records before restoring old

@@ -101,10 +101,22 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .header_index_path
             .clone()
             .unwrap_or_else(|| subdir("header-index").into());
-        let proof_index = Arc::new(open_index(subdir("proof-index/"))?);
-        let proof_file = Arc::new(ProofFile::new(subdir("proofs").into())?);
-        let view = open_chain_view(cli_options.network)?;
-        let header_index = Arc::new(HeaderIndex::open(&header_file_path, &header_index_path)?);
+        let (proof_index, proof_file, view, header_index) =
+            std::thread::scope(|scope| -> anyhow::Result<_> {
+                let storage = std::thread::Builder::new()
+                    .name("bridge-storage-open".to_string())
+                    .spawn_scoped(scope, || -> anyhow::Result<_> {
+                        Ok((
+                            Arc::new(open_index(subdir("proof-index/"))?),
+                            Arc::new(ProofFile::new(subdir("proofs").into())?),
+                            open_chain_view(cli_options.network)?,
+                            Arc::new(HeaderIndex::open(&header_file_path, &header_index_path)?),
+                        ))
+                    })?;
+                storage
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("storage initialization worker panicked"))?
+            })?;
         let (block_notifier_tx, block_notifier_rx) = std::sync::mpsc::channel();
         let client: Arc<dyn Blockchain> = get_chain_provider()?.into();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -130,8 +142,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
             shutdown,
             block_notifier_tx,
         )?;
-        let legacy_proof_forest_rows =
-            proof_index.legacy_proof_forest_rows(prover.forest_rows()?)?;
+        let legacy_proof_forest_rows = prover.legacy_proof_forest_rows();
         start_p2p(
             cli_options.network,
             view.clone(),

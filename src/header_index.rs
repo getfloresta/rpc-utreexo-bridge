@@ -229,9 +229,16 @@ impl HeaderIndex {
             .access
             .read()
             .map_err(|_| anyhow::anyhow!("header index lock poisoned"))?;
-        self.headers.sync_data()?;
-        self.heights.sync()?;
-        Ok(())
+        // The runtime allocator must still be sealed if the header-file flush fails.
+        let headers_result = self.headers.sync_data().context("failed to sync headers");
+        let heights_result = self.heights.sync().context("failed to sync header heights");
+        match (headers_result, heights_result) {
+            (Err(headers), Err(heights)) => Err(headers.context(format!(
+                "header-height synchronization also failed: {heights:#}"
+            ))),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     pub fn close(self) -> Result<()> {
