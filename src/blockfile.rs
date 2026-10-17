@@ -14,6 +14,7 @@ use bitcoin::consensus::serialize;
 
 use crate::block_index::BlockIndex;
 use crate::udata::CompactBlockProof;
+use crate::udata::MAX_COMPACT_PROOF_BYTES;
 
 /// An append-only file containing compact block proofs without Bitcoin blocks.
 pub struct ProofFile {
@@ -41,6 +42,9 @@ impl ProofFile {
 
     pub fn append(&self, proof: &CompactBlockProof) -> std::io::Result<BlockIndex> {
         let buffer = serialize(proof);
+        if buffer.len() > MAX_COMPACT_PROOF_BYTES {
+            return Err(std::io::Error::other("compact proof exceeds storage limit"));
+        }
         let length = u64::try_from(buffer.len())
             .map_err(|_| std::io::Error::other("proof length exceeds u64"))?;
         let offset = self
@@ -59,12 +63,14 @@ impl ProofFile {
     }
 
     pub fn contains(&self, index: &BlockIndex) -> bool {
-        index
-            .offset
-            .checked_add(index.size)
-            .and_then(|end| u64::try_from(end).ok())
-            .zip(self.file.metadata().ok().map(|metadata| metadata.len()))
-            .is_some_and(|(end, file_len)| end <= file_len)
+        // File bounds alone cannot authorize allocation from a corrupt sparse-file index.
+        index.size <= MAX_COMPACT_PROOF_BYTES
+            && index
+                .offset
+                .checked_add(index.size)
+                .and_then(|end| u64::try_from(end).ok())
+                .zip(self.file.metadata().ok().map(|metadata| metadata.len()))
+                .is_some_and(|(end, file_len)| end <= file_len)
     }
 
     pub fn get(&self, index: &BlockIndex) -> Option<CompactBlockProof> {
@@ -110,6 +116,26 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn sparse_file_does_not_authorize_oversized_proof_allocation() {
+        let path = std::env::temp_dir().join(format!(
+            "bridge-proof-file-{}-oversized.dat",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let file = ProofFile::new(path.clone()).unwrap();
+        let index = BlockIndex {
+            offset: 0,
+            size: MAX_COMPACT_PROOF_BYTES + 1,
+            proof_forest_rows: None,
+        };
+        file.file.set_len(index.size as u64).unwrap();
+        assert!(!file.contains(&index));
+        assert!(file.get(&index).is_none());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn concurrent_appends_reserve_disjoint_ranges_without_a_lock() {

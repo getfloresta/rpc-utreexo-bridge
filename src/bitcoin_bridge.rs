@@ -142,7 +142,6 @@ pub fn run_bridge() -> anyhow::Result<()> {
             shutdown,
             block_notifier_tx,
         )?;
-        let legacy_proof_forest_rows = prover.legacy_proof_forest_rows();
         start_p2p(
             cli_options.network,
             view.clone(),
@@ -150,7 +149,6 @@ pub fn run_bridge() -> anyhow::Result<()> {
             ProofBackend::CompactProofs(proof_file),
             Some(client),
             Some(header_index),
-            Some(legacy_proof_forest_rows),
             block_notifier_rx,
         )?;
         return prover.keep_up();
@@ -185,7 +183,6 @@ fn start_p2p(
     proof_backend: ProofBackend,
     header_source: Option<Arc<dyn Blockchain>>,
     header_index: Option<Arc<HeaderIndex>>,
-    proof_forest_rows: Option<u8>,
     block_notifier: std::sync::mpsc::Receiver<bitcoin::BlockHash>,
 ) -> anyhow::Result<()> {
     info!("Starting P2PV2-only BIP 183 proof server");
@@ -204,7 +201,6 @@ fn start_p2p(
         proof_backend,
         header_index,
         header_source,
-        proof_forest_rows,
     };
     node::Node::run(p2p_address, worker_context, block_notifier)?;
     Ok(())

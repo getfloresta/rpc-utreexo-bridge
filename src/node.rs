@@ -487,9 +487,6 @@ pub struct WorkerContext {
     /// RPC fallback for headers missing from local storage.
     pub header_source: Option<Arc<dyn Blockchain>>,
 
-    /// Forest rows for records written before per-entry target metadata.
-    pub proof_forest_rows: Option<u8>,
-
     /// Network magic used by the encrypted transport.
     pub magic: Magic,
 }
@@ -1581,24 +1578,22 @@ impl Peer {
         let Some(index) = self.context.proof_index.get_index(request.block_hash)? else {
             return Ok(());
         };
-        let proof_forest_rows = index.proof_forest_rows.or(self.context.proof_forest_rows);
-        let Some(mut stored_proof) = self.context.proof_backend.get(index) else {
+        let Some(stored_proof) = self.context.proof_backend.get(index) else {
             return Ok(());
         };
-        if let Some(forest_rows) = proof_forest_rows {
-            for target in &mut stored_proof.proof.targets {
-                target.0 = translate_position_to_wire(target.0, forest_rows);
-            }
-        }
         let proof = UtreexoProof {
             block_hash: request.block_hash,
-            proof_hashes: if request.include_all {
+            proof_hashes: if request.request_mask & GetUtreexoProof::PROOF_HASHES != 0 {
                 stored_proof.proof.hashes
             } else {
                 Self::select_bitmap(&stored_proof.proof.hashes, &request.proof_bitmap)
             },
-            target_locations: stored_proof.proof.targets,
-            leaf_data: if request.include_all {
+            target_locations: if request.request_mask & GetUtreexoProof::TARGETS != 0 {
+                stored_proof.proof.targets
+            } else {
+                Vec::new()
+            },
+            leaf_data: if request.request_mask & GetUtreexoProof::LEAF_DATA != 0 {
                 stored_proof.leaves
             } else {
                 Self::select_bitmap(&stored_proof.leaves, &request.leaf_bitmap)
@@ -1615,7 +1610,7 @@ impl Peer {
             .filter(|(index, _)| {
                 bitmap
                     .get(index / 8)
-                    .is_some_and(|byte| byte & (1 << (7 - index % 8)) != 0)
+                    .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
             })
             .map(|(_, value)| value.clone())
             .collect()
@@ -1629,6 +1624,7 @@ impl Peer {
             &self.context.chainview,
             self.context.header_index.as_deref(),
             self.context.header_source.as_deref(),
+            u32::try_from(self.context.proof_index.load_height()?).unwrap_or(u32::MAX),
             request,
         )
     }
@@ -1638,28 +1634,11 @@ impl Peer {
     }
 }
 
-/// Convert row-relative flat-forest positions to the 63-row BIP 183 wire forest.
-fn translate_position_to_wire(position: u64, forest_rows: u8) -> u64 {
-    let mut marker = 1u64 << forest_rows;
-    let mut row = 0u8;
-    while position & marker != 0 {
-        marker >>= 1;
-        row += 1;
-    }
-    if row == 0 {
-        return position;
-    }
-    let row_start = |rows: u8| {
-        u64::try_from((2u128 << rows) - (2u128 << (rows - row)))
-            .expect("63-row forest positions fit in u64")
-    };
-    position - row_start(forest_rows) + row_start(63)
-}
-
 fn headers_for_request(
     chainview: &ChainView,
     header_index: Option<&HeaderIndex>,
     header_source: Option<&dyn Blockchain>,
+    published_height: u32,
     request: &GetHeadersMessage,
 ) -> Result<Vec<Header>, PeerError> {
     if request.locator_hashes.len() > MAX_LOCATOR_HASHES as usize {
@@ -1667,19 +1646,43 @@ fn headers_for_request(
             request.locator_hashes.len() as u64,
         ));
     }
+    // Header storage/RPC can lead the committed proof index during a window.
+    // Advertise only the same serving-ready tip used by our version message.
+    if request.locator_hashes.is_empty() {
+        if request.stop_hash == BlockHash::all_zeros() {
+            return Ok(Vec::new());
+        }
+        let height = active_locator_height(
+            chainview,
+            header_index,
+            header_source,
+            &[request.stop_hash],
+            published_height,
+        )?;
+        return Ok(
+            header_at_height(chainview, header_index, header_source, height)?
+                .filter(|(hash, _)| *hash == request.stop_hash)
+                .map(|(_, header)| vec![header])
+                .unwrap_or_default(),
+        );
+    }
     let common_height = active_locator_height(
         chainview,
         header_index,
         header_source,
         &request.locator_hashes,
+        published_height,
     )?;
     let start = common_height.saturating_add(1);
     let end = match header_source {
         Some(source) => u32::try_from(source.get_block_count()?)
             .unwrap_or(u32::MAX)
             .saturating_add(1)
-            .min(start.saturating_add(MAX_HEADERS as u32)),
-        None => start.saturating_add(MAX_HEADERS as u32),
+            .min(start.saturating_add(MAX_HEADERS as u32))
+            .min(published_height.saturating_add(1)),
+        None => start
+            .saturating_add(MAX_HEADERS as u32)
+            .min(published_height.saturating_add(1)),
     };
     let mut headers = Vec::with_capacity(end.saturating_sub(start) as usize);
     for height in start..end {
@@ -1701,15 +1704,22 @@ fn active_locator_height(
     header_index: Option<&HeaderIndex>,
     header_source: Option<&dyn Blockchain>,
     locator_hashes: &[BlockHash],
+    published_height: u32,
 ) -> Result<u32, PeerError> {
     for block_hash in locator_hashes {
         if let Some(index) = header_index {
             if let Some(height) = index.get_height(*block_hash)? {
-                return Ok(height);
+                if height <= published_height {
+                    return Ok(height);
+                }
+                continue;
             }
         }
         if let Some(height) = chainview.get_height(*block_hash)? {
-            return Ok(height);
+            if height <= published_height {
+                return Ok(height);
+            }
+            continue;
         }
         let Some(source) = header_source else {
             continue;
@@ -1717,6 +1727,9 @@ fn active_locator_height(
         let Ok(height) = source.get_block_height(*block_hash) else {
             continue;
         };
+        if height > published_height {
+            continue;
+        }
         let Ok(active_hash) = source.get_block_hash(height as u64) else {
             continue;
         };
@@ -1767,7 +1780,9 @@ fn header_at_height(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GetUtreexoProof {
     block_hash: BlockHash,
-    include_all: bool,
+    /// Bits 0/1/2 request all targets/hashes/leaves respectively. When an
+    /// all-hashes/all-leaves bit is unset, its per-item bitmap selects entries.
+    request_mask: u8,
     proof_bitmap: Vec<u8>,
     leaf_bitmap: Vec<u8>,
 }
@@ -1778,7 +1793,7 @@ impl Encodable for GetUtreexoProof {
         writer: &mut W,
     ) -> Result<usize, bitcoin::io::Error> {
         let mut written = self.block_hash.consensus_encode(writer)?;
-        written += u8::from(self.include_all).consensus_encode(writer)?;
+        written += self.request_mask.consensus_encode(writer)?;
         written += self.proof_bitmap.consensus_encode(writer)?;
         written += self.leaf_bitmap.consensus_encode(writer)?;
         Ok(written)
@@ -1786,6 +1801,10 @@ impl Encodable for GetUtreexoProof {
 }
 
 impl GetUtreexoProof {
+    const TARGETS: u8 = 1;
+    const PROOF_HASHES: u8 = 1 << 1;
+    const LEAF_DATA: u8 = 1 << 2;
+
     /// Decodes one length-prefixed bitmap after validating its allocation size.
     fn decode_bitmap<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
@@ -1810,18 +1829,10 @@ impl Decodable for GetUtreexoProof {
         reader: &mut R,
     ) -> Result<Self, bitcoin::consensus::encode::Error> {
         let block_hash = BlockHash::consensus_decode(reader)?;
-        let include_all = match u8::consensus_decode(reader)? {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(bitcoin::consensus::encode::Error::ParseFailed(
-                    "invalid getuproof include-all flag",
-                ))
-            }
-        };
+        let request_mask = u8::consensus_decode(reader)?;
         Ok(Self {
             block_hash,
-            include_all,
+            request_mask,
             proof_bitmap: Self::decode_bitmap(reader)?,
             leaf_bitmap: Self::decode_bitmap(reader)?,
         })
@@ -2039,6 +2050,19 @@ impl V2Codec {
                 Self::ensure_empty(payload)?;
                 Ok(V2Message::Bitcoin(NetworkMessage::SendAddrV2))
             }
+            "getuproof" => Ok(V2Message::GetUtreexoProof(Self::decode_exact(payload)?)),
+            "getdata" => Ok(V2Message::Bitcoin(NetworkMessage::GetData(
+                Self::decode_get_data(payload)?,
+            ))),
+            "getheaders" => Ok(V2Message::Bitcoin(NetworkMessage::GetHeaders(
+                Self::decode_get_headers(payload)?,
+            ))),
+            "ping" => Ok(V2Message::Bitcoin(NetworkMessage::Ping(
+                Self::decode_exact(payload)?,
+            ))),
+            "getcfilters" => Ok(V2Message::Bitcoin(NetworkMessage::GetCFilters(
+                Self::decode_exact(payload)?,
+            ))),
             _ => Ok(V2Message::Ignored),
         }
     }
@@ -2302,6 +2326,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bridge-node-active-locator-{}", std::process::id()));
         let mut context = test_worker_context(&root);
+        context.proof_index.update_height(5).unwrap();
         context.header_source = Some(Arc::new(source));
         let mut peer = Peer::new(context).unwrap();
         let request = GetHeadersMessage::new(
@@ -2313,6 +2338,14 @@ mod tests {
         assert_eq!(
             peer.context.chainview.get_block_hash(5).unwrap(),
             Some(headers[5].block_hash())
+        );
+        let beyond_publication = GetHeadersMessage::new(
+            vec![headers[7].block_hash(), headers[2].block_hash()],
+            BlockHash::all_zeros(),
+        );
+        assert_eq!(
+            peer.headers_for_request(&beyond_publication).unwrap(),
+            headers[3..=5]
         );
 
         peer.context.header_source = None;
@@ -2327,6 +2360,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bridge-node-header-index-{}", std::process::id()));
         let mut context = test_worker_context(&root);
+        context.proof_index.update_height(5).unwrap();
         let index =
             HeaderIndex::create(&root.join("headers.dat"), &root.join("hashes"), 7).unwrap();
         for (height, header) in headers.iter().enumerate() {
@@ -2338,6 +2372,21 @@ mod tests {
         let request =
             GetHeadersMessage::new(vec![headers[2].block_hash()], headers[5].block_hash());
         assert_eq!(peer.headers_for_request(&request).unwrap(), headers[3..=5]);
+        let request = GetHeadersMessage::new(
+            vec![headers[7].block_hash(), headers[2].block_hash()],
+            BlockHash::all_zeros(),
+        );
+        assert_eq!(peer.headers_for_request(&request).unwrap(), headers[3..=5]);
+        let direct = GetHeadersMessage::new(Vec::new(), headers[4].block_hash());
+        assert_eq!(peer.headers_for_request(&direct).unwrap(), vec![headers[4]]);
+        let unpublished = GetHeadersMessage::new(Vec::new(), headers[7].block_hash());
+        assert!(peer.headers_for_request(&unpublished).unwrap().is_empty());
+        let unknown = GetHeadersMessage::new(Vec::new(), BlockHash::from_byte_array([0x42; 32]));
+        assert!(peer.headers_for_request(&unknown).unwrap().is_empty());
+        let tip = GetHeadersMessage::new(vec![headers[5].block_hash()], BlockHash::all_zeros());
+        assert!(peer.headers_for_request(&tip).unwrap().is_empty());
+        peer.context.proof_index.update_height(7).unwrap();
+        assert_eq!(peer.headers_for_request(&tip).unwrap(), headers[6..=7]);
         drop(peer);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2348,6 +2397,10 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bridge-node-header-bounds-{}", std::process::id()));
         let mut context = test_worker_context(&root);
+        context
+            .proof_index
+            .update_height(headers.len() - 1)
+            .unwrap();
         context.header_source = Some(Arc::new(HeaderSource {
             headers: headers.clone(),
             side_hash: BlockHash::all_zeros(),
@@ -2371,17 +2424,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_forest_targets_translate_to_wire_positions() {
-        assert_eq!(translate_position_to_wire(3, 3), 3);
-        assert_eq!(translate_position_to_wire(9, 3), (1u64 << 63) + 1);
-        assert_eq!(translate_position_to_wire(12, 3), 3u64 << 62);
-        assert_eq!(
-            translate_position_to_wire((1u64 << 63) + 1, 63),
-            (1u64 << 63) + 1
-        );
-    }
-
-    #[test]
     fn p2pv2_codec_handles_supported_inbound_and_outbound_bip183_messages() {
         let block_hash = BlockHash::all_zeros();
         let inbound_messages = [
@@ -2389,9 +2431,9 @@ mod tests {
             V2Message::Bitcoin(NetworkMessage::Verack),
             V2Message::GetUtreexoProof(GetUtreexoProof {
                 block_hash,
-                include_all: false,
-                proof_bitmap: vec![0b1010_0000],
-                leaf_bitmap: vec![0b0100_0000],
+                request_mask: GetUtreexoProof::TARGETS,
+                proof_bitmap: vec![0b0000_0101],
+                leaf_bitmap: vec![0b0000_0010],
             }),
         ];
 
@@ -2469,7 +2511,7 @@ mod tests {
             .consensus_encode(&mut oversized_bitmap)
             .expect("encode block hash");
         0u8.consensus_encode(&mut oversized_bitmap)
-            .expect("encode include-all flag");
+            .expect("encode request mask");
         VarInt(MAX_PROOF_BITMAP_BYTES as u64 + 1)
             .consensus_encode(&mut oversized_bitmap)
             .expect("encode bitmap length");
@@ -2504,12 +2546,40 @@ mod tests {
     }
 
     #[test]
-    fn proof_bitmaps_select_big_endian_bits_in_wire_order() {
-        let values = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    fn proof_bitmaps_match_floresta_push_input_fixture() {
+        // Floresta block_proof.rs::test_build_bitmap selects 1, 4, 5 and 10.
+        let values: Vec<_> = (0..11).collect();
         assert_eq!(
-            Peer::select_bitmap(&values, &[0b1010_0001, 0b1000_0000]),
-            vec![0, 2, 7, 8]
+            Peer::select_bitmap(&values, &[0b0011_0010, 0b0000_0100]),
+            vec![1, 4, 5, 10]
         );
+    }
+
+    #[test]
+    fn floresta_request_mask_and_long_command_fixtures() {
+        // Floresta's GetUtreexoProof encoder writes hash, mask, then two
+        // CompactSize-prefixed byte vectors. request_all() encodes as 7.
+        for mask in 0..=7 {
+            let mut payload = vec![0x42; 32];
+            payload.extend_from_slice(&[mask, 2, 0x32, 0x04, 1, 0x85]);
+            let mut short = vec![30];
+            short.extend_from_slice(&payload);
+            let mut long = b"\0getuproof\0\0\0".to_vec();
+            long.extend_from_slice(&payload);
+            let expected = V2Message::GetUtreexoProof(GetUtreexoProof {
+                block_hash: BlockHash::from_byte_array([0x42; 32]),
+                request_mask: mask,
+                proof_bitmap: vec![0x32, 0x04],
+                leaf_bitmap: vec![0x85],
+            });
+            assert_eq!(V2Codec::decode(&short).unwrap(), expected);
+            assert_eq!(V2Codec::decode(&long).unwrap(), expected);
+            long.push(0);
+            assert!(matches!(
+                V2Codec::decode(&long),
+                Err(PeerError::TrailingPayload(1))
+            ));
+        }
     }
 
     struct FragmentedWriter(std::net::TcpStream);
@@ -2547,7 +2617,6 @@ mod tests {
             chainview: Arc::new(ChainView::new(store("chainview"))),
             header_index: None,
             header_source: None,
-            proof_forest_rows: None,
             magic: Magic::REGTEST,
         }
     }
@@ -2607,7 +2676,7 @@ mod tests {
     #[test]
     fn slow_and_malformed_peers_do_not_block_compact_bip183_proof_service() {
         exercise_proof_service(None);
-        exercise_proof_service(Some(3));
+        exercise_proof_service(Some(27));
     }
 
     fn exercise_proof_service(entry_forest_rows: Option<u8>) {
@@ -2620,7 +2689,11 @@ mod tests {
                 .as_nanos()
         ));
         let mut context = test_worker_context(&storage);
-        context.proof_forest_rows = Some(4);
+        context.proof_index.update_height(11).unwrap();
+        context.header_source = Some(Arc::new(HeaderSource {
+            headers: header_chain(12),
+            side_hash: BlockHash::all_zeros(),
+        }));
         let services = Peer::advertised_services();
         assert!(services.has(ServiceFlags::P2P_V2));
         assert!(services.has(ServiceFlags::WITNESS));
@@ -2628,20 +2701,35 @@ mod tests {
         assert!(!services.has(ServiceFlags::from(1 << 24)));
         assert!(!services.has(ServiceFlags::NETWORK));
         assert!(!services.has(ServiceFlags::NETWORK_LIMITED));
-        let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = bitcoin::constants::genesis_block(bitcoin::Network::Signet);
         let block_hash = block.block_hash();
-        let proof_hash = BlockHash::from_byte_array([1; 32]);
+        let proof_hashes: Vec<_> = (0..11)
+            .map(|index| BlockHash::from_byte_array([index; 32]))
+            .collect();
         let leaf = CompactLeafData {
             header_code: 42,
             amount: 5_000,
             spk_ty: ScriptPubkeyType::PubKeyHash,
         };
+        let leaves: Vec<_> = (0..11)
+            .map(|index| CompactLeafData {
+                amount: leaf.amount + index,
+                spk_ty: match index % 5 {
+                    0 => ScriptPubkeyType::Other(vec![0x51, index as u8].into_boxed_slice()),
+                    1 => ScriptPubkeyType::PubKeyHash,
+                    2 => ScriptPubkeyType::WitnessV0PubKeyHash,
+                    3 => ScriptPubkeyType::ScriptHash,
+                    _ => ScriptPubkeyType::WitnessV0ScriptHash,
+                },
+                ..leaf.clone()
+            })
+            .collect();
         let stored_proof = CompactBlockProof {
             proof: BatchProof {
-                targets: vec![VarInt(9)],
-                hashes: vec![proof_hash],
+                targets: vec![VarInt(9223372036921654703); 11],
+                hashes: proof_hashes.clone(),
             },
-            leaves: vec![leaf.clone()],
+            leaves: leaves.clone(),
         };
         let ProofBackend::CompactProofs(proofs) = &context.proof_backend;
         let mut index = proofs.append(&stored_proof).expect("append compact proof");
@@ -2652,13 +2740,9 @@ mod tests {
             .expect("index compact proof");
         let expected_proof = UtreexoProof {
             block_hash,
-            proof_hashes: vec![proof_hash],
-            target_locations: vec![VarInt(if entry_forest_rows.is_some() {
-                (1u64 << 63) + 1
-            } else {
-                9
-            })],
-            leaf_data: vec![leaf],
+            proof_hashes,
+            target_locations: vec![VarInt(9223372036921654703); 11],
+            leaf_data: leaves,
         };
 
         let registry = Arc::new(Mutex::new(PeerRegistry::new(16)));
@@ -2757,7 +2841,7 @@ mod tests {
 
         let request = V2Codec::encode(&V2Message::GetUtreexoProof(GetUtreexoProof {
             block_hash,
-            include_all: true,
+            request_mask: 7,
             proof_bitmap: Vec::new(),
             leaf_bitmap: Vec::new(),
         }))
@@ -2775,6 +2859,57 @@ mod tests {
             deserialize::<UtreexoProof>(payload).expect("decode utreexo proof"),
             expected_proof
         );
+
+        // Exercise every partial field mask over the encrypted transport,
+        // including a selection spanning two bitmap bytes. All-field bits
+        // override the item bitmaps; unset bits select only those items.
+        for mask in 0..=7 {
+            let request = GetUtreexoProof {
+                block_hash,
+                request_mask: mask,
+                proof_bitmap: vec![0x32, 0x04],
+                leaf_bitmap: vec![0x85, 0x01],
+            };
+            let mut payload = if mask % 2 == 0 {
+                vec![30]
+            } else {
+                b"\0getuproof\0\0\0".to_vec()
+            };
+            request.consensus_encode(&mut payload).unwrap();
+            protocol.write(&Payload::genuine(payload)).unwrap();
+            let response = protocol.read().unwrap();
+            assert_eq!(response.contents()[0], 29);
+            let proof: UtreexoProof = deserialize(&response.contents()[1..]).unwrap();
+            assert_eq!(proof.block_hash, block_hash);
+            assert_eq!(
+                proof.proof_hashes,
+                if mask & 2 != 0 {
+                    expected_proof.proof_hashes.clone()
+                } else {
+                    [1, 4, 5, 10]
+                        .map(|i| expected_proof.proof_hashes[i])
+                        .to_vec()
+                }
+            );
+            assert_eq!(
+                proof.target_locations,
+                if mask & 1 != 0 {
+                    expected_proof.target_locations.clone()
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(
+                proof.leaf_data,
+                if mask & 4 != 0 {
+                    expected_proof.leaf_data.clone()
+                } else {
+                    [0, 2, 7, 8]
+                        .map(|i| expected_proof.leaf_data[i].clone())
+                        .to_vec()
+                }
+            );
+        }
 
         let request = V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::GetData(vec![
             Inventory::WitnessBlock(block_hash),

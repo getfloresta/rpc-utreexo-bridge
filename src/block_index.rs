@@ -16,7 +16,7 @@ pub struct BlockIndex {
     pub offset: usize,
     /// The size of the block in bytes.
     pub size: usize,
-    /// Logical forest rows used by compact proof targets, when this is a proof entry.
+    /// Logical forest rows at proof creation; stored targets already use the 63-row wire layout.
     pub proof_forest_rows: Option<u8>,
 }
 
@@ -27,6 +27,11 @@ impl kv::Value for IndexEntry {
                 "proof index entry has {} bytes, expected 16 or 17",
                 r.len()
             )));
+        }
+        if r.get(16).is_some_and(|rows| *rows > 63) {
+            return Err(kv::Error::Message(
+                "proof forest rows exceeds 63".to_string(),
+            ));
         }
         let size = u64::from_be_bytes(
             r[..8]
@@ -50,6 +55,11 @@ impl kv::Value for IndexEntry {
     fn to_raw_value(&self) -> Result<kv::Raw, kv::Error> {
         match self {
             IndexEntry::Index(index) => {
+                if index.proof_forest_rows.is_some_and(|rows| rows > 63) {
+                    return Err(kv::Error::Message(
+                        "proof forest rows exceeds 63".to_string(),
+                    ));
+                }
                 let mut buf = Vec::with_capacity(17);
                 buf.extend_from_slice(&(index.size as u64).to_be_bytes());
                 buf.extend_from_slice(&(index.offset as u64).to_be_bytes());
@@ -110,27 +120,6 @@ impl BlocksIndex {
         Ok(usize::from_be_bytes(height))
     }
 
-    /// Returns the row count for proof entries written before per-entry metadata existed.
-    ///
-    /// The first steady-state startup persists this value so a later online resize does not
-    /// reinterpret historical proof targets using the enlarged forest.
-    pub fn legacy_proof_forest_rows(&self, current_rows: u8) -> Result<u8, kv::Error> {
-        let bucket = self.database.bucket::<&[u8], Vec<u8>>(Some("meta"))?;
-        let key = b"legacy-proof-forest-rows";
-        if let Some(rows) = bucket.get(&key.as_slice())? {
-            return match rows.as_slice() {
-                [rows] => Ok(*rows),
-                _ => Err(kv::Error::Message(format!(
-                    "legacy proof forest rows has {} bytes, expected 1",
-                    rows.len()
-                ))),
-            };
-        }
-        bucket.set(&key.as_slice(), &vec![current_rows])?;
-        bucket.flush()?;
-        Ok(current_rows)
-    }
-
     /// Appends a new block entry to the index.
     #[cfg(test)]
     pub fn append<'a>(&'a self, index: BlockIndex, block: BlockHash) -> Result<(), kv::Error> {
@@ -170,6 +159,24 @@ impl BlocksIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_malformed_index_lengths_and_forest_layouts() {
+        for length in [0, 15, 18] {
+            assert!(
+                <IndexEntry as kv::Value>::from_raw_value(kv::Raw::from(vec![0; length])).is_err()
+            );
+        }
+        let mut raw = vec![0; 17];
+        raw[16] = 64;
+        assert!(<IndexEntry as kv::Value>::from_raw_value(kv::Raw::from(raw)).is_err());
+        let entry = IndexEntry::Index(BlockIndex {
+            offset: 0,
+            size: 1,
+            proof_forest_rows: Some(255),
+        });
+        assert!(<IndexEntry as kv::Value>::to_raw_value(&entry).is_err());
+    }
 
     #[test]
     fn index_entries_preserve_optional_proof_forest_rows() {
