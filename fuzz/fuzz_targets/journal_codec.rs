@@ -2,6 +2,9 @@
 #[allow(dead_code)]
 #[path = "../../src/forest_journal.rs"]
 mod forest_journal;
+#[allow(dead_code)]
+#[path = "../../src/udata.rs"]
+mod udata;
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -38,6 +41,11 @@ fuzz_target!(|data: &[u8]| {
         block_hash: BlockHash::from_byte_array(input.array()),
         num_leaves: input.u64().saturating_add(added.len() as u64),
         height: input.u32(),
+        forest_rows: if input.byte() & 1 == 0 {
+            None
+        } else {
+            Some(input.byte() % 64)
+        },
         previous_block_hash: BlockHash::from_byte_array(input.array()),
         forest,
         removed,
@@ -48,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(entry.encode().unwrap(), encoded);
 
     let mut with_trailing_byte = encoded;
-    with_trailing_byte.push(input.byte());
+    with_trailing_byte.push(255); // Neither a valid physical row count nor valid trailing data.
     assert!(JournalEntry::decode(&with_trailing_byte).is_err());
 });
 
