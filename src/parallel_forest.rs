@@ -3,9 +3,11 @@
 //! Linux-only, parallel construction of a position-addressed Utreexo forest.
 
 use std::cell::UnsafeCell;
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 #[cfg(test)]
 use std::collections::BTreeSet;
+use std::collections::BinaryHeap;
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
@@ -193,7 +195,7 @@ pub struct ForestBuildSummary {
     pub statistics: BuildStatistics,
 }
 
-/// Batch positions and the separate costs of database access and forest validation.
+/// Batch positions and the separate costs of database access and index validation.
 pub(crate) struct LeafPositions {
     pub(crate) positions: Vec<Result<u64>>,
     pub(crate) fetch: PositionTiming,
@@ -1118,6 +1120,45 @@ fn leaf_map_key(txid: [u8; 32], vout: u32) -> [u8; LEAF_MAP_KEY_SIZE] {
     key
 }
 
+/// Merge position-sorted block deltas without copying a window's forest data.
+/// Later blocks (and later deltas within a block) win at overlapping positions.
+fn merged_forest_writes<'a>(
+    entries: &'a [&JournalEntry],
+) -> impl Iterator<Item = (u64, JournalNodeState)> + 'a {
+    let heads: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(block, entry)| {
+            entry
+                .forest
+                .first()
+                .map(|delta| Reverse((delta.position, block, 0usize)))
+        })
+        .collect();
+    let mut heads = BinaryHeap::from(heads);
+    std::iter::from_fn(move || {
+        let Reverse((position, mut block, mut index)) = heads.pop()?;
+        let mut latest = (block, index);
+        loop {
+            if let Some(next) = entries[block].forest.get(index + 1) {
+                heads.push(Reverse((next.position, block, index + 1)));
+            }
+            match heads.peek() {
+                Some(&Reverse((next_position, next_block, next_index)))
+                    if next_position == position =>
+                {
+                    heads.pop();
+                    block = next_block;
+                    index = next_index;
+                    latest = latest.max((block, index));
+                }
+                _ => break,
+            }
+        }
+        Some((position, entries[latest.0].forest[latest.1].after))
+    })
+}
+
 /// A completed flat forest: mutation requires exclusive access, while reads and sync may share it.
 pub struct SteadyStateForest {
     forest: FlatForest,
@@ -1227,7 +1268,6 @@ impl<'a> ForestView<'a> {
                 if position >= self.leaves {
                     bail!("outpoint {outpoint} maps beyond {} leaves", self.leaves);
                 }
-                self.leaf_hash(position)?;
                 Ok(position)
             })
             .collect();
@@ -1389,6 +1429,19 @@ impl SteadyStateForest {
     }
     pub(crate) fn forest_rows(&self) -> u8 {
         self.forest_rows
+    }
+
+    /// Inspect the old layout before opening can finish an interrupted resize.
+    pub(crate) fn legacy_journal_rows(forest_path: &Path) -> Result<u8> {
+        if let Some(marker) = read_resize_marker(forest_path)? {
+            return Ok(marker.old_rows);
+        }
+        let bytes = std::fs::metadata(forest_path)?.len();
+        let node_size = size_of::<ForestNode>() as u64;
+        if bytes % node_size != 0 {
+            bail!("forest file has invalid byte length {bytes}");
+        }
+        forest_rows_from_node_count(bytes / node_size)
     }
 
     pub(crate) fn leaf_capacity(&self) -> Result<u64> {
@@ -1835,6 +1888,7 @@ impl SteadyStateForest {
         forest.sort_unstable_by_key(|delta| delta.position);
         Ok(JournalEntry {
             height,
+            forest_rows: Some(self.forest_rows),
             block_hash,
             num_leaves: leaves,
             previous_block_hash,
@@ -1887,9 +1941,37 @@ impl SteadyStateForest {
         Ok(roots)
     }
 
+    /// Applies one published window under exclusive access. Each entry's forest
+    /// deltas must be position-sorted and use the same physical forest layout.
+    /// Write each touched node once, then preserve block order for leaf-map changes.
+    pub(crate) fn apply_forward_batch(&mut self, entries: &[&JournalEntry]) -> Result<()> {
+        for entry in entries {
+            if self.journal_forest_rows(entry)? != self.forest_rows {
+                bail!("published window spans different physical forest layouts");
+            }
+            debug_assert!(entry
+                .forest
+                .windows(2)
+                .all(|pair| pair[0].position <= pair[1].position));
+        }
+        for (position, state) in merged_forest_writes(entries) {
+            self.forest.set_journal_state(position, state)?;
+        }
+        for entry in entries {
+            self.apply_leaf_map_delta(&entry.removed, &entry.added)?;
+            self.leaves = entry.num_leaves;
+            if entry.height % 1_000 == 0 {
+                self.compact_leaf_map()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_forward(&mut self, entry: &JournalEntry) -> Result<()> {
+        let rows = self.journal_forest_rows(entry)?;
         for delta in &entry.forest {
-            self.forest.set_journal_state(delta.position, delta.after)?;
+            let position = self.journal_position(delta.position, rows)?;
+            self.forest.set_journal_state(position, delta.after)?;
         }
         self.apply_leaf_map_delta(&entry.removed, &entry.added)?;
         self.leaves = entry.num_leaves;
@@ -1897,13 +1979,34 @@ impl SteadyStateForest {
     }
 
     pub fn apply_backward(&mut self, entry: &JournalEntry) -> Result<()> {
+        let rows = self.journal_forest_rows(entry)?;
         for delta in entry.forest.iter().rev() {
-            self.forest
-                .set_journal_state(delta.position, delta.before)?;
+            let position = self.journal_position(delta.position, rows)?;
+            self.forest.set_journal_state(position, delta.before)?;
         }
         self.apply_leaf_map_delta(&entry.added, &entry.removed)?;
         self.leaves = entry.previous_num_leaves()?;
         Ok(())
+    }
+
+    fn journal_forest_rows(&self, entry: &JournalEntry) -> Result<u8> {
+        // Legacy entries are durably bound to their original layout at startup.
+        let rows = entry.forest_rows.unwrap_or(self.forest_rows);
+        if rows > self.forest_rows {
+            bail!(
+                "journal forest height {rows} exceeds current height {}",
+                self.forest_rows
+            );
+        }
+        Ok(rows)
+    }
+
+    fn journal_position(&self, position: u64, rows: u8) -> Result<u64> {
+        if rows == self.forest_rows {
+            Ok(position)
+        } else {
+            translate_position(position, rows, self.forest_rows)
+        }
     }
 
     fn apply_leaf_map_delta(
@@ -3229,10 +3332,6 @@ pub(crate) mod tests {
                     leaf_map_key(txid.to_byte_array(), 4),
                     3u64.to_le_bytes().to_vec(),
                 ),
-                (
-                    leaf_map_key(txid.to_byte_array(), 5),
-                    1u64.to_le_bytes().to_vec(),
-                ),
             ];
             forest
                 .leaf_map
@@ -3252,7 +3351,6 @@ pub(crate) mod tests {
                     outpoint(2),
                     outpoint(3),
                     outpoint(4),
-                    outpoint(5),
                 ])
                 .unwrap();
             assert_eq!(*positions[0].as_ref().unwrap(), 2);
@@ -3269,12 +3367,7 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("beyond"));
-            assert!(positions[6]
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("spent"));
-            for vout in 1..=5 {
+            for vout in 1..=4 {
                 if vout != 2 {
                     assert!(forest.leaf_position(&outpoint(vout)).is_err());
                 }
@@ -3413,11 +3506,12 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             journal.append(entry.clone()).unwrap();
-            journal.flush().unwrap();
-            forest.apply_forward(&entry).unwrap();
-            if height % 1_000 == 0 {
-                forest.compact_leaf_map().unwrap();
-            }
+            journal
+                .publisher()
+                .unwrap()
+                .publish(journal.boundary())
+                .unwrap();
+            forest.apply_forward_batch(&[&entry]).unwrap();
             forest.sync().unwrap();
             let after = forest.leaf_map.stats().unwrap().body;
             assert_eq!(after.live_allocations, before.live_allocations);
@@ -3443,6 +3537,7 @@ pub(crate) mod tests {
         }
         drop(forest);
         std::fs::remove_file(journal_path).unwrap();
+        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -3775,8 +3870,33 @@ pub(crate) mod tests {
         let leaf_map_path = config.leaf_map_path.clone();
         build_with_source(&source, &hints, config).unwrap();
 
-        let roots_before = {
+        let journal_path = path.with_extension("journal");
+        let mut journal = ForestJournal::open(&journal_path).unwrap();
+        let outpoint = OutPoint {
+            txid: source.blocks[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let (original_roots, roots_before) = {
             let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let original_roots = steady.roots().unwrap();
+            let mut entry = steady
+                .plan_update_without_resize(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    source.blocks[0].block_hash(),
+                    &[(outpoint, 0)],
+                    &[],
+                )
+                .unwrap();
+            entry.forest_rows = None; // Model a published pre-migration WAL.
+            journal.append(entry.clone()).unwrap();
+            journal
+                .publisher()
+                .unwrap()
+                .publish(journal.boundary())
+                .unwrap();
+            steady.apply_forward(&entry).unwrap();
+            steady.sync().unwrap();
             let roots = steady.roots().unwrap();
             let marker = ResizeMarker {
                 old_rows: 2,
@@ -3788,17 +3908,35 @@ pub(crate) mod tests {
                 .forest
                 .grow_mapping(forest_capacity(2).unwrap(), forest_capacity(3).unwrap())
                 .unwrap();
-            roots
+            (original_roots, roots)
         };
         assert!(resize_marker_path(&path).exists());
+        drop(journal);
+        let mut journal = ForestJournal::open(&journal_path).unwrap();
+        let old_rows = SteadyStateForest::legacy_journal_rows(&path).unwrap();
+        assert_eq!(old_rows, 2);
+        journal.bind_legacy_forest_rows(old_rows).unwrap();
 
         {
-            let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let mut steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            steady.replay_journal(&journal).unwrap();
             assert_eq!(steady.leaves(), 3);
             assert_eq!(steady.forest_rows(), 3);
             assert_eq!(steady.roots().unwrap(), roots_before);
             assert!(!resize_marker_path(&path).exists());
+            assert_eq!(SteadyStateForest::legacy_journal_rows(&path).unwrap(), 3);
+            assert!(steady.leaf_position(&outpoint).is_err());
+            let entry = Arc::clone(&journal.records()[0].entry);
+            journal.mark_rolled_back(0).unwrap();
+            steady.apply_backward(&entry).unwrap();
+            steady.sync().unwrap();
+            assert_eq!(steady.roots().unwrap(), original_roots);
+            assert_eq!(steady.leaf_position(&outpoint).unwrap(), 0);
         }
+        drop(journal);
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
+        std::fs::remove_file(path.with_extension("journal.forest-rows")).unwrap();
 
         remove_bootstrap_files(&path, &leaf_map_path);
     }
@@ -3863,6 +4001,144 @@ pub(crate) mod tests {
             assert!(second_added_delta.after.spent);
         }
 
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn sorted_window_writes_match_sequential_apply_and_recover() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[10, 20, 30])],
+        };
+        let hints = bridge_hints(&[0, 3], &[Vec::new(), vec![0, 1, 2]]);
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.minimum_leaf_capacity = Some(128);
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+        let journal_path = path.with_extension("journal");
+        let mut journal = ForestJournal::open(&journal_path).unwrap();
+        let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+        let baseline = forest.roots().unwrap();
+        let mut previous = OutPoint {
+            txid: source.blocks[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let mut position = 0;
+        let mut leaves = forest.leaves();
+        let mut hash = source.blocks[0].block_hash();
+        let mut overlay = AHashMap::new();
+        let mut entries = Vec::new();
+        for height in 2..=101 {
+            let added = OutPoint {
+                txid: Txid::from_byte_array([height as u8; 32]),
+                vout: 0,
+            };
+            let entry = forest
+                .plan_update_with_overlay(
+                    height,
+                    BlockHash::from_byte_array([height as u8; 32]),
+                    hash,
+                    leaves,
+                    &overlay,
+                    &[(previous, position)],
+                    &[(added, BitcoinNodeHash::from([height as u8; 32]))],
+                )
+                .unwrap();
+            for delta in &entry.forest {
+                overlay.insert(delta.position, delta.after);
+            }
+            position = leaves;
+            leaves = entry.num_leaves;
+            hash = entry.block_hash;
+            previous = added;
+            journal.append(entry.clone()).unwrap();
+            entries.push(entry);
+        }
+        journal
+            .publisher()
+            .unwrap()
+            .publish(journal.boundary())
+            .unwrap();
+        let borrowed: Vec<_> = entries.iter().collect();
+        let merged: Vec<_> = merged_forest_writes(&borrowed).collect();
+        assert!(merged.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(merged.len(), overlay.len());
+        for (position, state) in &merged {
+            assert_eq!(*state, overlay[position]);
+        }
+        assert!(merged_forest_writes(&[]).next().is_none());
+        let mut repeated = entries[0].clone();
+        let first_delta = repeated.forest[0];
+        repeated.forest = vec![
+            first_delta,
+            JournalForestDelta {
+                after: JournalNodeState::UNINITIALIZED,
+                ..first_delta
+            },
+        ];
+        assert_eq!(
+            merged_forest_writes(&[&repeated]).collect::<Vec<_>>(),
+            [(first_delta.position, JournalNodeState::UNINITIALIZED)]
+        );
+        assert_eq!(
+            merged_forest_writes(&[&repeated, &entries[0]]).next(),
+            Some((first_delta.position, first_delta.after))
+        );
+        for entry in &entries {
+            forest.apply_forward(entry).unwrap();
+        }
+        let expected_roots = forest.roots().unwrap();
+        let expected_states: Vec<_> = merged
+            .iter()
+            .map(|(position, _)| (*position, forest.forest.journal_state(*position).unwrap()))
+            .collect();
+        for entry in entries.iter().rev() {
+            forest.apply_backward(entry).unwrap();
+        }
+        assert_eq!(forest.roots().unwrap(), baseline);
+        for _ in 0..2 {
+            forest.apply_forward_batch(&borrowed).unwrap();
+            assert_eq!(forest.roots().unwrap(), expected_roots);
+            assert_eq!(forest.leaves(), leaves);
+            assert_eq!(forest.leaf_position(&previous).unwrap(), position);
+            assert_eq!(forest.leaf_map.stats().unwrap().body.live_allocations, 3);
+            for (position, state) in &expected_states {
+                assert_eq!(forest.forest.journal_state(*position).unwrap(), *state);
+            }
+        }
+        // Model an interrupted sorted write pass: some nodes retain old states.
+        forest
+            .forest
+            .set_journal_state(
+                0,
+                entries[0]
+                    .forest
+                    .iter()
+                    .find(|delta| delta.position == 0)
+                    .unwrap()
+                    .before,
+            )
+            .unwrap();
+        forest.sync().unwrap();
+        drop(forest);
+        drop(journal);
+        let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+        let journal = ForestJournal::open(&journal_path).unwrap();
+        forest.replay_journal(&journal).unwrap();
+        assert_eq!(forest.roots().unwrap(), expected_roots);
+        assert_eq!(forest.leaf_position(&previous).unwrap(), position);
+        for (position, state) in &expected_states {
+            assert_eq!(forest.forest.journal_state(*position).unwrap(), *state);
+        }
+        println!("forest-window-smoke blocks={} scalar_writes={} sorted_unique_writes={} roots_leaf_map_reopen_recovery=ok",
+            entries.len(), entries.iter().map(|entry| entry.forest.len()).sum::<usize>(), merged.len());
+        drop(journal);
+        drop(forest);
+        std::fs::remove_file(journal_path).unwrap();
+        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -4060,6 +4336,11 @@ pub(crate) mod tests {
                 .unwrap();
             let mut journal = ForestJournal::open(&journal_path).unwrap();
             let first_index = journal.append(first_entry.clone()).unwrap();
+            journal
+                .publisher()
+                .unwrap()
+                .publish(journal.boundary())
+                .unwrap();
             forest.apply_forward(&first_entry).unwrap();
             let second_position = forest.leaf_position(&second).unwrap();
             let second_entry = forest
@@ -4072,8 +4353,12 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             let second_index = journal.append(second_entry.clone()).unwrap();
+            journal
+                .publisher()
+                .unwrap()
+                .publish(journal.boundary())
+                .unwrap();
             forest.apply_forward(&second_entry).unwrap();
-            journal.flush().unwrap();
             forest.sync().unwrap();
 
             journal.mark_rolled_back(second_index).unwrap();
@@ -4090,6 +4375,7 @@ pub(crate) mod tests {
         }
 
         std::fs::remove_file(journal_path).unwrap();
+        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -4131,7 +4417,11 @@ pub(crate) mod tests {
             let expected = steady.roots_after(&entry).unwrap();
             let mut journal = crate::forest_journal::ForestJournal::open(&journal_path).unwrap();
             journal.append(entry.clone()).unwrap();
-            journal.flush().unwrap();
+            journal
+                .publisher()
+                .unwrap()
+                .publish(journal.boundary())
+                .unwrap();
             expected
         };
 
@@ -4144,6 +4434,7 @@ pub(crate) mod tests {
         drop(forest);
 
         std::fs::remove_file(journal_path).unwrap();
+        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
