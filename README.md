@@ -12,23 +12,39 @@ It contains three components:
 
 ### Requirements
 
-- Rust 1.89.0 or later (required by the local database's batch implementation)
+- Rust 1.89.0 or later
 - Linux x86-64
-- A C++ toolchain, CMake, and Boost to compile `rust-bitcoinkernel`
+- A C++20 toolchain, CMake 3.22 or later, and Boost to compile `rust-bitcoinkernel`
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
-- Sibling `../ultra-fast-database` (`floresta-db`) and `../rustreexo` checkouts.
-  The accumulator checkout must include the bridge's position-addressed Pollard
-  cache APIs (the local `bridge` branch); an upstream-only checkout is insufficient.
+- `rustreexo` 0.8.0 from crates.io, including the position-addressed Pollard cache APIs.
+- `floresta-db` from <https://github.com/davidson-souza/floresta-db>, including the runtime
+  batch, compaction, and online body-capacity APIs used by this bridge.
 
 ### From source
 
 ```bash
-git clone https://github.com/Davidson-Souza/bridge
-cd bridge
+git clone https://github.com/getfloresta/rpc-utreexo-bridge
+cd rpc-utreexo-bridge
 cargo build --release
 ```
+
+The final review was verified against local rustreexo revision
+`e6748e572cff55366982652bca3f3cae3f1922cf` and floresta-db revision
+`29397816fcd9fbef415820e4dbef18ab98104fe8`. The committed manifests use remote dependencies,
+not sibling checkout paths. Remote builds require publication of rustreexo 0.8.0 and the
+corresponding database changes; those publications were not available during this review.
+The old local-dependency lockfiles are intentionally removed rather than presented as valid
+remote resolutions. After publishing the dependencies, generate and commit both lockfiles:
+
+```bash
+cargo generate-lockfile
+cargo generate-lockfile --manifest-path fuzz/Cargo.toml
+cargo build --locked --release
+```
+
+CI and Docker generate a lockfile only when none exists, then build with `--locked`.
 
 ### Docker
 
@@ -235,7 +251,8 @@ important lifecycle events without timing noise.
 
 - `cache`: leaf hashing, cached bottom-position lookup, and uncached-input collection.
 - `leaf_map`: key preparation and the database batch fetch.
-- `validation`: checking fetched positions against forest bounds, readiness, and spentness.
+- `validation`: decoding index results, resolving overlay entries, and checking forest bounds.
+  This does not read forest nodes to recheck spentness; Bitcoin Core already validated the spends.
 - `resolution`: assembling bottom positions, including explicit recovery for missing or invalid entries.
 - `traversal`: sorted, detwinned sibling fetching and conversion to canonical proof targets.
 
@@ -253,9 +270,16 @@ height and are retired only when that height is acknowledged; retiring an earlie
 discard a later update to the same node or outpoint. The runtime map is given 1 GiB of append
 headroom; older bootstrap maps are extended in place before they are opened.
 
-Journal application and rollback use `batch_delete` and `put_batch`. They remove
-the union of affected keys before reinsertion so replay remains idempotent even
+Journal application and rollback use per-block, key-sorted `batch_delete` and `put_batch`.
+They remove the union of affected keys before reinsertion so replay remains idempotent even
 though the database's append-only batch writer retains duplicate keys.
+
+For each published window, the worker merges the blocks' position-sorted forest deltas and
+writes each touched position exactly once, in ascending physical order. The last block's state
+wins when positions overlap. A heap holds one cursor per nonempty block instead of copying
+or sorting all node states into another window-sized buffer. Leaf-map changes and compaction
+boundaries retain block order under the same exclusive lock. Per-block journal before/after
+states remain unchanged for rollback and recovery of interrupted writes.
 
 After applying each steady-state block with `height % 1_000 == 0`, the background
 worker compacts leaf-map pages below half occupancy (16,384 live nodes per
@@ -264,81 +288,129 @@ The worker holds an exclusive forest lock only during mutation, relocation, and 
 foreground lookups cannot retain stale node offsets. During forest/database sync it holds a
 shared lock, allowing proof planning and cache misses to run concurrently. Compaction failures
 stop persistence rather than marking the height durable.
-Header reads and steady-state index replacement/removal are coordinated separately by a read/write lock.
+Header reads, bootstrap batches, synchronization, and steady-state index replacement/removal
+share a separate storage read/write lock. The header index keeps 64 MiB of body append headroom
+at startup. If a steady-state insertion exhausts that mapping, the persistence worker takes
+exclusive storage access, fully closes and unmaps the database, adds another 64 MiB of headroom
+beyond the allocator high-water mark, and reopens it before retrying the insertion once.
+Existing header mappings are preserved without restarting or rebuilding; a growth event is logged.
+Readers and synchronization wait through the remapping, and bootstrap writers borrow their
+database handle only for each locked batch. A close, growth, or reopen failure is returned to
+persistence and leaves the index explicitly unavailable rather than using a stale mapping.
+This does not change allocator page sealing: synchronization can still leave partially used pages.
 
-Online growth doubles the bottom-row capacity without restarting the bridge. Pending journal
-applications are drained first, internal rows are relocated into the enlarged positional layout,
-and the newly exposed bottom positions are cleared before proving continues. A durable
-`forest.resize` sidecar records the relocation phase; startup resumes an interrupted resize before
-opening the steady-state forest. Proof-index entries retain the logical row count used by their
-targets, so proofs created before and after a resize remain wire-compatible.
+Online growth doubles the bottom-row capacity without restarting the bridge. An explicit sync
+first publishes and applies any partial window, internal rows are relocated into the enlarged
+positional layout, and the newly exposed bottom positions are cleared before proving continues.
+A durable `forest.resize` sidecar records the relocation phase; startup resumes an interrupted
+resize before opening the steady-state forest. Journal records retain their physical forest-row
+count so replay and rollback translate old node positions into the current layout. Proof-index
+entries separately retain the logical row count used by their targets, keeping proofs created
+before and after a resize wire-compatible.
 
 Post-hints proofs are appended to `$DATA_DIR/proofs` and indexed by block hash under
 `$DATA_DIR/proof-index`. Records contain only targets, proof hashes, and compact leaf data—Bitcoin
 blocks are fetched from Core and are not retained.
 
-Every steady-state block is queued to one persistence worker, which exclusively owns
-`$DATA_DIR/forest.journal` and all steady-state writes. A page-aligned journal record starts with
-the block hash and post-block `numleaves`, then contains every changed forest position with its
-before/after hash and publication/spent flags. Added and removed outpoints include their stable
-bottom positions.
+The prover appends complete page-aligned records to `$DATA_DIR/forest.journal` without syncing.
+Each record contains the block identity, post-block `numleaves`, changed forest positions with
+before/after hashes and flags, added/removed outpoints with stable bottom positions, the block
+header, compact proof, and both physical and proof forest-row counts. Pending changes remain in the foreground
+overlay; no corresponding forest, leaf-map, header, proof, or proof-index writes occur yet.
 
-The worker groups up to eight consecutive blocks already waiting in the queue, without adding
-a batching delay. It never groups across a reorg, resize, repair, sync, or shutdown barrier.
-It appends all journal records and flushes the journal once **before changing the mapped forest
-or leaf map**. Proofs, headers, and proof-index entries are written for the group, with one sync
-per store. Forest mutations are applied in block order, followed by one forest/leaf-map sync
-and one durable-height commit for the group's final block. Notifications and completions for
-the group are published only after that commit succeeds. Journal pruning runs once per group.
-Foreground proving performs no journal, proof, header, index, or state writes/flushes.
+Every **100 new blocks**, the prover submits an immutable journal end offset to the persistence
+worker. The worker flushes the journal, advances the checksummed publication marker in
+`forest.journal.published`, then flushes that marker. Alternating marker slots protect against a
+torn update. Later appends may reach disk during this operation, but are not included in the
+captured publication boundary. Journal publication holds no producer metadata lock across sync.
 
-The producer can advance up to eight outstanding blocks. A 256 MiB estimated pending-memory
-budget includes journal data, overlay hash tables, and proofs; one block exceeding that budget
-is admitted only when no earlier block is outstanding. Backpressure waits only at these bounds,
-not after each block. `persistence_enqueue` includes this bounded backpressure; durability timings
-(`journal_flush`, `state_flush`, `proof_store`, `header_store`, `proof_index_write`, `height_commit`)
-are reported separately by `background-persistence`. Its `first_height`, `height` (last height),
-and `blocks` fields identify the group; durations are batch totals, not per-block times.
-Single blocks still commit immediately when there is no queued backlog. Backpressure can still
-occur if persistence cannot keep up, but queued blocks amortize the durability cost.
+Only after publication succeeds does the worker write proofs, headers, and proof-index entries,
+apply merged forest writes and block-ordered leaf-map changes, sync those stores, and commit the final applied
+height. Notifications and completions follow that applied-height commit, not journal publication.
+There is at most one submitted window and one accumulating window: **200 pending blocks**.
+The old 256 MiB pending-memory gate is removed because it could prevent reaching publication;
+memory usage now depends on the contents of those bounded windows, separately from the Pollard
+cache quota. Journal entries and proof payloads are shared rather than copied into each queue.
 
-Reorgs, capacity growth, explicit sync, position repair, and shutdown are ordered worker commands.
-They may wait for outstanding blocks, but all their persistence I/O remains on the worker.
-Normal active-chain checks and Pollard eviction do not drain the queue. Shutdown writes the
-clean marker only after every accepted block and all storage have been synced. A worker failure
-stops further submissions, propagates to the producer/barriers, and never writes a clean marker;
-restart uses the journal and contiguous proof range to recover the last complete publication.
+`persistence_enqueue` includes unsynced journal append and window-boundary backpressure.
+`background-persistence` reports `publication` (journal flush, marker bump, marker flush),
+`apply`, `state_flush`, `proof_store`, `header_store`, `proof_index_write`, and `height_commit`.
+Its `first_height`, `height` (last height), and `blocks` identify the window; durations are window
+totals. Completing a prover range publishes its partial window and waits for application before
+returning, so catching up to Core's tip makes every generated proof available to P2P. During
+normal operation, even a single newly mined block is published at the end of its range.
+
+Explicit sync and graceful shutdown also publish partial windows and wait for application.
+Capacity growth and position repair explicitly sync before their ordered worker operations. Reorgs drain
+already submitted work, discard the entire unpublished tail, then roll back published orphan
+blocks; any still-active discarded prefix is reproved. Ordinary drop or an error never submits a
+partial window. All flushes and durable-store writes remain on background workers; the prover
+only writes unsynced journal records. Buffered writes can still encounter kernel writeback stalls.
+Shutdown writes the clean marker only after accepted work and all storage are synced.
+
+Startup discards all bytes beyond the last valid publication boundary, even complete checksummed
+records that reached disk. Published records carry enough data to restore headers and compact
+proofs as well as forest/leaf-map changes when application was interrupted. The applied-height
+checkpoint is distinct from the published journal tip. Publication failures stop submissions and
+never certify a clean shutdown; an uncertain marker flush requires reopening the journal.
 
 On an orderly worker error, it attempts to seal and sync the leaf-map and header-index runtime
 allocators before exiting; this does not advance the durable height, send notifications, or write
 a clean marker. The original error and any finalization failures are preserved.
 
 The underlying runtime database has a pre-existing crash-recovery limitation: a hard kill or
-power loss before allocator sync can leave unfinished pages or unpublished bucket heads, and
-`open_runtime` may then refuse to reopen. The bridge journal alone cannot repair that database
-format. Recovery from arbitrary hard crashes is therefore not guaranteed; the regression tests
-cover clean shutdown and injected **orderly** persistence failures, not SIGKILL durability.
+power loss during state application, before allocator sync, can leave unfinished pages or
+unpublished bucket heads, and `open_runtime` may then refuse to reopen. The publication protocol
+does not repair that database format. Unpublished-WAL loss and published-WAL recovery are covered
+by killed-writer smoke checks; recovery during database application is covered by injected
+**orderly** failures, not a guarantee of arbitrary SIGKILL or power-loss recovery.
 
 Storage opening and crash recovery also run on named startup workers, including legacy proof-row
 metadata initialization and proof truncation. Startup joins these workers before constructing the
 thread-local Pollard; no recovery flush is issued by the caller.
 
-Startup validates the contiguous proof-index range, reconstructs the retained journal window, and
-refuses to advance across a missing proof. Reorgs durably mark orphan records before restoring old
-node states, leaf-map entries, and `numleaves`. The journal retains 144 forward records. Older spans
-use hole punching when supported and durable tombstones otherwise.
+Existing legacy journals are imported once at startup into the publication format. A permanent
+initialization header distinguishes them from publication journals: a missing or corrupt marker
+on an initialized journal is an error, never permission to replay an unpublished tail.
+Keep `forest.journal`, `forest.journal.published`, and any `forest.journal.forest-rows` together;
+do not downgrade to an older binary against the new journal format. Version-3 records store
+their physical layout; older records are bound once to a checksummed `.forest-rows` sidecar
+before replay or resuming a resize. An interrupted resize supplies its original row count.
+Histories that already completed a resize under an older binary without layout metadata have
+ambiguous journal coordinates: if the original layout is unavailable, rebuild instead of
+assuming those retained records are safe to replay.
+
+Startup validates the contiguous proof-index range after restoring available published redo data;
+legacy records without proofs retain the previous proof-gap rollback policy. Reorgs durably mark
+published orphan records before restoring old node states, leaf-map entries, and `numleaves`.
+Pruning retains at least 144 forward records and advances the replay floor in both marker slots
+before reclaiming old pages. Journal offsets stay stable; runtime compaction no longer renames
+the active file. Filesystems supporting hole punching reclaim old spans; unsupported filesystems
+retain those allocated bytes, but recovery skips them.
 
 Steady state also starts a P2PV2-only BIP 183 proof server on `P2P_HOST`/`P2P_PORT`.
 The `bip324` transport performs the responder handshake and encrypts every subsequent packet;
 there is no P2PV1 parser or fallback. BIP 183 `uproof` and `getuproof` use short IDs 29 and 30.
-The server accepts Floresta's field mask and least-significant-bit-first proof/leaf bitmaps, then
-replies with proof hashes, targets, and compact leaf data. Empty bitmaps request every element.
+The server accepts Floresta's field mask: bit 0 requests targets, bit 1 all proof hashes, and
+bit 2 all leaf data (`0x07` requests everything). When an all-hashes or all-leaves bit is unset,
+the corresponding bitmap selects elements least-significant-bit first; an empty bitmap selects
+none. Both short-ID and long-command `getuproof` requests are supported.
+Stored proof targets already use the 63-row wire layout. P2P serves them unchanged;
+physical or logical forest-row metadata must not trigger another translation.
 `getheaders` requests are served directly from the position-addressed header file and hash index.
-Responses contain at most 2,000 headers and honor the stop hash. RPC is only a compatibility
-fallback for normal-mode databases without the flat header index.
+Responses contain at most 2,000 headers and honor the stop hash, never advancing beyond the
+committed proof-index height advertised by the version handshake. An empty locator requests only
+the eligible stop header. RPC is a fallback when the flat header index is unavailable.
 The version handshake advertises `NODE_WITNESS`, `NODE_P2P_V2`, and `NODE_UTREEXO`; it does not
 advertise `NODE_NETWORK` or `NODE_NETWORK_LIMITED`, and block `getdata` requests are not served.
 Clients must obtain blocks from a separate Bitcoin peer.
+
+The final interoperability smoke used the actual Floresta codecs at revision
+`d302d68e2e4529bf330a0d293b9e82690361d412` over an encrypted localhost connection to the bridge.
+It exercised all eight field masks, multibyte bitmap selection, both command encodings,
+all compact script tags, headers/stop/tip behavior, service flags, ping, and block `notfound`.
+The transport regression additionally covers already-normalized high-bit targets with
+27-row index metadata, which must be served unchanged.
 
 ## Building with esplora backends
 
@@ -355,6 +427,11 @@ export ESPLORA_URL=https://blockstream.info/api
 ```
 
 This will reduce one requirement for running the bridge, but will make your setup slower and less secure. You'll need to trust the esplora backend to provide you with the correct blocks and transactions. We have no way to know if the esplora backend is lying to us.
+
+The Esplora backend consumes plain hexadecimal headers and derives coinbase status from the
+decoded transaction, not the status endpoint. HTTP failures, invalid hashes, and overflowing
+heights propagate as errors. Backend regression tests use isolated local HTTP fixtures and do
+not depend on public Esplora availability.
 
 ## Environment variables
 
