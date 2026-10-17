@@ -172,6 +172,40 @@ pub struct CompactBlockProof {
     pub leaves: Vec<CompactLeafData>,
 }
 
+/// Maximum encoded proof record accepted from disk, independent of the smaller
+/// network packet limit (a selective request can return only part of a proof).
+pub(crate) const MAX_COMPACT_PROOF_BYTES: usize = 512 * 1024 * 1024;
+
+impl CompactBlockProof {
+    fn decode_items<R: bitcoin::io::Read + ?Sized, T>(
+        reader: &mut R,
+        minimum_item_bytes: usize,
+        mut decode: impl FnMut(&mut R) -> Result<T, consensus::encode::Error>,
+    ) -> Result<Vec<T>, consensus::encode::Error> {
+        let count = VarInt::consensus_decode(reader)?.0;
+        let maximum = MAX_COMPACT_PROOF_BYTES / minimum_item_bytes;
+        if count > maximum as u64 {
+            return Err(consensus::encode::Error::OversizedVectorAllocation {
+                requested: usize::try_from(count).unwrap_or(usize::MAX),
+                max: maximum,
+            });
+        }
+        let mut items = Vec::new();
+        for _ in 0..count {
+            // Decode first: a truncated record with a forged count must not
+            // allocate memory proportional to its advertised length.
+            let item = decode(reader)?;
+            if items.len() == items.capacity() {
+                items.try_reserve(1).map_err(|_| {
+                    consensus::encode::Error::ParseFailed("compact proof allocation failed")
+                })?;
+            }
+            items.push(item);
+        }
+        Ok(items)
+    }
+}
+
 impl Encodable for CompactBlockProof {
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
@@ -199,27 +233,15 @@ impl Decodable for CompactBlockProof {
     fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
     ) -> Result<Self, consensus::encode::Error> {
-        let target_count = VarInt::consensus_decode(reader)?.0;
-        let mut targets = Vec::with_capacity(target_count as usize);
-        for _ in 0..target_count {
-            targets.push(VarInt::consensus_decode(reader)?);
-        }
-
-        let hash_count = VarInt::consensus_decode(reader)?.0;
-        let mut hashes = Vec::with_capacity(hash_count as usize);
-        for _ in 0..hash_count {
-            hashes.push(BlockHash::consensus_decode(reader)?);
-        }
-
-        let leaf_count = VarInt::consensus_decode(reader)?.0;
-        let mut leaves = Vec::with_capacity(leaf_count as usize);
-        for _ in 0..leaf_count {
-            leaves.push(CompactLeafData {
+        let targets = Self::decode_items(reader, 1, VarInt::consensus_decode)?;
+        let hashes = Self::decode_items(reader, 32, BlockHash::consensus_decode)?;
+        let leaves = Self::decode_items(reader, 13, |reader| {
+            Ok(CompactLeafData {
                 header_code: u32::consensus_decode(reader)?,
                 amount: u64::consensus_decode(reader)?,
                 spk_ty: ScriptPubkeyType::consensus_decode(reader)?,
-            });
-        }
+            })
+        })?;
 
         Ok(Self {
             proof: BatchProof { targets, hashes },
@@ -396,3 +418,75 @@ pub mod bitcoin_leaf_data {
 }
 
 pub use bitcoin_leaf_data::BitcoinLeafData as LeafData;
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::consensus::{deserialize, serialize};
+    use bitcoin::hashes::Hash;
+
+    use super::*;
+
+    #[test]
+    fn compact_proof_rejects_forged_counts_without_preallocating() {
+        for prefix in [vec![], vec![0], vec![0, 0]] {
+            let mut oversized = prefix.clone();
+            VarInt(u64::MAX).consensus_encode(&mut oversized).unwrap();
+            assert!(matches!(
+                deserialize::<CompactBlockProof>(&oversized),
+                Err(consensus::encode::Error::OversizedVectorAllocation { .. })
+            ));
+            let mut truncated = prefix;
+            VarInt(1_000_000).consensus_encode(&mut truncated).unwrap();
+            assert!(matches!(
+                deserialize::<CompactBlockProof>(&truncated),
+                Err(consensus::encode::Error::Io(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compact_scripts_match_floresta_consensus_tags() {
+        // floresta-chain::ScriptPubKeyKind uses these exact tags; scripts that
+        // cannot be reconstructed from the spending input retain their bytes.
+        let fixtures = [
+            (
+                ScriptPubkeyType::Other(vec![0x51, 0x21].into_boxed_slice()),
+                vec![0, 2, 0x51, 0x21],
+            ),
+            (ScriptPubkeyType::PubKeyHash, vec![1]),
+            (ScriptPubkeyType::WitnessV0PubKeyHash, vec![2]),
+            (ScriptPubkeyType::ScriptHash, vec![3]),
+            (ScriptPubkeyType::WitnessV0ScriptHash, vec![4]),
+        ];
+        for (script, bytes) in fixtures {
+            assert_eq!(serialize(&script), bytes);
+            assert_eq!(deserialize::<ScriptPubkeyType>(&bytes).unwrap(), script);
+        }
+        assert!(deserialize::<ScriptPubkeyType>(&[5]).is_err());
+    }
+
+    #[test]
+    fn compact_leaf_preserves_height_coinbase_amount_and_unrecoverable_script() {
+        let leaf = LeafContext {
+            block_hash: BlockHash::all_zeros(),
+            txid: Txid::all_zeros(),
+            vout: 3,
+            value: 0x0102_0304_0506_0708,
+            pk_script: ScriptBuf::from_bytes(vec![0x51]),
+            block_height: 257,
+            is_coinbase: true,
+        };
+        let compact = CompactLeafData::from(&leaf);
+        assert_eq!(compact.header_code, 515);
+        let proof = CompactBlockProof {
+            leaves: vec![compact],
+            ..Default::default()
+        };
+        // Empty targets/hashes, one leaf, LE u32 height/coinbase, LE u64
+        // amount, Other tag and CompactSize-prefixed script.
+        assert_eq!(
+            serialize(&proof),
+            vec![0, 0, 1, 3, 2, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 0x51]
+        );
+    }
+}

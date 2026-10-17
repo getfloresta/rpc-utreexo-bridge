@@ -620,7 +620,6 @@ pub struct FlatFileProver {
     pollard_leaves: BinaryHeap<Reverse<CachedPollardLeaf>>,
     pollard_memory_limit: usize,
     height: u32,
-    legacy_proof_forest_rows: u8,
     shutdown_flag: Arc<AtomicBool>,
     leaf_data: HashMap<OutPoint, CachedLeaf>,
     block_hash_cache: HashMap<u32, BlockHash>,
@@ -731,9 +730,8 @@ impl FlatFileProver {
         if pollard_memory_limit == 0 {
             anyhow::bail!("Pollard memory limit must be greater than zero");
         }
-        let (acc, journal, height, tip_hash, legacy_proof_forest_rows) = std::thread::scope(
-            |scope| -> anyhow::Result<_> {
-                let recovery = std::thread::Builder::new()
+        let (acc, journal, height, tip_hash) = std::thread::scope(|scope| -> anyhow::Result<_> {
+            let recovery = std::thread::Builder::new()
                     .name("bridge-recovery".to_string())
                     .spawn_scoped(scope, || -> anyhow::Result<_> {
         let indexed_height =
@@ -829,15 +827,12 @@ impl FlatFileProver {
             acc.leaves(),
             journal.records().len()
         );
-                        let legacy_proof_forest_rows =
-                            proof_index.legacy_proof_forest_rows(acc.forest_rows())?;
-                        Ok((acc, journal, height, tip_hash, legacy_proof_forest_rows))
+                        Ok((acc, journal, height, tip_hash))
                     })?;
-                recovery
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("startup recovery worker panicked"))?
-            },
-        )?;
+            recovery
+                .join()
+                .map_err(|_| anyhow::anyhow!("startup recovery worker panicked"))?
+        })?;
         let mut block_hash_cache = HashMap::new();
         block_hash_cache.insert(height, tip_hash);
         let forest_roots = acc.roots()?;
@@ -869,7 +864,6 @@ impl FlatFileProver {
             pollard_leaves: BinaryHeap::new(),
             pollard_memory_limit,
             height,
-            legacy_proof_forest_rows,
             shutdown_flag,
             leaf_data: HashMap::new(),
             block_hash_cache,
@@ -978,10 +972,6 @@ impl FlatFileProver {
             self.wait_for_apply()?;
         }
         Ok(())
-    }
-
-    pub(crate) fn legacy_proof_forest_rows(&self) -> u8 {
-        self.legacy_proof_forest_rows
     }
 
     fn verify_durable_tip(&self, tip: &DurableTip) -> anyhow::Result<()> {
