@@ -35,6 +35,12 @@ jobs:
       - name: Install MSRV
         uses: dtolnay/rust-toolchain@1.89.0
 
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
+
+      - name: Resolve published dependencies
+        run: test -f Cargo.lock || cargo generate-lockfile
+
       - name: Cache Rust
         uses: actions/cache@v4
         with:
@@ -50,7 +56,7 @@ jobs:
         run: cargo build --locked --verbose
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Check Esplora backend
-        run: cargo check --features esplora --verbose
+        run: cargo check --locked --features esplora --verbose

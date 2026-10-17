@@ -13,7 +13,7 @@ bitcoin = { version = "=0.32.6", features = ["serde"] }
 libc = "0.2"
 libfuzzer-sys = "0.4"
 parking_lot = "0.11.2"
-rustreexo = { path = "../../rustreexo" }
+rustreexo = "0.8.0"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 
