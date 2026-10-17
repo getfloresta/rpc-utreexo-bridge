@@ -9,7 +9,6 @@ use std::fmt::Display;
 use anyhow::Result;
 use bitcoin::block::Header;
 use bitcoin::consensus;
-use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use reqwest::blocking::Client;
@@ -35,61 +34,60 @@ impl EsploraBlockchain {
 impl Blockchain for EsploraBlockchain {
     fn get_block_hash(&self, height: u64) -> Result<bitcoin::BlockHash> {
         let url = format!("{}/block-height/{}", self.url, height);
-        let block = self.client.get(url).send()?.text()?;
-        Ok(block.parse().unwrap_or(BlockHash::all_zeros()))
+        let block = self.client.get(url).send()?.error_for_status()?.text()?;
+        Ok(block.trim().parse()?)
     }
 
     fn get_block(&self, block_hash: BlockHash) -> Result<Block> {
         let url = format!("{}/block/{}/raw", self.url, block_hash);
-        let block = self.client.get(url).send()?.bytes()?;
+        let block = self.client.get(url).send()?.error_for_status()?.bytes()?;
         Ok(consensus::deserialize::<Block>(&block)?)
     }
 
     fn get_block_height(&self, block_hash: BlockHash) -> Result<u32> {
         let url = format!("{}/block/{}", self.url, block_hash);
-        let block = self.client.get(url).send()?.text()?;
+        let block = self.client.get(url).send()?.error_for_status()?.text()?;
         let block: serde_json::Value = serde_json::from_str(&block)?;
         let Some(height) = block["height"].as_u64() else {
             return Err(anyhow::anyhow!("No header found"));
         };
-        Ok(height as u32)
+        Ok(u32::try_from(height)?)
     }
 
     fn get_block_header(&self, block_hash: BlockHash) -> Result<Header> {
         let url = format!("{}/block/{}/header", self.url, block_hash);
-        let header = self.client.get(url).send()?.text()?;
-        let header: serde_json::Value = serde_json::from_str(&header)?;
-        let Some(header) = header["hex"].as_str() else {
-            return Err(anyhow::anyhow!("No header found"));
-        };
-        let header = hex::decode(header)?;
-        Ok(consensus::deserialize::<Header>(&header).unwrap())
+        let header = self.client.get(url).send()?.error_for_status()?.text()?;
+        let header = hex::decode(header.trim())?;
+        Ok(consensus::deserialize::<Header>(&header)?)
     }
 
     fn get_block_count(&self) -> Result<u64> {
         let url = format!("{}/blocks/tip/height", self.url);
-        let height = self.client.get(url).send()?.text()?;
-        Ok(height.parse()?)
+        let height = self.client.get(url).send()?.error_for_status()?.text()?;
+        Ok(height.trim().parse()?)
     }
 
     fn get_raw_transaction_info(&self, txid: &bitcoin::Txid) -> Result<TransactionInfo> {
-        let client = Client::new();
         let url = format!("{}/tx/{}/status", self.url, txid);
-        let tx = client.get(url).send()?.text()?;
+        let tx = self.client.get(url).send()?.error_for_status()?.text()?;
         let tx: serde_json::Value = serde_json::from_str(&tx)?;
 
-        let tx_hex = client
+        let tx_hex = self
+            .client
             .get(format!("{}/tx/{}/hex", self.url, txid))
             .send()?
+            .error_for_status()?
             .text()?;
+        let transaction: bitcoin::Transaction =
+            consensus::deserialize(&hex::decode(tx_hex.trim())?)?;
         Ok(TransactionInfo {
-            is_coinbase: tx["vin"][0]["coinbase"].as_str().is_some(),
+            is_coinbase: transaction.is_coinbase(),
             blockhash: tx["block_hash"]
                 .as_str()
                 .map(|hash| hash.parse())
                 .transpose()?,
-            height: tx["block_height"].as_u64().unwrap_or(0) as u32,
-            tx: consensus::deserialize(&hex::decode(tx_hex)?)?,
+            height: u32::try_from(tx["block_height"].as_u64().unwrap_or(0))?,
+            tx: transaction,
         })
     }
 }
@@ -144,55 +142,112 @@ impl Display for EsploraError {
 impl std::error::Error for EsploraError {}
 #[cfg(test)]
 mod tests {
-    use bitcoin::consensus;
-    use bitcoin::Block;
-    use bitcoin::BlockHash;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
-    use super::Client;
-    use crate::chaininterface::TransactionInfo;
+    use super::*;
 
-    #[test]
-    fn test_get_block() {
-        let url = "https://blockstream.info/api/";
-        let client = Client::new();
-        let blockhash = "00000000000000000000bdd2ec0c94a35d76c6de2ae29e02dd901ac58373f77d"
-            .parse::<BlockHash>()
-            .unwrap();
-        let url = format!("{}/block/{}/raw", url, blockhash);
-        let block = client.get(&url).send().unwrap().bytes().unwrap();
-        assert_eq!(
-            blockhash,
-            consensus::deserialize::<Block>(&block)
-                .unwrap()
-                .block_hash()
-        );
+    fn server(responses: Vec<(String, u16, Vec<u8>)>) -> (EsploraBlockchain, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for (path, status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.split_whitespace().nth(1), Some(path.as_str()));
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        (EsploraBlockchain::new(url), handle)
     }
+
     #[test]
-    fn test_get_tx_info() {
-        let client = Client::new();
-        let base_url = "https://mempool.space/signet/api/";
-        let url = format!(
-            "{}/tx/{}/status",
-            base_url, "5c6574473085c1b25fc53d95f85cfdf3b6ba64fffe88893c62bc5bfd99028e89"
-        );
-        let tx = client.get(&url).send().unwrap().text().unwrap();
-        let tx: serde_json::Value = serde_json::from_str(&tx).unwrap();
+    fn decodes_raw_block_from_esplora() {
+        let block = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let hash = block.block_hash();
+        let (backend, server) = server(vec![(
+            format!("/block/{hash}/raw"),
+            200,
+            consensus::serialize(&block),
+        )]);
+        assert_eq!(backend.get_block(hash).unwrap(), block);
+        server.join().unwrap();
+    }
 
-        let tx_hex = client
-            .get(format!(
-                "{}/tx/{}/hex",
-                base_url, "5c6574473085c1b25fc53d95f85cfdf3b6ba64fffe88893c62bc5bfd99028e89"
-            ))
-            .send()
-            .unwrap()
-            .text()
-            .unwrap();
+    #[test]
+    fn decodes_plain_hex_header_from_esplora() {
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).header;
+        let hash = header.block_hash();
+        let (backend, server) = server(vec![(
+            format!("/block/{hash}/header"),
+            200,
+            hex::encode(consensus::serialize(&header)).into_bytes(),
+        )]);
+        assert_eq!(backend.get_block_header(hash).unwrap(), header);
+        server.join().unwrap();
+    }
 
-        let _ = TransactionInfo {
-            is_coinbase: tx["vin"][0]["coinbase"].as_str().is_some(),
-            blockhash: Some(tx["block_hash"].as_str().unwrap().parse().unwrap()),
-            height: tx["block_height"].as_u64().unwrap() as u32,
-            tx: consensus::deserialize(&hex::decode(tx_hex).unwrap()).unwrap(),
-        };
+    #[test]
+    fn derives_coinbase_from_transaction_not_status_json() {
+        let block = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let tx = &block.txdata[0];
+        let txid = tx.compute_txid();
+        let status = serde_json::json!({"confirmed": true, "block_height": 42, "block_hash": block.block_hash()});
+        let (backend, server) = server(vec![
+            (
+                format!("/tx/{txid}/status"),
+                200,
+                status.to_string().into_bytes(),
+            ),
+            (
+                format!("/tx/{txid}/hex"),
+                200,
+                hex::encode(consensus::serialize(tx)).into_bytes(),
+            ),
+        ]);
+        let info = backend.get_raw_transaction_info(&txid).unwrap();
+        assert!(info.is_coinbase);
+        assert_eq!(info.tx, *tx);
+        assert_eq!(info.height, 42);
+        assert_eq!(info.blockhash, Some(block.block_hash()));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_hash_http_error_and_height_overflow() {
+        let hash = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).block_hash();
+        let (backend, server) = server(vec![
+            ("/block-height/1".into(), 200, b"not a hash".to_vec()),
+            ("/block-height/2".into(), 404, hash.to_string().into_bytes()),
+            (
+                format!("/block/{hash}"),
+                200,
+                br#"{"height":4294967296}"#.to_vec(),
+            ),
+        ]);
+        assert!(backend.get_block_hash(1).is_err());
+        assert!(backend.get_block_hash(2).is_err());
+        assert!(backend.get_block_height(hash).is_err());
+        server.join().unwrap();
     }
 }
