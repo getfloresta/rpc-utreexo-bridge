@@ -524,7 +524,7 @@ fn pollard_from_stump_roots(
     leaves: u64,
 ) -> Pollard<BitcoinNodeHash> {
     roots.reverse();
-    Pollard::from_roots(roots, leaves)
+    Pollard::from_roots(&roots, leaves)
 }
 
 fn pollard_stump_roots(pollard: &Pollard<BitcoinNodeHash>) -> Vec<BitcoinNodeHash> {
@@ -2737,7 +2737,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut pollard = Pollard::new();
-        pollard.modify(&additions, &[], Proof::default()).unwrap();
+        pollard.modify(&additions, &[], &Proof::default()).unwrap();
         let mut leaves = BinaryHeap::new();
         for (position, addition) in additions.iter().enumerate() {
             leaves.push(Reverse(CachedPollardLeaf {
