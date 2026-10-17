@@ -325,6 +325,7 @@ struct FlatForest {
     node_count: u64,
     lock_pages: bool,
     pages_locked: bool,
+    random_access: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +485,7 @@ impl FlatForest {
             node_count,
             lock_pages,
             pages_locked: false,
+            random_access: false,
         };
         forest.prepare_residency(lock_pages);
         Ok(forest)
@@ -498,6 +500,13 @@ impl FlatForest {
             .write(true)
             .open(path)
             .with_context(|| format!("failed to open forest file {}", path.display()))?;
+        // io_uring buffered reads use this file description's readahead policy.
+        // Sorted sparse requests are not a sequential scan of the intervening bytes.
+        let advice = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        if advice != 0 {
+            return Err(std::io::Error::from_raw_os_error(advice))
+                .context("failed to disable steady-state forest readahead");
+        }
         let byte_len = file.metadata()?.len();
         if byte_len == 0 || byte_len % size_of::<ForestNode>() as u64 != 0 {
             bail!(
@@ -517,6 +526,7 @@ impl FlatForest {
             node_count,
             lock_pages,
             pages_locked: false,
+            random_access: true,
         };
         forest.resume_resize_if_needed()?;
         forest.prepare_residency(lock_pages);
@@ -729,7 +739,12 @@ impl FlatForest {
     fn prepare_residency(&mut self, lock_pages: bool) {
         let ptr = self.map.as_mut_ptr().cast::<libc::c_void>();
         let len = self.map.len();
-        for advice in [libc::MADV_WILLNEED, libc::MADV_HUGEPAGE] {
+        let advice = if self.random_access {
+            [libc::MADV_RANDOM, libc::MADV_NOHUGEPAGE]
+        } else {
+            [libc::MADV_WILLNEED, libc::MADV_HUGEPAGE]
+        };
+        for advice in advice {
             if unsafe { libc::madvise(ptr, len, advice) } != 0 {
                 warn!(
                     "madvise({advice}) failed for the forest mapping: {}",
@@ -744,7 +759,10 @@ impl FlatForest {
         let mut result = unsafe { libc::mlock2(ptr, len, libc::MLOCK_ONFAULT) };
         if result != 0 {
             let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            // Eager mlock would fault the entire steady-state forest into RAM.
+            if !self.random_access
+                && matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL))
+            {
                 result = unsafe { libc::mlock(ptr, len) };
             }
         }

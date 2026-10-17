@@ -249,6 +249,11 @@ canonical proof-hash lookup, and deletion leaf-hash checks then use only the own
 snapshot; target order and duplicates remain aligned with deletion hashes and leaf data.
 The file mapping remains for mutation, startup, and explicit recovery paths, not normal proof
 reads. This still uses the kernel's buffered file cache and does not eliminate cold disk I/O.
+Steady-state opens apply `POSIX_FADV_RANDOM` to disable file readahead, and the remaining
+mapping uses `MADV_RANDOM` and `MADV_NOHUGEPAGE`, including after growth. Steady state
+does not issue `MADV_WILLNEED` or fall back from on-fault locking to eager `mlock`.
+Bootstrap retains its separate prefetch/residency policy. Cold reads still fetch filesystem
+pages rather than individual 33-byte nodes; random advice does not bypass the page cache.
 
 If the host restricts `io_uring` with `kernel.io_uring_disabled=1`, its
 `kernel.io_uring_group` must permit a group belonging to the bridge user (or the process needs
