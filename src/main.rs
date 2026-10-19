@@ -8,6 +8,7 @@ mod blockfile;
 #[cfg(feature = "esplora")]
 mod esplora;
 mod forest_journal;
+mod forest_reader;
 mod header_index;
 
 mod node;

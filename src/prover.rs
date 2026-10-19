@@ -1459,7 +1459,7 @@ impl FlatFileProver {
         let timer = PositionTimer::start();
         let mut uncached_positions = lookup.positions.into_iter();
         let mut deletions = Vec::with_capacity(external_outpoints.len());
-        let mut proof_targets = Vec::with_capacity(external_outpoints.len());
+        let mut bottom_positions = Vec::with_capacity(external_outpoints.len());
         let mut recovered_leaf_data = HashMap::new();
         let mut cached_target_hashes = HashMap::with_capacity(cached_leaf_hashes.len());
         for outpoint in external_outpoints {
@@ -1493,12 +1493,13 @@ impl FlatFileProver {
                 },
             };
             deletions.push((outpoint, bottom_position));
-            proof_targets.push(bottom_position);
+            bottom_positions.push(bottom_position);
         }
         timings.position_resolution = timer.finish();
         let timer = PositionTimer::start();
-        acc.translate_proof_positions(&mut proof_targets)?;
-        for ((outpoint, _), proof_position) in deletions.iter().zip(&proof_targets) {
+        let forest_proof = acc.read_proof(&bottom_positions)?;
+        let proof_targets = &forest_proof.targets;
+        for ((outpoint, _), proof_position) in deletions.iter().zip(proof_targets) {
             if let Some(hash) = cached_leaf_hashes.get(outpoint) {
                 cached_target_hashes.insert(*proof_position, *hash);
             }
@@ -1507,9 +1508,9 @@ impl FlatFileProver {
         timings.positions = started.elapsed();
         let started = Instant::now();
 
-        // Pollard exposes which canonical positions are not cached. Only those hashes are read
-        // from the flat forest, then the reconstructed proof is verified while being ingested.
-        let missing_positions = self.pollard.missing_positions(&proof_targets);
+        // The forest batch already contains the complete proof/traversal read set.
+        // Resolve only Pollard's missing hashes from memory, without further forest I/O.
+        let missing_positions = self.pollard.missing_positions(proof_targets);
         let positions_to_load = missing_positions
             .into_iter()
             .filter(|position| !cached_target_hashes.contains_key(position))
@@ -1517,12 +1518,16 @@ impl FlatFileProver {
         timings.forest_positions_loaded = positions_to_load.len();
         let mut loaded_positions = positions_to_load
             .into_iter()
-            .map(|position| acc.position_hash(position).map(|hash| (position, hash)))
+            .map(|position| {
+                forest_proof
+                    .position_hash(position)
+                    .map(|hash| (position, hash))
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         loaded_positions.extend(cached_target_hashes);
         let proof = self
             .pollard
-            .ingest_positions(&proof_targets, &loaded_positions)
+            .ingest_positions(proof_targets, &loaded_positions)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed to ingest Pollard targets={proof_targets:?}"))?;
         let original_stump = Stump {
@@ -1576,7 +1581,7 @@ impl FlatFileProver {
                 .copied()
                 .unwrap_or_else(|| LeafData::get_leaf_hashes(&leaf));
             if !cached_bottom_positions.contains_key(outpoint) {
-                let stored_hash = acc.leaf_hash(*bottom_position)?;
+                let stored_hash = forest_proof.leaf_hash(*bottom_position)?;
                 if hash != stored_hash {
                     let recovered_position = self
                         .recover_leaf_position(&acc, *outpoint, &leaf)

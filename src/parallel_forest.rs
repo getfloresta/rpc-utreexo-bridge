@@ -36,6 +36,7 @@ use crate::forest_journal::JournalEntry;
 use crate::forest_journal::JournalForestDelta;
 use crate::forest_journal::JournalIndexDelta;
 use crate::forest_journal::JournalNodeState;
+use crate::forest_reader::ForestReader;
 use crate::header_index::HeaderBuildWriter;
 use crate::header_index::HeaderIndex;
 use crate::position_timing::PositionTimer;
@@ -1162,6 +1163,7 @@ fn merged_forest_writes<'a>(
 /// A completed flat forest: mutation requires exclusive access, while reads and sync may share it.
 pub struct SteadyStateForest {
     forest: FlatForest,
+    reader: ForestReader,
     leaf_map: Database,
     leaves: u64,
     forest_rows: u8,
@@ -1218,6 +1220,30 @@ pub(crate) struct ForestView<'a> {
     leaves: u64,
 }
 
+/// An owned proof snapshot. Lookups never consult the forest mapping or the file.
+#[derive(Debug, Default)]
+pub(crate) struct ForestProofRead {
+    pub(crate) targets: Vec<u64>,
+    hashes: AHashMap<u64, BitcoinNodeHash>,
+    leaves: AHashMap<u64, BitcoinNodeHash>,
+}
+
+impl ForestProofRead {
+    pub(crate) fn position_hash(&self, canonical_position: u64) -> Result<BitcoinNodeHash> {
+        self.hashes
+            .get(&canonical_position)
+            .copied()
+            .ok_or_else(|| anyhow!("proof read omitted canonical position {canonical_position}"))
+    }
+
+    pub(crate) fn leaf_hash(&self, bottom_position: u64) -> Result<BitcoinNodeHash> {
+        self.leaves
+            .get(&bottom_position)
+            .copied()
+            .ok_or_else(|| anyhow!("proof read omitted bottom position {bottom_position}"))
+    }
+}
+
 impl<'a> ForestView<'a> {
     pub(crate) fn new(
         forest: &'a SteadyStateForest,
@@ -1229,6 +1255,167 @@ impl<'a> ForestView<'a> {
             overlay,
             leaves,
         }
+    }
+
+    /// Fetch the complete physical path/sibling union before interpreting promotion.
+    /// The caller must retain its forest read lock throughout this operation.
+    pub(crate) fn read_proof(&self, bottom_positions: &[u64]) -> Result<ForestProofRead> {
+        if bottom_positions.is_empty() {
+            return Ok(ForestProofRead::default());
+        }
+        if self.leaves > self.forest.leaf_capacity()? {
+            bail!("proof view exceeds the physical forest capacity");
+        }
+        let physical_rows = self.forest.forest_rows;
+        let logical_rows = tree_rows(self.leaves);
+        let mut frontier = bottom_positions.to_vec();
+        frontier.sort_unstable();
+        frontier.dedup();
+        for &position in &frontier {
+            if position >= self.leaves {
+                bail!(
+                    "bottom position {position} is beyond {} leaves",
+                    self.leaves
+                );
+            }
+        }
+
+        let mut positions = Vec::new();
+        let mut roots = Vec::new();
+        let mut index = 0;
+        while index < frontier.len() {
+            let position = frontier[index];
+            index += 1;
+            positions.push(position);
+            if is_root_position(position, self.leaves, physical_rows) {
+                roots.push(position);
+                continue;
+            }
+            let sibling = position ^ 1;
+            positions.push(sibling);
+            if frontier.get(index) == Some(&sibling) {
+                index += 1;
+            }
+            // Sorted row-major children append sorted, unique parents. Stop at
+            // each populated root, not the root of the preallocated capacity.
+            frontier.push(parent(position, physical_rows));
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        let disk_positions: Vec<_> = positions
+            .iter()
+            .copied()
+            .filter(|position| !self.overlay.nodes.contains_key(position))
+            .collect();
+        let bytes = self.forest.reader.read_nodes(
+            &self.forest.forest.file,
+            &disk_positions,
+            size_of::<ForestNode>(),
+        )?;
+        let mut records = bytes.chunks_exact(size_of::<ForestNode>());
+        let mut nodes = AHashMap::with_capacity(positions.len());
+        for &position in &positions {
+            let node = if let Some(state) = self.overlay.nodes.get(&position) {
+                if !state.ready {
+                    bail!("forest position {position} is uninitialized in the overlay");
+                }
+                ForestNodeData {
+                    hash: state.hash,
+                    spent: state.spent,
+                }
+            } else {
+                let record = records
+                    .next()
+                    .context("forest reader omitted a requested record")?;
+                let flags = record[32];
+                if flags & READY == 0 {
+                    bail!("forest position {position} is uninitialized (flags {flags:#04x})");
+                }
+                if flags & !(READY | SPENT) != 0 {
+                    bail!("forest position {position} has invalid flags {flags:#04x}");
+                }
+                let mut hash = [0; 32];
+                hash.copy_from_slice(&record[..32]);
+                ForestNodeData {
+                    hash,
+                    spent: flags & SPENT != 0,
+                }
+            };
+            nodes.insert(position, node);
+        }
+        if records.next().is_some() || !records.remainder().is_empty() {
+            bail!("forest reader returned an invalid record count");
+        }
+
+        let mut result = ForestProofRead::default();
+        for &position in bottom_positions {
+            let node = nodes
+                .get(&position)
+                .context("proof read omitted a target node")?;
+            if node.spent {
+                bail!("leaf position {position} is spent");
+            }
+            result
+                .leaves
+                .insert(position, BitcoinNodeHash::from(node.hash));
+        }
+
+        // Project loaded parent/child pairs top-down. A sole surviving child
+        // inherits its parent's logical position; two live children descend one
+        // logical row. Boundary siblings already contain their compressed hash,
+        // so projection never needs to chase their descendants on disk.
+        let mut projected = AHashMap::with_capacity(positions.len());
+        for root in roots {
+            projected.insert(root, translate_position(root, physical_rows, logical_rows)?);
+        }
+        for &position in positions.iter().rev() {
+            let Some(&canonical) = projected.get(&position) else {
+                continue;
+            };
+            let node = nodes[&position];
+            if node.spent {
+                bail!("proof path enters spent position {position}");
+            }
+            result
+                .hashes
+                .insert(canonical, BitcoinNodeHash::from(node.hash));
+            if detect_row(position, physical_rows) == 0 {
+                continue;
+            }
+            let left_position = left_child(position, physical_rows);
+            let (left, right) = match (nodes.get(&left_position), nodes.get(&(left_position + 1))) {
+                (None, None) => continue,
+                (Some(left), Some(right)) => (left, right),
+                _ => bail!("proof read omitted a child of position {position}"),
+            };
+            match (left.spent, right.spent) {
+                (true, true) => bail!("live proof path has fully spent children at {position}"),
+                (true, false) => {
+                    projected.insert(left_position + 1, canonical);
+                }
+                (false, true) => {
+                    projected.insert(left_position, canonical);
+                }
+                (false, false) => {
+                    if detect_row(canonical, logical_rows) == 0 {
+                        bail!("proof projection descends below the logical bottom row");
+                    }
+                    let canonical_left = left_child(canonical, logical_rows);
+                    projected.insert(left_position, canonical_left);
+                    projected.insert(left_position + 1, canonical_left + 1);
+                }
+            }
+        }
+        result.targets = bottom_positions
+            .iter()
+            .map(|position| {
+                projected
+                    .get(position)
+                    .copied()
+                    .ok_or_else(|| anyhow!("proof projection omitted target {position}"))
+            })
+            .collect::<Result<_>>()?;
+        Ok(result)
     }
 
     pub(crate) fn leaf_positions(&self, outpoints: &[OutPoint]) -> Result<LeafPositions> {
@@ -1278,7 +1465,7 @@ impl<'a> ForestView<'a> {
         })
     }
 
-    pub(crate) fn leaf_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
+    fn leaf_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
         let node = self
             .forest
             .read_with_overlay(position, &self.overlay.nodes)?;
@@ -1288,6 +1475,7 @@ impl<'a> ForestView<'a> {
         Ok(BitcoinNodeHash::from(node.hash))
     }
 
+    #[cfg(test)]
     pub(crate) fn translate_proof_positions(&self, positions: &mut [u64]) -> Result<()> {
         translate_proof_positions(
             positions,
@@ -1302,6 +1490,7 @@ impl<'a> ForestView<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn position_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
         self.forest
             .position_hash_with_overlay(position, self.leaves, &self.overlay.nodes)
@@ -1418,6 +1607,7 @@ impl SteadyStateForest {
             .with_context(|| format!("failed to open leaf map {}", leaf_map_path.display()))?;
         Ok(Self {
             forest,
+            reader: ForestReader::default(),
             leaf_map,
             leaves: first,
             forest_rows,
@@ -1562,6 +1752,7 @@ impl SteadyStateForest {
             .ok_or_else(|| anyhow!("forest position {position} is uninitialized"))
     }
 
+    #[cfg(test)]
     fn containing_root(&self, position: u64, leaves: u64) -> Result<(u64, u8)> {
         let position_row = detect_row(position, self.forest_rows);
         for root_row in position_row..=self.forest_rows {
@@ -1580,6 +1771,7 @@ impl SteadyStateForest {
         bail!("position {position} is not below a populated root")
     }
 
+    #[cfg(test)]
     // Proof positions use the canonical row count; storage positions use the preallocated
     // capacity. Row-local offsets are stable between the two layouts.
     fn compressed_hash(
@@ -1644,6 +1836,7 @@ impl SteadyStateForest {
         Ok(Proof::new_with_hash(targets, hashes))
     }
 
+    #[cfg(test)]
     pub(crate) fn position_hash_with_overlay(
         &self,
         position: u64,
@@ -2847,6 +3040,7 @@ fn is_root_position(position: u64, leaves: u64, forest_rows: u8) -> bool {
     leaves & (1 << row) != 0 && root_position(leaves, row, forest_rows) == position
 }
 
+#[cfg(test)]
 fn proof_position_from_spent(
     bottom_position: u64,
     leaves: u64,
@@ -2873,6 +3067,7 @@ fn proof_position_from_spent(
     Ok(promoted)
 }
 
+#[cfg(test)]
 fn translate_proof_positions(
     positions: &mut [u64],
     leaves: u64,
@@ -2995,9 +3190,257 @@ pub(crate) mod tests {
     use hintsfile::EliasFano;
     use hintsfile::HintsfileBuilder;
 
+    use rustreexo::pollard::Pollard;
     use rustreexo::stump::Stump;
 
     use super::*;
+
+    fn assert_proof_read_matches_scalar(view: &ForestView<'_>, bottoms: &[u64]) {
+        let batch = view.read_proof(bottoms).unwrap();
+        let mut scalar_targets = bottoms.to_vec();
+        view.translate_proof_positions(&mut scalar_targets).unwrap();
+        assert_eq!(batch.targets, scalar_targets);
+        for (&bottom, &target) in bottoms.iter().zip(&batch.targets) {
+            let scalar_hash = view.leaf_hash(bottom).unwrap();
+            assert_eq!(batch.leaf_hash(bottom).unwrap(), scalar_hash);
+            assert_eq!(batch.position_hash(target).unwrap(), scalar_hash);
+        }
+        // The snapshot preserves duplicates; the accumulator verifier expects a
+        // set of targets, so verify the first occurrence of each requested leaf.
+        let mut seen = AHashSet::new();
+        let mut targets = Vec::new();
+        let mut target_hashes = Vec::new();
+        for (&bottom, &target) in bottoms.iter().zip(&batch.targets) {
+            if seen.insert(bottom) {
+                targets.push(target);
+                target_hashes.push(batch.leaf_hash(bottom).unwrap());
+            }
+        }
+        let hashes = get_proof_positions(&targets, view.leaves, tree_rows(view.leaves))
+            .into_iter()
+            .map(|position| {
+                let hash = batch.position_hash(position).unwrap();
+                assert_eq!(hash, view.position_hash(position).unwrap());
+                hash
+            })
+            .collect();
+        let proof = Proof::new_with_hash(
+            targets
+                .iter()
+                .map(|position| translate_position(*position, tree_rows(view.leaves), 63).unwrap())
+                .collect(),
+            hashes,
+        );
+        let roots: Vec<_> = (0..=view.forest.forest_rows)
+            .rev()
+            .filter(|row| view.leaves & (1u64 << row) != 0)
+            .map(|row| {
+                accumulator_hash(
+                    view.forest
+                        .read_with_overlay(
+                            root_position(view.leaves, row, view.forest.forest_rows),
+                            &view.overlay.nodes,
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let mut pollard_roots = roots.clone();
+        pollard_roots.reverse();
+        let mut pollard = Pollard::from_roots(&pollard_roots, view.leaves);
+        let loaded: Vec<_> = pollard
+            .missing_positions(&batch.targets)
+            .into_iter()
+            .map(|position| {
+                let hash = batch.position_hash(position).unwrap();
+                assert_eq!(hash, view.position_hash(position).unwrap());
+                (position, hash)
+            })
+            .collect();
+        let hydrated_proof = pollard.ingest_positions(&targets, &loaded).unwrap();
+        let stump = Stump {
+            leaves: view.leaves,
+            roots,
+        };
+        assert!(stump.verify(&proof, &target_hashes).unwrap());
+        assert!(stump.verify(&hydrated_proof, &target_hashes).unwrap());
+        assert!(batch.position_hash(u64::MAX).is_err());
+        assert!(batch.leaf_hash(view.leaves).is_err());
+    }
+
+    #[test]
+    fn proof_read_matches_dense_sparse_and_promoted_forests() {
+        for (leaves, live, capacity) in [
+            (1u32, vec![0u32], 1),
+            (8, (0..8).collect(), 8),
+            (11, (0..11).collect(), 32),
+            (11, vec![0, 4, 7, 8, 10], 32),
+            (17, vec![1, 6, 13, 16], 64),
+        ] {
+            let path = temp_forest_path();
+            let source = MockSource {
+                blocks: vec![mock_block(1, &(1..=u64::from(leaves)).collect::<Vec<_>>())],
+            };
+            let hints = bridge_hints(&[0, leaves], &[vec![], live.clone()]);
+            let mut config = ParallelForestConfig::new(path.clone());
+            config.leaf_workers = 1;
+            config.chaser_workers = 1;
+            config.minimum_leaf_capacity = Some(capacity);
+            config.lock_pages = false;
+            let leaf_map_path = config.leaf_map_path.clone();
+            build_with_source(&source, &hints, config).unwrap();
+            {
+                let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+                let overlay = ForestOverlay::default();
+                let view = ForestView::new(&forest, &overlay, forest.leaves());
+                let mut bottoms: Vec<_> = live.iter().rev().map(|&p| u64::from(p)).collect();
+                bottoms.extend([bottoms[0], *bottoms.last().unwrap()]);
+                assert_proof_read_matches_scalar(&view, &bottoms);
+                for chunk in bottoms.chunks(2) {
+                    assert_proof_read_matches_scalar(&view, chunk);
+                }
+                for &bottom in &bottoms {
+                    assert_proof_read_matches_scalar(&view, &[bottom]);
+                }
+            }
+            remove_bootstrap_files(&path, &leaf_map_path);
+        }
+    }
+
+    #[test]
+    fn proof_read_tracks_overlay_updates_and_capacity_growth() {
+        let path = temp_forest_path();
+        let block = mock_block(1, &[10, 20, 30]);
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        bootstrap_fixture(block.clone(), config).unwrap();
+        {
+            let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let mut overlay = ForestOverlay::default();
+            assert_proof_read_matches_scalar(
+                &ForestView::new(&forest, &overlay, forest.leaves()),
+                &[2, 0, 1, 0],
+            );
+            assert!(forest.ensure_leaf_capacity(9).unwrap());
+            assert_proof_read_matches_scalar(
+                &ForestView::new(&forest, &overlay, forest.leaves()),
+                &[1, 2, 0],
+            );
+            let additions: Vec<_> = (3u8..9)
+                .map(|value| {
+                    (
+                        OutPoint {
+                            txid: Txid::from_byte_array([value; 32]),
+                            vout: 0,
+                        },
+                        BitcoinNodeHash::from([value; 32]),
+                    )
+                })
+                .collect();
+            let original = |vout| OutPoint {
+                txid: block.txdata[0].compute_txid(),
+                vout,
+            };
+            let first = ForestView::new(&forest, &overlay, 3)
+                .plan_update(
+                    2,
+                    BlockHash::from_byte_array([2; 32]),
+                    block.block_hash(),
+                    &[(original(1), 1)],
+                    &additions[..4],
+                )
+                .unwrap();
+            overlay.push(&first);
+            let first_view = ForestView::new(&forest, &overlay, first.num_leaves);
+            assert_proof_read_matches_scalar(&first_view, &[6, 0, 3, 2, 5, 4, 0]);
+            assert!(first_view
+                .read_proof(&[1])
+                .unwrap_err()
+                .to_string()
+                .contains("spent"));
+            let second = first_view
+                .plan_update(
+                    3,
+                    BlockHash::from_byte_array([3; 32]),
+                    first.block_hash,
+                    &[(additions[0].0, 3), (original(0), 0)],
+                    &additions[4..],
+                )
+                .unwrap();
+            overlay.push(&second);
+            let final_bottoms = [8, 2, 7, 4, 6, 5, 2];
+            let final_view = ForestView::new(&forest, &overlay, second.num_leaves);
+            assert_proof_read_matches_scalar(&final_view, &final_bottoms);
+            let snapshot = final_view.read_proof(&final_bottoms).unwrap();
+            forest.apply_forward(&first).unwrap();
+            forest.apply_forward(&second).unwrap();
+            overlay.retire(&first);
+            overlay.retire(&second);
+            assert!(overlay.nodes.is_empty());
+            let durable_view = ForestView::new(&forest, &overlay, forest.leaves());
+            assert_proof_read_matches_scalar(&durable_view, &final_bottoms);
+            let durable = durable_view.read_proof(&final_bottoms).unwrap();
+            assert_eq!(snapshot.targets, durable.targets);
+            assert_eq!(snapshot.hashes, durable.hashes);
+            assert_eq!(snapshot.leaves, durable.leaves);
+        }
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn proof_read_rejects_invalid_records_and_keeps_owned_hashes() {
+        let path = temp_forest_path();
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.minimum_leaf_capacity = Some(8);
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        bootstrap_fixture(mock_block(1, &[10, 20, 30]), config).unwrap();
+        {
+            let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let mut overlay = ForestOverlay::default();
+            let view = ForestView::new(&forest, &overlay, forest.leaves());
+            let snapshot = view.read_proof(&[0]).unwrap();
+            let target_hash = snapshot.leaf_hash(0).unwrap();
+            let sibling_hash = snapshot.position_hash(1).unwrap();
+            let root = root_position(forest.leaves(), 1, forest.forest_rows);
+            for position in [0, 1, root] {
+                let node = forest.forest.node(position).unwrap();
+                let original_flags = node.flags.load(Ordering::Acquire);
+                for flags in [0, SPENT, WRITING, READY | WRITING, READY | 0x80] {
+                    node.flags.store(flags, Ordering::Release);
+                    let error = view.read_proof(&[0]).unwrap_err().to_string();
+                    assert!(error.contains(&format!("forest position {position}")));
+                    assert_eq!(snapshot.leaf_hash(0).unwrap(), target_hash);
+                    assert_eq!(snapshot.position_hash(1).unwrap(), sibling_hash);
+                }
+                node.flags.store(original_flags, Ordering::Release);
+            }
+            for bottom in [forest.leaves(), root, u64::MAX] {
+                assert!(view.read_proof(&[bottom]).is_err());
+            }
+            assert!(ForestView::new(&forest, &overlay, 9)
+                .read_proof(&[0])
+                .is_err());
+            let empty = ForestView::new(&forest, &overlay, 0)
+                .read_proof(&[])
+                .unwrap();
+            assert!(empty.targets.is_empty());
+            assert!(empty.leaf_hash(0).is_err());
+            assert!(empty.position_hash(0).is_err());
+            overlay.nodes.insert(1, JournalNodeState::UNINITIALIZED);
+            assert!(ForestView::new(&forest, &overlay, forest.leaves())
+                .read_proof(&[0])
+                .unwrap_err()
+                .to_string()
+                .contains("uninitialized in the overlay"));
+        }
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
 
     #[test]
     fn detwinned_traversal_fetches_only_sorted_external_siblings() {

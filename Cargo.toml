@@ -42,6 +42,7 @@ serde_json = { version = "1.0.128" }
 hintsfile = "0.1.1"
 libc = "0.2"
 memmap2 = "0.9"
+io-uring = "0.7.15"
 jemallocator = "0.5.4"
 clap = { version = "4.5.20", features = ["derive"] }
 ahash = "0.8.11"

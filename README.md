@@ -13,7 +13,7 @@ It contains three components:
 ### Requirements
 
 - Rust 1.89.0 or later
-- Linux x86-64
+- Linux x86-64; steady-state proof reads require Linux 5.6+ with `io_uring` permitted for the bridge user.
 - A C++20 toolchain, CMake 3.22 or later, and Boost to compile `rust-bitcoinkernel`
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
@@ -237,10 +237,24 @@ positions, and only those hashes are read from the flat forest and ingested. The
 modified immediately and is the source of truth while journal records are pending.
 `--pollard-memory-mib` sets its cache quota and defaults to 250 MiB. Cache eviction does not wait
 for persistence: pending node and outpoint overlays keep subsequent cache misses current.
-Bottom-to-proof position conversion sorts and detwins the live target frontier before fetching
-sibling spentness. Sibling targets merge into one parent traversal without reading either sibling;
-remaining sibling nodes are fetched once each in ascending physical-position order. The resulting
-proof targets retain the original input order so they stay aligned with deletion hashes and leaf data.
+Steady-state proof reads first gather the complete physical target-to-root paths and their
+siblings, including nodes needed to resolve promotions. Positions are sorted and deduplicated;
+adjacent 33-byte nodes are coalesced into one read. A reusable `io_uring` submits these distinct
+file ranges in waves of at most 256 requests, rather than faulting forest mmap pages while
+chasing each target. `readv`/`preadv` cannot express these scattered offsets.
+
+Pending journal-overlay nodes take precedence and are omitted from disk reads. The forest read
+lock excludes concurrent mutation/remapping until the snapshot is complete. Target promotion,
+canonical proof-hash lookup, and deletion leaf-hash checks then use only the owned in-memory
+snapshot; target order and duplicates remain aligned with deletion hashes and leaf data.
+The file mapping remains for mutation, startup, and explicit recovery paths, not normal proof
+reads. This still uses the kernel's buffered file cache and does not eliminate cold disk I/O.
+
+If the host restricts `io_uring` with `kernel.io_uring_disabled=1`, its
+`kernel.io_uring_group` must permit a group belonging to the bridge user (or the process needs
+the corresponding privilege). Disabled or denied `io_uring` is an explicit error; the proof
+reader does not silently fall back to mmap or sequential `pread`. Partial reads are completed,
+and EOF/read errors drain outstanding requests before returning.
 
 Per-block cache metrics, foreground timings, and completed `background-persistence` timings are written at
 debug level to `$DATA_DIR/debug.log`. Terminal logs report block height, hash, proof size, and
@@ -254,12 +268,12 @@ important lifecycle events without timing noise.
 - `validation`: decoding index results, resolving overlay entries, and checking forest bounds.
   This does not read forest nodes to recheck spentness; Bitcoin Core already validated the spends.
 - `resolution`: assembling bottom positions, including explicit recovery for missing or invalid entries.
-- `traversal`: sorted, detwinned sibling fetching and conversion to canonical proof targets.
+- `traversal`: read-set planning, coalesced `io_uring` reads, and in-memory promotion to canonical targets.
 
 Each phase has a matching `*_majflt` field. On Linux these are `RUSAGE_THREAD` major-page-fault
 deltas for the proving thread, excluding background workers: `Some(0)` means no major faults,
 while `None` means the counter was unavailable. Faults indicate paging that required I/O, not
-all storage waits; database syscalls and writeback stalls need not increment them. Measurements
+all storage waits; explicit `io_uring` reads, database syscalls, and writeback stalls need not increment them. Measurements
 are taken at phase boundaries, not per input. Phase times exclude counter-sampling overhead
 and need not sum exactly to `positions`.
 
