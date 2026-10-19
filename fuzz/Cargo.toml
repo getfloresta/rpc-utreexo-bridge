@@ -1,0 +1,38 @@
+[package]
+name = "bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+anyhow = "1"
+bitcoin = { version = "=0.32.6", features = ["serde"] }
+libc = "0.2"
+libfuzzer-sys = "0.4"
+parking_lot = "0.11.2"
+rustreexo = { git = "https://github.com/Davidson-Souza/rustreexo", branch = "bridge" }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+[[bin]]
+name = "journal_codec"
+path = "fuzz_targets/journal_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pollard_behavior"
+path = "fuzz_targets/pollard_behavior.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

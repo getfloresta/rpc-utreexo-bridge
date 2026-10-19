@@ -1,645 +1,2766 @@
 //SPDX-License-Identifier: MIT
 
-//! A prover is a thread that keeps up with the blockchain and generates proofs for
-//! the utreexo accumulator. Since it holds the entire accumulator, it also provides
-//! proofs for other modules. To avoid having multiple channels to and from the prover, it
-//! uses a channel to receive requests and sends responses through a oneshot channel, provided
-//! by the request sender. Maybe there is a better way to do this, but this is a TODO for later.
+//! Pollard-backed steady-state proof generation over the persistent flat forest.
+
+use parking_lot::Mutex;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::RwLock;
+use std::time::Duration;
+use std::time::Instant;
 
+use ahash::AHashMap;
 use anyhow::Context;
-use bitcoin::consensus::serialize;
-use bitcoin::consensus::Encodable;
+use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
 use bitcoin::Script;
-use bitcoin::Transaction;
-use bitcoin::TxIn;
-use bitcoin::TxOut;
-#[cfg(feature = "api")]
 use bitcoin::Txid;
-#[cfg(feature = "api")]
-use futures::channel::mpsc::Receiver;
-use log::error;
+use bitcoin::VarInt;
+use log::debug;
 use log::info;
-use rustreexo::accumulator::mem_forest::MemForest;
-use rustreexo::accumulator::node_hash::BitcoinNodeHash;
-use rustreexo::accumulator::proof::Proof;
-use rustreexo::accumulator::stump::Stump;
-use serde::Deserialize;
-use serde::Serialize;
+use log::warn;
+use rayon::prelude::*;
+use rustreexo::node_hash::BitcoinNodeHash;
+use rustreexo::pollard::Pollard;
+use rustreexo::pollard::PollardAddition;
+#[cfg(test)]
+use rustreexo::proof::Proof;
+use rustreexo::stump::Stump;
 
-use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
+use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
-use crate::chainview;
+use crate::chaininterface::PrevoutInfo;
+use crate::chaininterface::TransactionInfo;
+use crate::forest_journal::ForestJournal;
+use crate::forest_journal::JournalBoundary;
+use crate::forest_journal::JournalEntry;
+use crate::forest_journal::JournalPublisher;
+use crate::forest_journal::JournalStatus;
+use crate::header_index::HeaderIndex;
+use crate::parallel_forest::tree_rows;
+use crate::parallel_forest::ForestOverlay;
+use crate::parallel_forest::ForestView;
+use crate::parallel_forest::SteadyStateForest;
+use crate::position_timing::PositionTimer;
+use crate::position_timing::PositionTiming;
+use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
+use crate::udata::BatchProof;
+use crate::udata::CompactBlockProof;
+use crate::udata::CompactLeafData;
 use crate::udata::LeafContext;
 use crate::udata::LeafData;
-use crate::udata::UtreexoBlock;
 
-#[cfg(not(feature = "shinigami"))]
-pub type AccumulatorHash = rustreexo::accumulator::node_hash::BitcoinNodeHash;
+const MIN_PARALLEL_ADDITION_HASHES: usize = 128;
 
-pub trait BlockStorage {
-    fn save_block(
-        &mut self,
-        block: &Block,
-        block_height: u32,
-        proof: Proof<AccumulatorHash>,
-        leaves: Vec<LeafContext>,
-        acc: &MemForest<AccumulatorHash>,
-    ) -> BlockIndex;
-    #[cfg_attr(feature = "shinigami", allow(unused))]
-    fn get_block(&self, index: BlockIndex) -> Option<UtreexoBlock>;
+const LEAF_CACHE_BLOCKS: u32 = 144;
+pub(crate) fn is_unspendable(script: &Script) -> bool {
+    script.len() > 10_000 || script.as_bytes().first() == Some(&0x6a)
 }
 
-#[cfg(feature = "shinigami")]
-pub type AccumulatorHash = crate::udata::shinigami_udata::PoseidonHash;
-
-pub trait LeafCache: Sync + Send + Sized + 'static {
-    fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext>;
-    fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool;
-    fn flush(&mut self) {}
-    #[cfg_attr(feature = "shinigami", allow(unused))]
-    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext>;
-    fn cache_size(&self) -> usize {
-        0
-    }
+#[derive(Default)]
+struct SteadyBlockTimings {
+    rpc_block_hash: Duration,
+    rpc_block: Duration,
+    scan_prevouts: Duration,
+    positions: Duration,
+    position_cache: PositionTiming,
+    position_leaf_map: PositionTiming,
+    position_validation: PositionTiming,
+    position_resolution: PositionTiming,
+    position_traversal: PositionTiming,
+    position_cache_hits: usize,
+    position_cache_misses: usize,
+    forest_positions_loaded: usize,
+    proof_build: Duration,
+    prevout_block_hashes: Duration,
+    leaf_resolution: Duration,
+    proof_verify: Duration,
+    additions: Duration,
+    stump_update: Duration,
+    plan_update: Duration,
+    persistence_enqueue: Duration,
+    cache_update: Duration,
+    total: Duration,
 }
 
-impl LeafCache for HashMap<OutPoint, LeafContext> {
-    fn remove(&mut self, outpoint: &OutPoint) -> Option<LeafContext> {
-        self.remove(outpoint)
-    }
+const PUBLICATION_BLOCKS: usize = 100;
+// One submitted window and one accumulating window. A byte gate cannot stop a
+// partial window: only publication makes its memory eligible for retirement.
+const MAX_PENDING_BLOCKS: usize = 2 * PUBLICATION_BLOCKS;
 
-    fn insert(&mut self, outpoint: OutPoint, leaf_data: LeafContext) -> bool {
-        self.insert(outpoint, leaf_data);
-        false
-    }
-
-    fn get(&self, outpoint: &OutPoint) -> Option<LeafContext> {
-        self.get(outpoint).cloned()
-    }
+#[derive(Default)]
+struct ApplyTimings {
+    blocks: usize,
+    publication: Duration,
+    apply: Duration,
+    state_flush: Duration,
+    proof_store: Duration,
+    header_store: Duration,
+    proof_index_write: Duration,
+    height_commit: Duration,
 }
 
-/// All the state that the prover needs to keep track of
-pub struct Prover<LeafStorage: LeafCache, Storage: BlockStorage> {
-    /// A reference to a file manager that holds the blocks on disk, using flat files.
-    files: Arc<RwLock<Storage>>,
-    /// A reference to the RPC client that is used to query the blockchain.
-    rpc: Box<dyn Blockchain>,
-    /// The accumulator that holds the state of the utreexo accumulator.
-    acc: MemForest<AccumulatorHash>,
-    /// An index that keeps track of the blocks that are stored on disk, we need this
-    /// to get the blocks from disk.
-    storage: Arc<BlocksIndex>,
-    /// The height of the blockchain we are on.
+struct DurableTip {
     height: u32,
-    /// A reference to the chainview, this keeps a map of block hashes to heights and vice versa.
-    /// Also keeps block headers for easy access.
-    view: Arc<chainview::ChainView>,
-    /// A map that keeps track of the leaf data for each outpoint. This is used to generate
-    /// proofs for the utreexo accumulator. This is more like a cache, since it won't be
-    /// persisted on shutdown.
-    leaf_data: LeafStorage,
-    /// If set, we'll save a snapshot of the accumulator to disk every n blocks.
-    ///
-    /// The file will be named <height>.acc and can be used to start this software from
-    /// that height.
-    snapshot_acc_every: Option<u32>,
-    /// A flag that is set when the prover should shut down.
-    shutdown_flag: Arc<Mutex<bool>>,
-    /// Only save proofs for blocks older than that
-    save_proofs_for_blocks_older_than: u32,
-    block_notification: Sender<BlockHash>,
-    ibd: bool,
+    hash: BlockHash,
+    leaves: u64,
+    roots: Vec<BitcoinNodeHash>,
 }
 
-impl<LeafStorage: LeafCache, Storage: BlockStorage> Prover<LeafStorage, Storage> {
-    /// Creates a new prover. It loads the accumulator from disk, if it exists.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        rpc: Box<dyn Blockchain>,
-        index_database: Arc<BlocksIndex>,
-        files: Arc<RwLock<Storage>>,
-        view: Arc<chainview::ChainView>,
-        leaf_data: LeafStorage,
-        start_acc: Option<PathBuf>,
-        start_height: Option<u32>,
-        snapshot_acc_every: Option<u32>,
-        shutdown_flag: Arc<Mutex<bool>>,
-        save_proofs_for_blocks_older_than: u32,
-        block_notification: Sender<BlockHash>,
-    ) -> Prover<LeafStorage, Storage> {
-        let height = start_height.unwrap_or_else(|| index_database.load_height() as u32);
-        info!("Loaded height {}", height);
-        info!("Loading accumulator data...");
-        let acc = Self::try_from_disk(start_acc);
-        Self {
-            snapshot_acc_every,
-            rpc,
-            acc,
-            height,
-            storage: index_database,
-            files,
-            view,
-            leaf_data,
-            shutdown_flag,
-            save_proofs_for_blocks_older_than,
-            block_notification,
-            ibd: true,
-        }
-    }
+struct PersistenceBlock {
+    entry: Arc<JournalEntry>,
+    header: bitcoin::block::Header,
+    proof: Arc<CompactBlockProof>,
+    proof_forest_rows: u8,
+}
 
-    /// Tries to load the accumulator from disk. If it fails, it creates a new one.
-    fn try_from_disk(path: Option<PathBuf>) -> MemForest<AccumulatorHash> {
-        if let Some(path) = path {
-            let file = File::open(&path).unwrap();
-            let reader = BufReader::new(file);
-            match MemForest::<AccumulatorHash>::deserialize(reader) {
-                Ok(acc) => return acc,
-                Err(e) => panic!("Failed to load accumulator at {path:?}, reson: {e:?}"),
-            }
-        }
+enum PersistenceCommand {
+    Publish {
+        blocks: Vec<PersistenceBlock>,
+        boundary: JournalBoundary,
+    },
+    Barrier {
+        operation: PersistenceBarrier,
+        completion: std::sync::mpsc::SyncSender<anyhow::Result<DurableTip>>,
+    },
+}
 
-        let Ok(file) = std::fs::File::open(crate::subdir("/pollard")) else {
-            return MemForest::<AccumulatorHash>::new_with_hash();
-        };
+enum PersistenceBarrier {
+    Sync { clean_shutdown: bool },
+    Resize(u64),
+    DiscardUnpublished,
+    Rollback { height: u32, hash: BlockHash },
+    Repair { outpoint: OutPoint, position: u64 },
+}
 
-        let reader = BufReader::new(file);
-        match MemForest::<AccumulatorHash>::deserialize(reader) {
-            Ok(acc) => acc,
-            Err(_) => MemForest::<AccumulatorHash>::new_with_hash(),
-        }
-    }
+#[cfg(test)]
+type PersistenceHook = Arc<dyn Fn(&str, u32) -> anyhow::Result<()> + Send + Sync>;
 
-    /// Handles the request from another module. It returns a response through the oneshot channel
-    /// provided by the request sender. Errors are returned as strings, maybe this should be changed
-    /// to a boxed error or something else.
-    #[cfg(feature = "api")]
-    fn handle_request(&mut self, req: Requests) -> anyhow::Result<Responses> {
-        use bitcoin::ScriptBuf;
-        use bitcoin::Sequence;
-        use bitcoin::Witness;
+/// The only steady-state store writer; the producer only appends unsynced WAL records.
+struct PersistenceState {
+    forest: Arc<RwLock<SteadyStateForest>>,
+    journal: Arc<Mutex<ForestJournal>>,
+    publisher: JournalPublisher,
+    proof_file: Arc<ProofFile>,
+    proof_index: Arc<BlocksIndex>,
+    header_index: Arc<HeaderIndex>,
+    block_notification: Sender<BlockHash>,
+    height: u32,
+    tip_hash: BlockHash,
+    bootstrap_height: u32,
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<PersistenceHook>>>,
+}
 
-        match req {
-            Requests::GetProof(node) => {
-                let proof = self
-                    .acc
-                    .prove(&[node])
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::Proof(proof))
-            }
-            Requests::GetRoots => {
-                let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
-                Ok(Responses::Roots(roots))
-            }
-            Requests::GetLeaf(outpoint) => {
-                let leaf = self.leaf_data.get(&outpoint).ok_or(anyhow::anyhow!(
-                    "Leaf for outpoint {}:{} not found",
-                    outpoint.txid,
-                    outpoint.vout
-                ))?;
-
-                Ok(Responses::LeafData(leaf))
-            }
-            Requests::GetBlockByHeight(height) => {
-                let hash = self
-                    .rpc
-                    .get_block_hash(height as u64)
-                    .map_err(|_| anyhow::anyhow!("Block at height {} not found", height))?;
-                let block = self.storage.get_index(hash).ok_or(anyhow::anyhow!(
-                    "Block at height {} not found in storage",
-                    height
-                ))?;
-
-                let block = self
-                    .files
-                    .read()
-                    .unwrap()
-                    .get_block(block)
-                    .ok_or(anyhow::anyhow!(
-                        "Block at height {} not found in files",
-                        height
-                    ))?;
-                Ok(Responses::Block(serialize(&block)))
-            }
-            Requests::GetTxUnpent(txid) => {
-                // returns the unspent outputs of a transaction and a proof for them
-                let tx = self
-                    .rpc
-                    .get_transaction(txid)
-                    .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
-
-                let mut hashes = Vec::new();
-                for vout in 0..tx.output.len() {
-                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                        previous_output: OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        script_sig: ScriptBuf::new(),
-                        sequence: Sequence::ZERO,
-                        witness: Witness::new(),
-                    })?;
-
-                    // if this returns err, this output is spent
-                    if self.acc.prove(&[hash]).is_ok() {
-                        hashes.push(hash);
-                    }
-                }
-
-                let proof = self
-                    .acc
-                    .prove(&hashes)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::TransactionOut(tx.output, proof))
-            }
-            Requests::GetTransaction(txid) => {
-                // returns the unspent outputs of a transaction and a proof for them
-                let tx = self
-                    .rpc
-                    .get_transaction(txid)
-                    .map_err(|_| anyhow::anyhow!("Transaction {} not found", txid))?;
-
-                let mut hashes = Vec::new();
-                for vout in 0..tx.output.len() {
-                    let (hash, _) = self.get_input_leaf_hash(&TxIn {
-                        previous_output: OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        script_sig: ScriptBuf::new(),
-                        sequence: Sequence::ZERO,
-                        witness: Witness::new(),
-                    })?;
-
-                    hashes.push(hash);
-                }
-
-                let proof = self
-                    .acc
-                    .prove(&hashes)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                Ok(Responses::Transaction((tx, proof)))
-            }
-            Requests::GetCSN => {
-                let roots = self.acc.get_roots().iter().map(|x| x.get_data()).collect();
-                let leaves = self.acc.leaves;
-                Ok(Responses::Csn(Stump { roots, leaves }))
-            }
-            Requests::GetBlocksByHeight(height, count) => {
-                let mut blocks = Vec::new();
-                for i in height..height + count {
-                    let Some(hash) = self.view.get_block_hash(i)? else {
-                        break;
-                    };
-                    let block = self.storage.get_index(hash).ok_or(anyhow::anyhow!(
-                        "Block at height {} not found in storage",
-                        i
-                    ))?;
-
-                    let block = self
-                        .files
-                        .read()
-                        .unwrap()
-                        .get_block(block)
-                        .ok_or(anyhow::anyhow!("Block at height {} not found in files", i))?;
-                    blocks.push(serialize(&block));
-                }
-                Ok(Responses::Blocks(blocks))
-            }
-        }
-    }
-
-    /// Gracefully shuts down the prover. It saves the accumulator to disk and flushes the chainview.
-    fn shutdown(&mut self) {
-        self.save_to_disk(None)
-            .expect("could not save the acc to disk");
-        self.leaf_data.flush();
-        self.view.flush();
-    }
-
-    /// Saves the accumulator to disk. This is done by serializing the accumulator to a file,
-    /// the serialization is done by the rustreexo library and is a depth first traversal of the
-    /// tree.
-    fn save_to_disk(&self, height: Option<u32>) -> std::io::Result<()> {
-        let file = match height {
-            Some(height) => std::fs::File::create(crate::subdir(&format!("{}.acc", height)))?,
-            None => std::fs::File::create(crate::subdir("/pollard"))?,
-        };
-
-        let mut writer = std::io::BufWriter::new(file);
-        self.acc.serialize(&mut writer).unwrap();
-
-        Ok(())
-    }
-
-    /// A infinite loop that keeps the prover up to date with the blockchain. It handles requests
-    /// from other modules and updates the accumulator when a new block is found. This method is
-    /// also how we create proofs for historical blocks.
-    pub fn keep_up(
+impl PersistenceState {
+    fn persist(
         &mut self,
-        #[cfg(feature = "api")] mut receiver: Receiver<(
-            Requests,
-            futures::channel::oneshot::Sender<Result<Responses, String>>,
-        )>,
-    ) -> anyhow::Result<()> {
-        let mut last_tip_update = std::time::Instant::now();
-        loop {
-            if *self.shutdown_flag.lock().unwrap() {
-                info!("Shutting down prover");
-                self.shutdown();
-                break;
+        blocks: &[PersistenceBlock],
+        boundary: JournalBoundary,
+    ) -> anyhow::Result<ApplyTimings> {
+        let last = blocks.last().context("empty persistence batch")?;
+        let mut height = self.height;
+        let mut hash = self.tip_hash;
+        for block in blocks {
+            if block.entry.height != height + 1 || block.entry.previous_block_hash != hash {
+                anyhow::bail!("persistence batch does not extend the durable tip");
             }
-
-            #[cfg(feature = "api")]
-            while let Ok(Some((req, res))) = receiver.try_next() {
-                let ret = self.handle_request(req).map_err(|e| e.to_string());
-                res.send(ret)
-                    .map_err(|_| anyhow::anyhow!("Error sending response"))?;
-            }
-
-            if last_tip_update.elapsed() >= std::time::Duration::from_secs(10) {
-                let result = self.check_tip();
-                // Wait between attempts even when the tip is unchanged or the backend fails.
-                last_tip_update = std::time::Instant::now();
-                if let Err(e) = result {
-                    error!("Error checking tip: {}", e);
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            height = block.entry.height;
+            hash = block.entry.block_hash;
         }
-        self.save_to_disk(None)
-            .expect("could not save the acc to disk");
-        self.storage.update_height(self.height as usize);
-        Ok(())
-    }
-
-    fn check_tip(&mut self) -> anyhow::Result<()> {
-        let height = self.rpc.get_block_count()? as u32;
-        if height == self.height {
-            self.ibd = false; // we'll flip it once, and keep it false for the rest of the time
-            return Ok(());
-        }
-
-        if height > self.height {
-            self.prove_range(self.height + 1, height)?;
-
-            self.save_to_disk(None)
-                .expect("could not save the acc to disk");
-            self.storage.update_height(height as usize);
-        }
-        Ok(())
-    }
-
-    /// Proves a range of blocks, may be just one block.
-    pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
-        for height in start..=end {
-            if *self.shutdown_flag.lock().unwrap() {
-                break;
-            }
-
-            let block_hash = self.rpc.get_block_hash(height as u64)?;
-            // Update the local index
-            self.view.save_block_hash(height, block_hash)?;
-            self.view.save_height(block_hash, height)?;
-
-            let block = self.rpc.get_block(block_hash)?;
-
-            self.view
-                .save_header(block_hash, serialize(&block.header))?;
-
-            info!(
-                "processing height={} cache={} txs={}",
-                height,
-                self.leaf_data.cache_size(),
-                block.txdata.len()
-            );
-
-            let mtp = self.rpc.get_mtp(block.header.prev_blockhash)?;
-            let (proof, leaves) = match self.process_block(&block, height, mtp) {
-                Ok((proof, leaves)) => (proof, leaves),
-                Err(e) => {
-                    error!("Couldn't process block {block_hash} due to {e:?}");
-                    return Ok(());
-                }
-            };
-
-            if height > self.save_proofs_for_blocks_older_than {
-                let index = self
-                    .files
-                    .write()
-                    .unwrap()
-                    .save_block(&block, height, proof, leaves, &self.acc);
-                self.storage.append(index, block.block_hash());
-            }
-
-            self.height = height;
-            if let Some(n) = self.snapshot_acc_every {
-                if height % n == 0 {
-                    self.save_to_disk(Some(height))
-                        .expect("could not save the acc to disk");
-                }
-            }
-
-            if !self.ibd {
-                // only notify when we're not in IBD
-                self.block_notification.send(block.block_hash()).unwrap();
-            }
-        }
-
-        anyhow::Ok(())
-    }
-
-    /// Pulls the [LeafData] from the bitcoin core rpc. We use this as fallback if we can't find
-    /// the leaf in leaf_data. This method is slow and should only be used if we can't find the
-    /// leaf in the leaf_data.
-    fn get_input_leaf_hash_from_rpc(
-        rpc: &Box<dyn Blockchain>,
-        input: &TxIn,
-    ) -> anyhow::Result<LeafContext> {
-        let tx_info = rpc.get_raw_transaction_info(&input.previous_output.txid)?;
-
-        let Some(block_hash) = tx_info.blockhash else {
-            return Err(anyhow::anyhow!(
-                "Transaction wasn't confirmed yet, so there's no leaf hash"
-            ));
+        let mut timings = ApplyTimings {
+            blocks: blocks.len(),
+            ..Default::default()
         };
+        let started = Instant::now();
+        #[cfg(test)]
+        self.checkpoint("before_publication", last.entry.height)?;
+        self.publisher.publish(boundary)?;
+        timings.publication = started.elapsed();
+        #[cfg(test)]
+        self.checkpoint("journal", last.entry.height)?;
 
-        let height = tx_info.height;
-        let output = &tx_info.tx.output[input.previous_output.vout as usize];
-        let prev_block = rpc
-            .get_block_header(block_hash)
-            .context("Failed to get block header")?
-            .prev_blockhash;
+        let started = Instant::now();
+        let mut indexes = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let mut index = self.proof_file.append(&block.proof)?;
+            if self.proof_file.get(&index).as_ref() != Some(block.proof.as_ref()) {
+                anyhow::bail!(
+                    "failed to read back compact proof for {}",
+                    block.entry.block_hash
+                );
+            }
+            index.proof_forest_rows = Some(block.proof_forest_rows);
+            indexes.push((index, block.entry.block_hash));
+        }
+        self.proof_file.sync()?;
+        timings.proof_store = started.elapsed();
+        let started = Instant::now();
+        for block in blocks {
+            self.header_index.put(block.entry.height, &block.header)?;
+        }
+        self.header_index.sync()?;
+        timings.header_store = started.elapsed();
+        let started = Instant::now();
+        self.proof_index.append_batch(&indexes)?;
+        timings.proof_index_write = started.elapsed();
 
-        let median_time_past = rpc
-            .get_mtp(prev_block)
-            .context("Failed to get median time past")?;
+        let started = Instant::now();
+        let entries: Vec<_> = blocks.iter().map(|block| block.entry.as_ref()).collect();
+        {
+            let mut forest = self
+                .forest
+                .write()
+                .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+            forest.apply_forward_batch(&entries)?;
+        }
+        timings.apply = started.elapsed();
+        let started = Instant::now();
+        {
+            // Shared with foreground readers, excluding mutation/remapping during sync.
+            let forest = self
+                .forest
+                .read()
+                .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+            #[cfg(test)]
+            self.checkpoint("state_flush", last.entry.height)?;
+            forest.sync()?;
+        }
+        timings.state_flush = started.elapsed();
+        let started = Instant::now();
+        self.proof_index.update_height(last.entry.height as usize)?;
+        timings.height_commit = started.elapsed();
+        self.height = last.entry.height;
+        self.tip_hash = last.entry.block_hash;
+        let prune = self.journal.lock().prepare_prune(144)?;
+        if let Some(prune) = prune {
+            if let Err(error) = prune.finish() {
+                warn!("journal pruning failed; retaining older recovery records: {error:#}");
+            }
+        }
+        for block in blocks {
+            let _ = self.block_notification.send(block.entry.block_hash);
+        }
+        Ok(timings)
+    }
 
-        Ok(LeafContext {
-            block_hash,
-            median_time_past,
-            block_height: height,
-            is_coinbase: tx_info.is_coinbase,
-            pk_script: output.script_pubkey.clone(),
-            value: output.value.to_sat(),
-            vout: input.previous_output.vout,
-            txid: input.previous_output.txid,
+    #[cfg(test)]
+    fn checkpoint(&self, stage: &str, height: u32) -> anyhow::Result<()> {
+        let hook = self.hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(stage, height)?;
+        }
+        Ok(())
+    }
+
+    fn finish_failed(&self, mut error: anyhow::Error) -> anyhow::Error {
+        // Runtime database allocators retain their current page and bucket heads in
+        // memory until sync. Seal them before an orderly failed worker exits so the
+        // durable journal can be replayed on reopen. This does not commit a height
+        // or certify a clean shutdown, and cannot replace hard-crash recovery.
+        let forest_result = self
+            .forest
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned during error finalization"))
+            .and_then(|forest| forest.sync());
+        if let Err(cleanup) = forest_result {
+            error = error.context(format!(
+                "failed to finalize forest after persistence error: {cleanup:#}"
+            ));
+        }
+        if let Err(cleanup) = self.header_index.sync() {
+            error = error.context(format!(
+                "failed to finalize header index after persistence error: {cleanup:#}"
+            ));
+        }
+        error
+    }
+
+    fn barrier(&mut self, operation: PersistenceBarrier) -> anyhow::Result<DurableTip> {
+        let clean_shutdown = matches!(
+            &operation,
+            PersistenceBarrier::Sync {
+                clean_shutdown: true
+            }
+        );
+        match operation {
+            PersistenceBarrier::Sync { .. } => {
+                self.forest
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .sync()?;
+                self.journal.lock().flush()?;
+                self.proof_file.sync()?;
+                self.header_index.sync()?;
+                self.proof_index.update_height(self.height as usize)?;
+            }
+            PersistenceBarrier::DiscardUnpublished => {
+                self.journal.lock().discard_unpublished()?;
+            }
+            PersistenceBarrier::Resize(leaves) => {
+                self.forest
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .ensure_leaf_capacity(leaves)?;
+            }
+            PersistenceBarrier::Repair { outpoint, position } => {
+                self.forest
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+                    .repair_leaf_position(&outpoint, position)?;
+            }
+            PersistenceBarrier::Rollback { height, hash } => {
+                if (height, hash) != (self.height, self.tip_hash) {
+                    anyhow::bail!("rollback does not match the durable tip");
+                }
+                let (index, entry) = {
+                    let journal = self.journal.lock();
+                    let (index, record) = journal.latest_forward().context(
+                        "reorg exceeds retained journal; rebuild from a newer bootstrap",
+                    )?;
+                    (index, Arc::clone(&record.entry))
+                };
+                if (entry.height, entry.block_hash) != (height, hash) {
+                    anyhow::bail!("rollback journal does not match the durable tip");
+                }
+                self.journal.lock().mark_rolled_back(index)?;
+                {
+                    let mut forest = self
+                        .forest
+                        .write()
+                        .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+                    forest.apply_backward(&entry)?;
+                    forest.sync()?;
+                }
+                self.header_index.remove(height, hash)?;
+                self.header_index.sync()?;
+                self.proof_index.remove(hash)?;
+                let previous_height = height.saturating_sub(1);
+                let previous_index = if previous_height > self.bootstrap_height {
+                    Some(
+                        self.proof_index
+                            .get_index(entry.previous_block_hash)?
+                            .context("proof index is missing rollback destination")?,
+                    )
+                } else {
+                    None
+                };
+                self.proof_file.truncate_after(previous_index.as_ref())?;
+                self.proof_index.update_height(previous_height as usize)?;
+                self.height = previous_height;
+                self.tip_hash = entry.previous_block_hash;
+            }
+        }
+        let forest = self
+            .forest
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+        let tip = DurableTip {
+            height: self.height,
+            hash: self.tip_hash,
+            leaves: forest.leaves(),
+            roots: forest.roots()?,
+        };
+        drop(forest);
+        if clean_shutdown {
+            self.journal.lock().mark_clean_shutdown()?;
+        }
+        Ok(tip)
+    }
+}
+
+struct PersistenceWorker {
+    sender: Option<std::sync::mpsc::SyncSender<PersistenceCommand>>,
+    completions: std::sync::mpsc::Receiver<anyhow::Result<ApplyTimings>>,
+    error: Arc<Mutex<Option<String>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<PersistenceHook>>>,
+}
+
+impl PersistenceWorker {
+    fn new(mut state: PersistenceState) -> anyhow::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (completed, completions) = std::sync::mpsc::sync_channel(1);
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&error);
+        #[cfg(test)]
+        let hook = Arc::clone(&state.hook);
+        let handle = std::thread::Builder::new()
+            .name("bridge-persistence".to_string())
+            .spawn(move || loop {
+                let command = match receiver.recv() {
+                    Ok(command) => command,
+                    Err(_) => break,
+                };
+                let (failure, shutdown) = match command {
+                    PersistenceCommand::Publish { blocks, boundary } => {
+                        let result = state.persist(&blocks, boundary);
+                        let result = result.map_err(|error| {
+                            *worker_error.lock() = Some(format!("{error:#}"));
+                            state.finish_failed(error)
+                        });
+                        let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                        if let Some(error) = &failure {
+                            *worker_error.lock() = Some(error.clone());
+                        }
+                        let _ = completed.send(result);
+                        (failure, false)
+                    }
+                    PersistenceCommand::Barrier {
+                        operation,
+                        completion,
+                    } => {
+                        let shutdown = matches!(
+                            operation,
+                            PersistenceBarrier::Sync {
+                                clean_shutdown: true
+                            }
+                        );
+                        let result = state.barrier(operation);
+                        let result = result.map_err(|error| {
+                            *worker_error.lock() = Some(format!("{error:#}"));
+                            state.finish_failed(error)
+                        });
+                        let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                        if let Some(error) = &failure {
+                            *worker_error.lock() = Some(error.clone());
+                        }
+                        let _ = completion.send(result);
+                        (failure, shutdown)
+                    }
+                };
+                if failure.is_some() || shutdown {
+                    break;
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            completions,
+            error,
+            handle: Some(handle),
+            #[cfg(test)]
+            hook,
         })
     }
 
-    /// Returns the leaf hash and the compact leaf data for a given input. If the leaf is not in
-    /// leaf_data we will try to get it from the bitcoin core rpc.
-    fn get_input_leaf_hash(
-        &mut self,
-        input: &TxIn,
-    ) -> anyhow::Result<(AccumulatorHash, LeafContext)> {
-        let leaf = self.leaf_data.remove(&input.previous_output);
+    fn check(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.error.lock().as_ref() {
+            anyhow::bail!("background persistence failed: {error}");
+        }
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            anyhow::bail!("background persistence worker stopped");
+        }
+        Ok(())
+    }
 
-        let leaf = match leaf {
-            Some(leaf) => leaf,
-            None => Self::get_input_leaf_hash_from_rpc(&self.rpc, input)
-                .context("[get_input_leaf_hash] Failure to get leaf hash")?,
+    fn send(&self, command: PersistenceCommand) -> anyhow::Result<()> {
+        self.check()?;
+        self.sender
+            .as_ref()
+            .context("persistence worker stopped")?
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("persistence worker stopped"))
+    }
+
+    fn barrier(&self, operation: PersistenceBarrier) -> anyhow::Result<DurableTip> {
+        let (completion, receiver) = std::sync::mpsc::sync_channel(1);
+        self.send(PersistenceCommand::Barrier {
+            operation,
+            completion,
+        })?;
+        receiver
+            .recv()
+            .context("persistence worker stopped during barrier")?
+    }
+}
+
+impl Drop for PersistenceWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CachedPollardLeaf {
+    creation_height: u32,
+    position: u64,
+    hash: BitcoinNodeHash,
+}
+
+#[derive(Clone)]
+struct CachedLeaf {
+    context: LeafContext,
+    position: u64,
+}
+
+fn cached_bottom_position(
+    pollard_position: Option<u64>,
+    cached_leaf: Option<&CachedLeaf>,
+) -> Option<u64> {
+    pollard_position.or_else(|| cached_leaf.map(|leaf| leaf.position))
+}
+fn pollard_from_stump_roots(
+    mut roots: Vec<BitcoinNodeHash>,
+    leaves: u64,
+) -> Pollard<BitcoinNodeHash> {
+    roots.reverse();
+    Pollard::from_roots(&roots, leaves)
+}
+
+fn pollard_stump_roots(pollard: &Pollard<BitcoinNodeHash>) -> Vec<BitcoinNodeHash> {
+    let mut roots = pollard.roots();
+    roots.reverse();
+    roots
+}
+
+fn evict_pollard_cache(
+    pollard: &mut Pollard<BitcoinNodeHash>,
+    leaves: &mut BinaryHeap<Reverse<CachedPollardLeaf>>,
+    memory_limit: usize,
+) -> anyhow::Result<(usize, usize, usize)> {
+    let initial_usage = pollard.estimated_memory_usage();
+    if initial_usage < memory_limit {
+        return Ok((0, initial_usage, initial_usage));
+    }
+
+    let target = memory_limit / 5;
+    let mut evicted = 0usize;
+    while pollard.estimated_compact_memory_usage() > target {
+        let Some(Reverse(cached)) = leaves.pop() else {
+            break;
         };
+        if pollard.position_hash(cached.position) != Some(cached.hash) {
+            continue;
+        }
+        pollard
+            .prune(&[cached.position])
+            .map_err(anyhow::Error::msg)?;
+        evicted += 1;
+    }
+    pollard.shrink_to_fit();
+    Ok((evicted, initial_usage, pollard.estimated_memory_usage()))
+}
 
-        Ok((LeafData::get_leaf_hashes(&leaf), leaf))
+struct PendingApply {
+    entry: Arc<JournalEntry>,
+}
+
+struct PreparedBlock {
+    entry: JournalEntry,
+    proof_forest_rows: u8,
+}
+
+/// Sequential steady-state prover backed by the bootstrapped flat forest and persistent leaf map.
+pub struct FlatFileProver {
+    rpc: Arc<dyn Blockchain>,
+    header_index: Arc<HeaderIndex>,
+    persistence: PersistenceWorker,
+    acc: Arc<RwLock<SteadyStateForest>>,
+    journal: Arc<Mutex<ForestJournal>>,
+    publication_window: Vec<PersistenceBlock>,
+    publication_boundary: Option<JournalBoundary>,
+    submitted_blocks: usize,
+    overlay: ForestOverlay,
+    pollard: Pollard<BitcoinNodeHash>,
+    pollard_leaves: BinaryHeap<Reverse<CachedPollardLeaf>>,
+    pollard_memory_limit: usize,
+    height: u32,
+    shutdown_flag: Arc<AtomicBool>,
+    leaf_data: HashMap<OutPoint, CachedLeaf>,
+    block_hash_cache: HashMap<u32, BlockHash>,
+    pending_apply: VecDeque<PendingApply>,
+    tip_hash: BlockHash,
+}
+
+fn recoverable_journal_height(
+    journal: &mut ForestJournal,
+    header_index: &HeaderIndex,
+    proof_index: &BlocksIndex,
+    proof_file: &ProofFile,
+    indexed_height: u32,
+    bootstrap_height: u32,
+) -> anyhow::Result<u32> {
+    // Published records recover every store, including failures before the first
+    // proof/header write. Legacy records below still use the old gap policy.
+    let mut repaired_indexes = Vec::new();
+    let mut repair_proof_tail = false;
+    for record in journal.records() {
+        if record.status != JournalStatus::Forward {
+            continue;
+        }
+        let Some(replay) = &record.replay else {
+            continue;
+        };
+        if header_index.get_by_height(record.entry.height)? != Some(replay.header)
+            || header_index.get_height(record.entry.block_hash)? != Some(record.entry.height)
+        {
+            header_index.put(record.entry.height, &replay.header)?;
+        }
+        let index = proof_index.get_index(record.entry.block_hash)?;
+        let valid = index.as_ref().is_some_and(|index| {
+            index.proof_forest_rows == Some(replay.proof_forest_rows)
+                && proof_file.get(index).as_ref() == Some(replay.proof.as_ref())
+        });
+        if repair_proof_tail || !valid {
+            // Keep repaired indexes in file order: truncating at the recovered
+            // tip must not discard a repaired earlier proof appended after it.
+            repair_proof_tail = true;
+            let mut index = proof_file.append(&replay.proof)?;
+            index.proof_forest_rows = Some(replay.proof_forest_rows);
+            repaired_indexes.push((index, record.entry.block_hash));
+        }
+    }
+    proof_file.sync()?;
+    header_index.sync()?;
+    if !repaired_indexes.is_empty() {
+        proof_index.append_batch(&repaired_indexes)?;
+    }
+    let candidate_height = match journal.latest_forward() {
+        Some((_, record)) => record.entry.height,
+        None if !journal.records().is_empty() => {
+            journal.records()[0].entry.height.saturating_sub(1)
+        }
+        None => indexed_height.max(bootstrap_height),
+    };
+    if candidate_height < bootstrap_height {
+        anyhow::bail!(
+            "journal height {candidate_height} precedes bootstrap height {bootstrap_height}"
+        );
+    }
+    let retained = journal
+        .records()
+        .iter()
+        .filter(|record| record.status == JournalStatus::Forward)
+        .map(|record| (record.entry.height, record.entry.block_hash))
+        .collect::<AHashMap<_, _>>();
+    let first_proof_height = bootstrap_height
+        .checked_add(1)
+        .context("bootstrap height overflow")?;
+    for height in first_proof_height..=candidate_height {
+        let header = header_index.get_by_height(height)?;
+        let block_hash = header.as_ref().map(bitcoin::block::Header::block_hash);
+        let index = match block_hash {
+            Some(block_hash) => proof_index.get_index(block_hash)?,
+            None => None,
+        };
+        let valid = block_hash
+            .zip(index.as_ref())
+            .is_some_and(|(block_hash, index)| {
+                retained
+                    .get(&height)
+                    .is_none_or(|retained_hash| *retained_hash == block_hash)
+                    && proof_file.contains(index)
+                    && retained
+                        .contains_key(&height)
+                        .then(|| proof_file.get(index).is_some())
+                        .unwrap_or(true)
+            });
+        if valid {
+            continue;
+        }
+        let rollback_indices = journal
+            .records()
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.status == JournalStatus::Forward && record.entry.height >= height
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if rollback_indices.is_empty()
+            || !journal.records().iter().any(|record| {
+                record.status == JournalStatus::Forward && record.entry.height == height
+            })
+        {
+            anyhow::bail!(
+                "proof gap at height {height} is outside the retained journal; rebuild from a newer bootstrap"
+            );
+        }
+        for index in rollback_indices.into_iter().rev() {
+            journal.mark_rolled_back(index)?;
+        }
+        warn!("rolling back height {height} and later because its proof is missing or corrupt");
+        return Ok(height - 1);
+    }
+    if candidate_height != indexed_height {
+        info!(
+            "reconciled proof height {indexed_height} to journal-backed height {candidate_height}"
+        );
+    }
+    Ok(candidate_height)
+}
+
+impl FlatFileProver {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rpc: Arc<dyn Blockchain>,
+        header_index: Arc<HeaderIndex>,
+        forest_path: &Path,
+        journal_path: PathBuf,
+        leaf_map_path: &Path,
+        proof_file: Arc<ProofFile>,
+        proof_index: Arc<BlocksIndex>,
+        bootstrap_height: u32,
+        lock_pages: bool,
+        pollard_memory_limit: usize,
+        shutdown_flag: Arc<AtomicBool>,
+        block_notification: Sender<BlockHash>,
+    ) -> anyhow::Result<Self> {
+        if pollard_memory_limit == 0 {
+            anyhow::bail!("Pollard memory limit must be greater than zero");
+        }
+        let (acc, journal, height, tip_hash) = std::thread::scope(|scope| -> anyhow::Result<_> {
+            let recovery = std::thread::Builder::new()
+                    .name("bridge-recovery".to_string())
+                    .spawn_scoped(scope, || -> anyhow::Result<_> {
+        let indexed_height =
+            u32::try_from(proof_index.load_height()?).context("proof height exceeds u32")?;
+        let mut journal = ForestJournal::open(journal_path)?;
+        journal.bind_legacy_forest_rows(SteadyStateForest::legacy_journal_rows(forest_path)?)?;
+        let mut acc = SteadyStateForest::open(forest_path, leaf_map_path, lock_pages)?;
+        let recovered_height = recoverable_journal_height(
+            &mut journal,
+            &header_index,
+            &proof_index,
+            &proof_file,
+            indexed_height,
+            bootstrap_height,
+        )?;
+        if acc.replay_journal(&journal)? {
+            if !journal.records().is_empty() {
+                info!(
+                    "replayed {} journal records after an incomplete shutdown",
+                    journal.records().len()
+                );
+            }
+        } else {
+            info!("skipped forest journal replay after a clean shutdown");
+        }
+        for record in journal.records() {
+            match record.status {
+                JournalStatus::Forward => {
+                    let indexed = header_index.get_height(record.entry.block_hash)?
+                        == Some(record.entry.height)
+                        && header_index
+                            .get_by_height(record.entry.height)?
+                            .is_some_and(|header| header.block_hash() == record.entry.block_hash);
+                    if !indexed {
+                        let header = match &record.replay {
+                            Some(replay) => replay.header,
+                            None => rpc.get_block_header(record.entry.block_hash)?,
+                        };
+                        header_index.put(record.entry.height, &header)?;
+                    }
+                }
+                JournalStatus::RolledBack => {
+                    // A previously orphaned block can become active again. Its
+                    // older rollback record must not erase the later publication.
+                    if journal.records().iter().any(|later| {
+                        later.status == JournalStatus::Forward
+                            && later.entry.block_hash == record.entry.block_hash
+                    }) {
+                        continue;
+                    }
+                    header_index.remove(record.entry.height, record.entry.block_hash)?;
+                    proof_index.remove(record.entry.block_hash)?;
+                }
+            }
+        }
+        if !journal.records().is_empty() {
+            header_index.sync()?;
+        }
+        let (height, tip_hash, expected_leaves) = match journal.latest_forward() {
+            Some((_, record)) => (
+                record.entry.height,
+                record.entry.block_hash,
+                record.entry.num_leaves,
+            ),
+            None if !journal.records().is_empty() => {
+                let first = &journal.records()[0].entry;
+                (
+                    first.height.saturating_sub(1),
+                    first.previous_block_hash,
+                    first.previous_num_leaves()?,
+                )
+            }
+            None => (
+                recovered_height,
+                rpc.get_block_hash(recovered_height as u64)?,
+                acc.leaves(),
+            ),
+        };
+        if height != recovered_height {
+            anyhow::bail!(
+                "forest journal recovered height {height}, proof storage recovered {recovered_height}"
+            );
+        }
+        if acc.leaves() != expected_leaves {
+            anyhow::bail!(
+                "forest at height {height} has {} leaves, journal expects {expected_leaves}",
+                acc.leaves()
+            );
+        }
+        let published_index = if height > bootstrap_height {
+            let index = proof_index.get_index(tip_hash)?.ok_or_else(|| {
+                anyhow::anyhow!("proof index is missing recovered height {height}")
+            })?;
+            if proof_file.get(&index).is_none() {
+                anyhow::bail!("proof data at recovered height {height} is unreadable");
+            }
+            Some(index)
+        } else {
+            None
+        };
+        proof_file.truncate_after(published_index.as_ref())?;
+        proof_index.update_height(height as usize)?;
+        info!(
+            "Opened steady-state forest at height {height} with {} historical leaves and {} retained journal entries",
+            acc.leaves(),
+            journal.records().len()
+        );
+                        Ok((acc, journal, height, tip_hash))
+                    })?;
+            recovery
+                .join()
+                .map_err(|_| anyhow::anyhow!("startup recovery worker panicked"))?
+        })?;
+        let mut block_hash_cache = HashMap::new();
+        block_hash_cache.insert(height, tip_hash);
+        let forest_roots = acc.roots()?;
+        let pollard = pollard_from_stump_roots(forest_roots.clone(), acc.leaves());
+        if pollard_stump_roots(&pollard) != forest_roots {
+            anyhow::bail!("Pollard roots do not match the recovered flat forest");
+        }
+        let acc = Arc::new(RwLock::new(acc));
+        let publisher = journal.publisher()?;
+        let journal = Arc::new(Mutex::new(journal));
+        let persistence = PersistenceWorker::new(PersistenceState {
+            forest: Arc::clone(&acc),
+            journal: Arc::clone(&journal),
+            publisher,
+            proof_file,
+            proof_index,
+            header_index: Arc::clone(&header_index),
+            block_notification,
+            height,
+            tip_hash,
+            bootstrap_height,
+            #[cfg(test)]
+            hook: Arc::new(Mutex::new(None)),
+        })?;
+        Ok(Self {
+            rpc,
+            header_index,
+            persistence,
+            acc,
+            journal,
+            publication_window: Vec::with_capacity(PUBLICATION_BLOCKS),
+            publication_boundary: None,
+            submitted_blocks: 0,
+            overlay: ForestOverlay::default(),
+            pollard,
+            pollard_leaves: BinaryHeap::new(),
+            pollard_memory_limit,
+            height,
+            shutdown_flag,
+            leaf_data: HashMap::new(),
+            block_hash_cache,
+            pending_apply: VecDeque::new(),
+            tip_hash,
+        })
     }
 
-    fn is_unspendable(script: &Script) -> bool {
-        if script.len() > 10_000 {
-            return true;
+    fn enforce_pollard_memory_limit(&mut self) -> anyhow::Result<()> {
+        if self.pollard.estimated_memory_usage() < self.pollard_memory_limit {
+            return Ok(());
+        }
+        // Cache misses remain correct through the pending overlay; eviction is not a
+        // durability barrier.
+        let (evicted, initial_usage, final_usage) = evict_pollard_cache(
+            &mut self.pollard,
+            &mut self.pollard_leaves,
+            self.pollard_memory_limit,
+        )?;
+        if evicted == 0 {
+            return Ok(());
         }
 
-        if !script.is_empty() && script.as_bytes()[0] == 0x6a {
-            return true;
+        let target = self.pollard_memory_limit / 5;
+        if final_usage > target {
+            warn!(
+                "Pollard cache could not reach its memory target: bytes={final_usage} target={target}"
+            );
         }
-
-        false
+        info!(
+            "Pollard cache eviction: leaves={evicted} bytes_before={initial_usage} bytes_after={final_usage}"
+        );
+        Ok(())
     }
 
-    /// Processes a block and returns the batch proof and the compact leaf data for the block.
+    fn retire_apply(&mut self, timings: ApplyTimings) -> anyhow::Result<()> {
+        let first_height = self
+            .pending_apply
+            .front()
+            .context("unexpected persistence completion")?
+            .entry
+            .height;
+        let mut height = first_height;
+        for _ in 0..timings.blocks {
+            let pending = self
+                .pending_apply
+                .pop_front()
+                .context("persistence batch exceeds pending blocks")?;
+            self.overlay.retire(&pending.entry);
+            height = pending.entry.height;
+        }
+        self.submitted_blocks = self
+            .submitted_blocks
+            .checked_sub(timings.blocks)
+            .context("persistence completion exceeds submitted window")?;
+        debug!(
+            "background-persistence height={height} first_height={first_height} blocks={} publication={:?} apply={:?} state_flush={:?} proof_store={:?} header_store={:?} proof_index_write={:?} height_commit={:?}",
+            timings.blocks, timings.publication, timings.apply, timings.state_flush,
+            timings.proof_store, timings.header_store, timings.proof_index_write, timings.height_commit
+        );
+        Ok(())
+    }
+
+    fn collect_completed(&mut self) -> anyhow::Result<()> {
+        self.persistence.check()?;
+        loop {
+            match self.persistence.completions.try_recv() {
+                Ok(result) => self.retire_apply(result?)?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("persistence completion channel closed");
+                }
+            }
+        }
+    }
+
+    fn wait_for_apply(&mut self) -> anyhow::Result<()> {
+        let result = self
+            .persistence
+            .completions
+            .recv()
+            .context("persistence worker stopped with outstanding blocks")?;
+        self.retire_apply(result?)
+    }
+
+    fn drain_pending_apply(&mut self) -> anyhow::Result<()> {
+        while self.submitted_blocks != 0 {
+            self.wait_for_apply()?;
+        }
+        self.persistence.check()
+    }
+
+    fn reserve_persistence(&mut self) -> anyhow::Result<()> {
+        self.collect_completed()?;
+        // Retain at most 200 protocol-bounded blocks, rather than 256 MiB. A byte
+        // gate on unpublished work would deadlock before reaching block 100.
+        while self.pending_apply.len() >= MAX_PENDING_BLOCKS {
+            #[cfg(test)]
+            {
+                let hook = self.persistence.hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook("backpressure", self.height)?;
+                }
+            }
+            self.wait_for_apply()?;
+        }
+        Ok(())
+    }
+
+    fn publish_pending(&mut self) -> anyhow::Result<()> {
+        if self.publication_window.is_empty() {
+            return Ok(());
+        }
+        // Production of the next window overlaps application, but at most one
+        // window is submitted at a time.
+        #[cfg(test)]
+        if self.submitted_blocks != 0 {
+            let hook = self.persistence.hook.lock().clone();
+            if let Some(hook) = hook {
+                hook("backpressure", self.height)?;
+            }
+        }
+        self.drain_pending_apply()?;
+        let boundary = self
+            .publication_boundary
+            .take()
+            .context("publication window has no journal boundary")?;
+        let blocks = std::mem::replace(
+            &mut self.publication_window,
+            Vec::with_capacity(PUBLICATION_BLOCKS),
+        );
+        self.submitted_blocks = blocks.len();
+        self.persistence
+            .send(PersistenceCommand::Publish { blocks, boundary })
+    }
+
+    fn verify_durable_tip(&self, tip: &DurableTip) -> anyhow::Result<()> {
+        if (tip.height, tip.hash, tip.leaves) != (self.height, self.tip_hash, self.pollard.leaves())
+            || tip.roots != pollard_stump_roots(&self.pollard)
+        {
+            anyhow::bail!("durable forest and producer state diverged");
+        }
+        Ok(())
+    }
+
+    fn ensure_forest_capacity(&mut self, additions: usize) -> anyhow::Result<()> {
+        let required_leaves = self
+            .pollard
+            .leaves()
+            .checked_add(additions as u64)
+            .context("steady-state leaf count overflow")?;
+        let current_capacity = self
+            .acc
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+            .leaf_capacity()?;
+        if required_leaves <= current_capacity {
+            return Ok(());
+        }
+
+        self.sync()?;
+        let tip = self
+            .persistence
+            .barrier(PersistenceBarrier::Resize(required_leaves))?;
+        self.verify_durable_tip(&tip)
+    }
+
+    pub fn keep_up(&mut self) -> anyhow::Result<()> {
+        loop {
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                self.sync_for_shutdown()?;
+                return Ok(());
+            }
+            self.sync_to_tip()?;
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    }
+
+    fn reconcile_chain(&mut self) -> anyhow::Result<u32> {
+        self.collect_completed()?;
+        let mut rolled_back = 0u32;
+        loop {
+            let core_tip = self.rpc.get_block_count()? as u32;
+            let active = self.height <= core_tip
+                && self
+                    .rpc
+                    .get_block_hash(self.height as u64)
+                    .is_ok_and(|hash| hash == self.tip_hash);
+            if active {
+                break;
+            }
+            self.drain_pending_apply()?;
+            if !self.publication_window.is_empty() {
+                let discarded = self.publication_window.len() as u32;
+                let tip = self
+                    .persistence
+                    .barrier(PersistenceBarrier::DiscardUnpublished)?;
+                self.publication_window.clear();
+                self.publication_boundary = None;
+                self.pending_apply.clear();
+                self.overlay = ForestOverlay::default();
+                self.pollard = pollard_from_stump_roots(tip.roots, tip.leaves);
+                self.pollard_leaves.clear();
+                self.height = tip.height;
+                self.tip_hash = tip.hash;
+                self.block_hash_cache
+                    .retain(|height, _| *height <= tip.height);
+                self.leaf_data.clear();
+                rolled_back += discarded;
+                continue;
+            }
+            let orphan_height = self.height;
+            let orphan_hash = self.tip_hash;
+            let tip = self.persistence.barrier(PersistenceBarrier::Rollback {
+                height: self.height,
+                hash: self.tip_hash,
+            })?;
+            self.pollard = pollard_from_stump_roots(tip.roots, tip.leaves);
+            self.pollard_leaves.clear();
+            self.height = tip.height;
+            self.tip_hash = tip.hash;
+            self.block_hash_cache
+                .retain(|height, _| *height <= tip.height);
+            self.leaf_data.clear();
+            rolled_back += 1;
+            info!(
+                "rolled back orphaned block height={orphan_height} hash={orphan_hash} leaves={}",
+                tip.leaves
+            );
+        }
+        Ok(rolled_back)
+    }
+
+    pub fn sync_to_tip(&mut self) -> anyhow::Result<u32> {
+        self.reconcile_chain()?;
+        let tip = self.rpc.get_block_count()? as u32;
+        let start = self.height.saturating_add(1);
+        if start > tip {
+            return Ok(0);
+        }
+        self.prove_range(start, tip)?;
+        Ok(tip - start + 1)
+    }
+
+    pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
+        self.prove_range_inner(start, end)?;
+        self.sync()
+    }
+
+    fn prove_range_inner(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
+        for height in start..=end {
+            let total_started = Instant::now();
+            let mut timings = SteadyBlockTimings::default();
+            let started = Instant::now();
+            self.reserve_persistence()?;
+            timings.persistence_enqueue = started.elapsed();
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                break;
+            }
+            let started = Instant::now();
+            let block_hash = self.rpc.get_block_hash(height as u64)?;
+            timings.rpc_block_hash = started.elapsed();
+            let started = Instant::now();
+            let block_with_prevouts = self.rpc.get_block_with_prevouts(block_hash)?;
+            timings.rpc_block = started.elapsed();
+            let block = block_with_prevouts.block;
+            let prevouts = block_with_prevouts.prevouts;
+            if block.header.prev_blockhash != self.tip_hash {
+                self.reconcile_chain()?;
+                anyhow::bail!(
+                    "block {block_hash} does not build on current tip {}; retrying active chain",
+                    self.tip_hash
+                );
+            }
+            let (
+                compact_proof,
+                leaf_cache_hits,
+                leaf_cache_misses,
+                prevout_creation_heights,
+                process_timings,
+                pending,
+            ) = self.process_block(&block, &prevouts, height)?;
+            timings.scan_prevouts = process_timings.scan_prevouts;
+            timings.positions = process_timings.positions;
+            timings.position_cache = process_timings.position_cache;
+            timings.position_leaf_map = process_timings.position_leaf_map;
+            timings.position_validation = process_timings.position_validation;
+            timings.position_resolution = process_timings.position_resolution;
+            timings.position_traversal = process_timings.position_traversal;
+            timings.position_cache_hits = process_timings.position_cache_hits;
+            timings.position_cache_misses = process_timings.position_cache_misses;
+            timings.forest_positions_loaded = process_timings.forest_positions_loaded;
+            timings.proof_build = process_timings.proof_build;
+            timings.prevout_block_hashes = process_timings.prevout_block_hashes;
+            timings.leaf_resolution = process_timings.leaf_resolution;
+            timings.proof_verify = process_timings.proof_verify;
+            timings.additions = process_timings.additions;
+            timings.stump_update = process_timings.stump_update;
+            timings.plan_update = process_timings.plan_update;
+            timings.cache_update = process_timings.cache_update;
+            let target_count = compact_proof.proof.targets.len();
+            let proof_hash_count = compact_proof.proof.hashes.len();
+            let leaf_count = compact_proof.leaves.len();
+            let started = Instant::now();
+            let entry = Arc::new(pending.entry);
+            let proof = Arc::new(compact_proof);
+            let boundary = self.journal.lock().append_block(
+                Arc::clone(&entry),
+                block.header,
+                Arc::clone(&proof),
+                pending.proof_forest_rows,
+            )?;
+            self.publication_boundary = Some(boundary);
+            self.publication_window.push(PersistenceBlock {
+                entry: Arc::clone(&entry),
+                header: block.header,
+                proof,
+                proof_forest_rows: pending.proof_forest_rows,
+            });
+            self.overlay.push(&entry);
+            self.pending_apply.push_back(PendingApply { entry });
+            if self.publication_window.len() == PUBLICATION_BLOCKS {
+                self.publish_pending()?;
+            }
+            timings.persistence_enqueue += started.elapsed();
+            self.enforce_pollard_memory_limit()?;
+
+            let started = Instant::now();
+            self.block_hash_cache.insert(height, block_hash);
+            self.height = height;
+            self.tip_hash = block_hash;
+            timings.cache_update += started.elapsed();
+
+            timings.total = total_started.elapsed();
+            let leaves = self.pollard.leaves();
+            info!(
+                "steady-state height={height} hash={block_hash} targets={} proof_hashes={} leaves={leaves}",
+                target_count,
+                proof_hash_count,
+            );
+            debug!(
+                "steady-state-cache height={height} leaf_data={} leaf_cache_hits={} leaf_cache_misses={} leaf_cache_entries={} position_cache_hits={} position_cache_misses={} forest_positions_loaded={} prevout_creation_heights={} pollard_cached_nodes={} pollard_ingested_positions={} pollard_bytes={} pollard_quota={}",
+                leaf_count,
+                leaf_cache_hits,
+                leaf_cache_misses,
+                self.leaf_data.len(),
+                timings.position_cache_hits,
+                timings.position_cache_misses,
+                timings.forest_positions_loaded,
+                prevout_creation_heights,
+                self.pollard.cached_nodes(),
+                self.pollard.ingested_positions(),
+                self.pollard.estimated_memory_usage(),
+                self.pollard_memory_limit
+            );
+            debug!(
+                "steady-state-timings height={height} hash={block_hash} total={:?} rpc_block_hash={:?} rpc_block_v3={:?} scan_prevouts={:?} positions={:?} proof_build={:?} prevout_block_hashes={:?} leaf_resolution={:?} proof_verify={:?} additions={:?} stump_update={:?} plan_update={:?} persistence_enqueue={:?} cache_update={:?}",
+                timings.total,
+                timings.rpc_block_hash,
+                timings.rpc_block,
+                timings.scan_prevouts,
+                timings.positions,
+                timings.proof_build,
+                timings.prevout_block_hashes,
+                timings.leaf_resolution,
+                timings.proof_verify,
+                timings.additions,
+                timings.stump_update,
+                timings.plan_update,
+                timings.persistence_enqueue,
+                timings.cache_update
+            );
+            debug!(
+                "steady-state-position-timings height={height} cache={:?} cache_majflt={:?} leaf_map={:?} leaf_map_majflt={:?} validation={:?} validation_majflt={:?} resolution={:?} resolution_majflt={:?} traversal={:?} traversal_majflt={:?}",
+                timings.position_cache.elapsed,
+                timings.position_cache.major_faults,
+                timings.position_leaf_map.elapsed,
+                timings.position_leaf_map.major_faults,
+                timings.position_validation.elapsed,
+                timings.position_validation.major_faults,
+                timings.position_resolution.elapsed,
+                timings.position_resolution.major_faults,
+                timings.position_traversal.elapsed,
+                timings.position_traversal.major_faults,
+            );
+        }
+        Ok(())
+    }
+
+    fn creating_block_hash(&mut self, height: u32) -> anyhow::Result<BlockHash> {
+        if let Some(block_hash) = self.block_hash_cache.get(&height) {
+            return Ok(*block_hash);
+        }
+        let header = self.header_index.get_by_height(height)?.ok_or_else(|| {
+            anyhow::anyhow!("header index has no block header at prevout creation height {height}")
+        })?;
+        let block_hash = header.block_hash();
+        self.block_hash_cache.insert(height, block_hash);
+        Ok(block_hash)
+    }
+    fn recover_leaf_position(
+        &self,
+        acc: &ForestView<'_>,
+        outpoint: OutPoint,
+        leaf: &LeafContext,
+    ) -> anyhow::Result<u64> {
+        let creating_block = self
+            .rpc
+            .get_block(leaf.block_hash)
+            .with_context(|| format!("failed to fetch creating block {}", leaf.block_hash))?;
+        let block_leaves = eligible_block_leaves(&creating_block, leaf.block_height)?;
+        let leaf_hash = LeafData::get_leaf_hashes(leaf);
+        acc.recover_leaf_position_from_block(outpoint, leaf_hash, &block_leaves)
+    }
+
+    fn recover_missing_leaf_position(
+        &self,
+        acc: &ForestView<'_>,
+        outpoint: OutPoint,
+        prevouts: &HashMap<OutPoint, PrevoutInfo>,
+        creating_block_hashes: &HashMap<u32, BlockHash>,
+    ) -> anyhow::Result<(u64, LeafContext)> {
+        let leaf = if let Some(leaf) = self.leaf_data.get(&outpoint) {
+            leaf.context.clone()
+        } else if let Some(prevout) = prevouts.get(&outpoint) {
+            let block_hash = creating_block_hashes
+                .get(&prevout.height)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing creating block hash for height {}", prevout.height)
+                })?;
+            leaf_context_from_prevout(block_hash, prevout, outpoint)
+        } else {
+            let transaction = self
+                .rpc
+                .get_raw_transaction_info(&outpoint.txid)
+                .with_context(|| format!("failed to recover transaction for {outpoint}"))?;
+            leaf_context_from_transaction(&transaction, outpoint)?
+        };
+        let position = self.recover_leaf_position(acc, outpoint, &leaf)?;
+        Ok((position, leaf))
+    }
+
     fn process_block(
         &mut self,
         block: &Block,
+        prevouts: &HashMap<OutPoint, PrevoutInfo>,
         height: u32,
-        mtp: u32,
-    ) -> anyhow::Result<(Proof<AccumulatorHash>, Vec<LeafContext>)> {
-        let mut inputs = Vec::new();
-        let mut utxos = Vec::new();
-        let mut compact_leaves = Vec::new();
-
-        for tx in block.txdata.iter() {
-            let txid = tx.compute_txid();
-            for input in tx.input.iter() {
-                if !tx.is_coinbase() {
-                    let (hash, compact_leaf) = self.get_input_leaf_hash(input)?;
-                    if let Some(idx) = utxos.iter().position(|h| *h == hash) {
-                        utxos.remove(idx);
-                    } else {
-                        inputs.push(hash);
-                        compact_leaves.push(compact_leaf);
-                    }
+    ) -> anyhow::Result<(
+        CompactBlockProof,
+        usize,
+        usize,
+        usize,
+        SteadyBlockTimings,
+        PreparedBlock,
+    )> {
+        let mut timings = SteadyBlockTimings::default();
+        let started = Instant::now();
+        let spent_in_block = same_block_spends(block);
+        let external_outpoints: Vec<OutPoint> = block
+            .txdata
+            .iter()
+            .filter(|transaction| !transaction.is_coinbase())
+            .flat_map(|transaction| transaction.input.iter())
+            .map(|input| input.previous_output)
+            .filter(|outpoint| !spent_in_block.contains(outpoint))
+            .collect();
+        let missing_heights: HashSet<u32> = external_outpoints
+            .iter()
+            .filter(|outpoint| !self.leaf_data.contains_key(outpoint))
+            .filter_map(|outpoint| prevouts.get(outpoint).map(|prevout| prevout.height))
+            .collect();
+        timings.scan_prevouts = started.elapsed();
+        let started = Instant::now();
+        let block_hash = block.block_hash();
+        let mut addition_contexts = Vec::with_capacity(
+            block
+                .txdata
+                .iter()
+                .map(|transaction| transaction.output.len())
+                .sum(),
+        );
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                let outpoint = OutPoint {
+                    txid,
+                    vout: u32::try_from(vout).context("transaction output index overflow")?,
+                };
+                if is_unspendable(&output.script_pubkey) || spent_in_block.contains(&outpoint) {
+                    continue;
                 }
-            }
-
-            for (idx, output) in tx.output.iter().enumerate() {
-                if !Self::is_unspendable(&output.script_pubkey) {
-                    let leaf = LeafContext {
-                        block_hash: block.block_hash(),
-                        median_time_past: mtp,
-                        txid,
-                        vout: idx as u32,
-                        value: output.value.to_sat(),
-                        pk_script: output.script_pubkey.clone(),
-                        is_coinbase: tx.is_coinbase(),
-                        block_height: height,
-                    };
-
-                    utxos.push(LeafData::get_leaf_hashes(&leaf));
-
-                    let flush = self.leaf_data.insert(
-                        OutPoint {
-                            txid,
-                            vout: idx as u32,
-                        },
-                        leaf,
-                    );
-
-                    if flush {
-                        self.leaf_data.flush();
-                        self.save_to_disk(None)
-                            .expect("could not save the acc to disk");
-                        self.storage.update_height(self.height as usize);
-                    }
-                }
+                addition_contexts.push(LeafContext {
+                    block_hash,
+                    txid,
+                    vout: outpoint.vout,
+                    value: output.value.to_sat(),
+                    pk_script: output.script_pubkey.clone(),
+                    block_height: height,
+                    is_coinbase: transaction.is_coinbase(),
+                });
             }
         }
+        let addition_hashes: Vec<_> = if addition_contexts.len() >= MIN_PARALLEL_ADDITION_HASHES {
+            addition_contexts
+                .par_iter()
+                .map(LeafData::get_leaf_hashes)
+                .collect()
+        } else {
+            addition_contexts
+                .iter()
+                .map(LeafData::get_leaf_hashes)
+                .collect()
+        };
+        let mut additions = Vec::with_capacity(addition_contexts.len());
+        let mut added_leaf_data = Vec::with_capacity(addition_contexts.len());
+        for (leaf, hash) in addition_contexts
+            .into_iter()
+            .zip(addition_hashes.iter().copied())
+        {
+            let outpoint = OutPoint {
+                txid: leaf.txid,
+                vout: leaf.vout,
+            };
+            additions.push((outpoint, hash));
+            added_leaf_data.push((outpoint, leaf));
+        }
+        timings.additions = started.elapsed();
+        self.ensure_forest_capacity(addition_hashes.len())?;
+        let started = Instant::now();
+        let prevout_creation_heights = missing_heights.len();
+        let mut creating_block_hashes = HashMap::with_capacity(missing_heights.len());
+        for height in missing_heights {
+            creating_block_hashes.insert(height, self.creating_block_hash(height)?);
+        }
+        timings.prevout_block_hashes = started.elapsed();
+        let started = Instant::now();
+        let timer = PositionTimer::start();
 
-        let proof = self.acc.prove(&inputs).unwrap();
-        self.acc.modify(&utxos, &inputs).unwrap();
+        let cached_leaf_hashes = external_outpoints
+            .iter()
+            .filter_map(|outpoint| {
+                self.leaf_data
+                    .get(outpoint)
+                    .map(|leaf| (*outpoint, LeafData::get_leaf_hashes(&leaf.context)))
+            })
+            .collect::<HashMap<_, _>>();
+        let cached_bottom_positions = cached_leaf_hashes
+            .iter()
+            .filter_map(|(outpoint, hash)| {
+                cached_bottom_position(
+                    self.pollard.leaf_position(hash),
+                    self.leaf_data.get(outpoint),
+                )
+                .map(|position| (*outpoint, position))
+            })
+            .collect::<HashMap<_, _>>();
+        timings.position_cache_hits = cached_bottom_positions.len();
+        timings.position_cache_misses = external_outpoints.len() - timings.position_cache_hits;
+        let forest_handle = Arc::clone(&self.acc);
+        let forest = forest_handle
+            .read()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
+        self.persistence.check()?;
+        let acc = ForestView::new(&forest, &self.overlay, self.pollard.leaves());
+        let uncached_outpoints: Vec<_> = external_outpoints
+            .iter()
+            .filter(|outpoint| !cached_bottom_positions.contains_key(outpoint))
+            .copied()
+            .collect();
+        timings.position_cache = timer.finish();
+        let lookup = acc.leaf_positions(&uncached_outpoints)?;
+        timings.position_leaf_map = lookup.fetch;
+        timings.position_validation = lookup.validation;
+        let timer = PositionTimer::start();
+        let mut uncached_positions = lookup.positions.into_iter();
+        let mut deletions = Vec::with_capacity(external_outpoints.len());
+        let mut proof_targets = Vec::with_capacity(external_outpoints.len());
+        let mut recovered_leaf_data = HashMap::new();
+        let mut cached_target_hashes = HashMap::with_capacity(cached_leaf_hashes.len());
+        for outpoint in external_outpoints {
+            let bottom_position = match cached_bottom_positions.get(&outpoint) {
+                Some(position) => *position,
+                None => match uncached_positions
+                    .next()
+                    .context("leaf-map batch omitted an uncached outpoint")?
+                {
+                    Ok(position) => position,
+                    Err(map_error) => {
+                        let (position, leaf) = self
+                            .recover_missing_leaf_position(
+                                &acc,
+                                outpoint,
+                                prevouts,
+                                &creating_block_hashes,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "failed explicit position recovery after leaf-map error: {map_error}"
+                                )
+                            })?;
+                        info!(
+                            "recovered missing leaf-map position outpoint={outpoint} height={} position={position}",
+                            leaf.block_height
+                        );
+                        recovered_leaf_data.insert(outpoint, leaf);
+                        position
+                    }
+                },
+            };
+            deletions.push((outpoint, bottom_position));
+            proof_targets.push(bottom_position);
+        }
+        timings.position_resolution = timer.finish();
+        let timer = PositionTimer::start();
+        acc.translate_proof_positions(&mut proof_targets)?;
+        for ((outpoint, _), proof_position) in deletions.iter().zip(&proof_targets) {
+            if let Some(hash) = cached_leaf_hashes.get(outpoint) {
+                cached_target_hashes.insert(*proof_position, *hash);
+            }
+        }
+        timings.position_traversal = timer.finish();
+        timings.positions = started.elapsed();
+        let started = Instant::now();
 
-        let mut ser_acc = Vec::new();
+        // Pollard exposes which canonical positions are not cached. Only those hashes are read
+        // from the flat forest, then the reconstructed proof is verified while being ingested.
+        let missing_positions = self.pollard.missing_positions(&proof_targets);
+        let positions_to_load = missing_positions
+            .into_iter()
+            .filter(|position| !cached_target_hashes.contains_key(position))
+            .collect::<Vec<_>>();
+        timings.forest_positions_loaded = positions_to_load.len();
+        let mut loaded_positions = positions_to_load
+            .into_iter()
+            .map(|position| acc.position_hash(position).map(|hash| (position, hash)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        loaded_positions.extend(cached_target_hashes);
+        let proof = self
+            .pollard
+            .ingest_positions(&proof_targets, &loaded_positions)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("failed to ingest Pollard targets={proof_targets:?}"))?;
+        let original_stump = Stump {
+            leaves: self.pollard.leaves(),
+            roots: pollard_stump_roots(&self.pollard),
+        };
+        timings.proof_build = started.elapsed();
+        let started = Instant::now();
+        let mut deletion_hashes = Vec::with_capacity(deletions.len());
+        let mut leaf_data = Vec::with_capacity(deletions.len());
+        let mut leaf_cache_hits = 0usize;
+        let mut leaf_cache_misses = 0usize;
+        let mut fallback_transactions = HashMap::<Txid, TransactionInfo>::new();
+        for (outpoint, bottom_position) in &deletions {
+            let (leaf, cache_hit) = if let Some(leaf) = recovered_leaf_data.remove(outpoint) {
+                (leaf, false)
+            } else {
+                cached_leaf_context(&self.leaf_data, *outpoint, || {
+                    if let Some(prevout) = prevouts.get(outpoint) {
+                        let block_hash = creating_block_hashes
+                            .get(&prevout.height)
+                            .copied()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing creating block hash for height {}",
+                                    prevout.height
+                                )
+                            })?;
+                        return Ok(leaf_context_from_prevout(block_hash, prevout, *outpoint));
+                    }
+                    let transaction = match fallback_transactions.entry(outpoint.txid) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                            self.rpc
+                                .get_raw_transaction_info(&outpoint.txid)
+                                .with_context(|| {
+                                    format!("verbosity-three response omitted prevout {outpoint}")
+                                })?,
+                        ),
+                    };
+                    leaf_context_from_transaction(transaction, *outpoint)
+                })?
+            };
+            if cache_hit {
+                leaf_cache_hits += 1;
+            } else {
+                leaf_cache_misses += 1;
+            }
+            let hash = cached_leaf_hashes
+                .get(outpoint)
+                .copied()
+                .unwrap_or_else(|| LeafData::get_leaf_hashes(&leaf));
+            if !cached_bottom_positions.contains_key(outpoint) {
+                let stored_hash = acc.leaf_hash(*bottom_position)?;
+                if hash != stored_hash {
+                    let recovered_position = self
+                        .recover_leaf_position(&acc, *outpoint, &leaf)
+                        .with_context(|| {
+                            format!(
+                                "failed to recover {outpoint} after hash mismatch at position {bottom_position}"
+                            )
+                        })?;
+                    drop(forest);
+                    self.sync()?;
+                    self.persistence.barrier(PersistenceBarrier::Repair {
+                        outpoint: *outpoint,
+                        position: recovered_position,
+                    })?;
+                    anyhow::bail!(
+                        "repaired leaf-map position for {outpoint}: {bottom_position} -> {recovered_position}; retry the block"
+                    );
+                }
+            }
+            deletion_hashes.push(hash);
+            leaf_data.push(leaf);
+        }
+        timings.leaf_resolution = started.elapsed();
+        let started = Instant::now();
+        let proof_valid = original_stump
+            .verify(&proof, &deletion_hashes)
+            .map_err(anyhow::Error::msg)?;
+        timings.proof_verify = started.elapsed();
+        if !proof_valid {
+            anyhow::bail!("generated proof does not verify against the flat-forest roots");
+        }
 
-        self.acc.leaves.consensus_encode(&mut ser_acc).unwrap();
-        self.acc.get_roots().iter().for_each(|x| {
-            x.get_data().consensus_encode(&mut ser_acc).unwrap();
-        });
+        let started = Instant::now();
+        let expected_stump = original_stump
+            .modify(&addition_hashes, &deletion_hashes, &proof)
+            .map_err(anyhow::Error::msg)?;
+        timings.stump_update = started.elapsed();
+        let started = Instant::now();
+        let journal_entry = acc.plan_update(
+            height,
+            block_hash,
+            block.header.prev_blockhash,
+            &deletions,
+            &additions,
+        )?;
+        let planned_roots = acc.roots_after(&journal_entry)?;
+        if expected_stump.leaves != journal_entry.num_leaves
+            || expected_stump.roots != planned_roots
+        {
+            anyhow::bail!(
+                "planned flat-forest update diverged from verified stump update: leaves expected={} planned={}, roots expected={} planned={}",
+                expected_stump.leaves,
+                journal_entry.num_leaves,
+                expected_stump.roots.len(),
+                planned_roots.len()
+            );
+        }
+        let pollard_additions = addition_hashes
+            .iter()
+            .map(|hash| PollardAddition {
+                hash: *hash,
+                remember: true,
+            })
+            .collect::<Vec<_>>();
+        let cached_pollard_leaves = added_leaf_data
+            .iter()
+            .zip(addition_hashes.iter())
+            .enumerate()
+            .map(|(offset, ((_, leaf), hash))| {
+                Ok(CachedPollardLeaf {
+                    creation_height: leaf.block_height,
+                    position: original_stump
+                        .leaves
+                        .checked_add(offset as u64)
+                        .context("Pollard leaf position overflow")?,
+                    hash: *hash,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let pollard_update = self
+            .pollard
+            .modify_stump(&pollard_additions, &deletion_hashes, &proof)
+            .map_err(anyhow::Error::msg);
+        if let Err(error) = pollard_update {
+            self.pollard =
+                pollard_from_stump_roots(original_stump.roots.clone(), original_stump.leaves);
+            self.pollard_leaves.clear();
+            return Err(error.context("failed to modify Pollard"));
+        }
+        if self.pollard.leaves() != journal_entry.num_leaves
+            || pollard_stump_roots(&self.pollard) != expected_stump.roots
+        {
+            self.pollard =
+                pollard_from_stump_roots(original_stump.roots.clone(), original_stump.leaves);
+            self.pollard_leaves.clear();
+            anyhow::bail!("Pollard mutation diverged from the planned flat-forest update");
+        }
+        timings.plan_update = started.elapsed();
 
-        self.view.save_acc(ser_acc, block.block_hash());
+        let pending = PreparedBlock {
+            entry: journal_entry,
+            proof_forest_rows: tree_rows(original_stump.leaves),
+        };
+        let started = Instant::now();
+        for (outpoint, _) in &deletions {
+            self.leaf_data.remove(outpoint);
+        }
+        self.leaf_data.extend(
+            added_leaf_data
+                .into_iter()
+                .zip(cached_pollard_leaves.iter())
+                .map(|((outpoint, context), cached)| {
+                    (
+                        outpoint,
+                        CachedLeaf {
+                            context,
+                            position: cached.position,
+                        },
+                    )
+                }),
+        );
+        let oldest_cached_height = height.saturating_sub(LEAF_CACHE_BLOCKS.saturating_sub(1));
+        self.leaf_data
+            .retain(|_, leaf| leaf.context.block_height >= oldest_cached_height);
+        self.pollard_leaves
+            .extend(cached_pollard_leaves.into_iter().map(Reverse));
+        timings.cache_update = started.elapsed();
 
-        Ok((proof, compact_leaves))
+        Ok((
+            CompactBlockProof {
+                proof: BatchProof {
+                    targets: proof.targets.iter().copied().map(VarInt).collect(),
+                    hashes: proof
+                        .hashes
+                        .iter()
+                        .map(|hash| BlockHash::from_byte_array(**hash))
+                        .collect(),
+                },
+                leaves: leaf_data.iter().map(CompactLeafData::from).collect(),
+            },
+            leaf_cache_hits,
+            leaf_cache_misses,
+            prevout_creation_heights,
+            timings,
+            pending,
+        ))
+    }
+
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.publish_pending()?;
+        self.drain_pending_apply()?;
+        let tip = self.persistence.barrier(PersistenceBarrier::Sync {
+            clean_shutdown: false,
+        })?;
+        self.verify_durable_tip(&tip)
+    }
+
+    fn sync_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.publish_pending()?;
+        self.drain_pending_apply()?;
+        let tip = self.persistence.barrier(PersistenceBarrier::Sync {
+            clean_shutdown: true,
+        })?;
+        self.verify_durable_tip(&tip)
     }
 }
 
-#[cfg(feature = "api")]
-/// All requests we can send to the prover. The prover will respond with the corresponding
-/// response element.
-pub enum Requests {
-    /// Get the proof for a given leaf hash.
-    GetProof(BitcoinNodeHash),
-    /// Get the roots of the accumulator.
-    GetRoots,
-    /// Get a block at a given height. This method returns the block and utreexo data for it.
-    GetBlockByHeight(u32),
-    /// Returns a transaction and a proof for all inputs
-    GetTransaction(Txid),
-    /// Returns the CSN of the current acc
-    GetCSN,
-    /// Returns multiple blocks and utreexo data for them.
-    GetBlocksByHeight(u32, u32),
-    GetTxUnpent(Txid),
-    GetLeaf(OutPoint),
+fn same_block_spends(block: &Block) -> HashSet<OutPoint> {
+    let mut created = HashSet::new();
+    let mut spent = HashSet::new();
+    for transaction in &block.txdata {
+        for input in &transaction.input {
+            if created.contains(&input.previous_output) {
+                spent.insert(input.previous_output);
+            }
+        }
+        let txid = transaction.compute_txid();
+        for vout in 0..transaction.output.len() {
+            created.insert(OutPoint {
+                txid,
+                vout: vout as u32,
+            });
+        }
+    }
+    spent
 }
-/// All responses the prover will send.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Responses {
-    /// A utreexo proof
-    Proof(Proof),
-    /// The roots of the accumulator
-    Roots(Vec<BitcoinNodeHash>),
-    /// A block and the utreexo data for it, serialized.
-    Block(Vec<u8>),
-    /// A transaction and a proof for all **outputs**
-    Transaction((Transaction, Proof)),
-    /// The CSN of the current acc
-    #[allow(clippy::upper_case_acronyms)]
-    Csn(Stump),
-    /// Multiple blocks and utreexo data for them.
-    Blocks(Vec<Vec<u8>>),
-    TransactionOut(Vec<TxOut>, Proof),
-    LeafData(LeafContext),
+fn eligible_block_leaves(
+    block: &Block,
+    height: u32,
+) -> anyhow::Result<Vec<(OutPoint, BitcoinNodeHash)>> {
+    let spent_in_block = same_block_spends(block);
+    let block_hash = block.block_hash().to_byte_array();
+    let mut leaves = Vec::new();
+    for transaction in &block.txdata {
+        let txid = transaction.compute_txid();
+        let header_code = (height << 1) | u32::from(transaction.is_coinbase());
+        for (vout, output) in transaction.output.iter().enumerate() {
+            let outpoint = OutPoint {
+                txid,
+                vout: u32::try_from(vout).context("transaction output index overflow")?,
+            };
+            if is_unspendable(&output.script_pubkey) || spent_in_block.contains(&outpoint) {
+                continue;
+            }
+            let hash = get_leaf_hash_from_parts(
+                block_hash,
+                txid.to_byte_array(),
+                outpoint.vout,
+                header_code,
+                output.value.to_sat(),
+                output.script_pubkey.as_bytes(),
+            );
+            leaves.push((outpoint, hash));
+        }
+    }
+    Ok(leaves)
+}
+
+fn cached_leaf_context(
+    cache: &HashMap<OutPoint, CachedLeaf>,
+    outpoint: OutPoint,
+    fetch: impl FnOnce() -> anyhow::Result<LeafContext>,
+) -> anyhow::Result<(LeafContext, bool)> {
+    match cache.get(&outpoint) {
+        Some(leaf) => Ok((leaf.context.clone(), true)),
+        None => fetch().map(|leaf| (leaf, false)),
+    }
+}
+
+fn leaf_context_from_prevout(
+    block_hash: BlockHash,
+    prevout: &PrevoutInfo,
+    outpoint: OutPoint,
+) -> LeafContext {
+    LeafContext {
+        block_hash,
+        block_height: prevout.height,
+        is_coinbase: prevout.is_coinbase,
+        pk_script: prevout.script_pubkey.clone(),
+        value: prevout.value,
+        vout: outpoint.vout,
+        txid: outpoint.txid,
+    }
+}
+
+fn leaf_context_from_transaction(
+    transaction: &TransactionInfo,
+    outpoint: OutPoint,
+) -> anyhow::Result<LeafContext> {
+    let block_hash = transaction
+        .blockhash
+        .ok_or_else(|| anyhow::anyhow!("previous transaction {} is unconfirmed", outpoint.txid))?;
+    let output = transaction
+        .tx
+        .output
+        .get(outpoint.vout as usize)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "previous transaction {} has no output {}",
+                outpoint.txid,
+                outpoint.vout
+            )
+        })?;
+    Ok(LeafContext {
+        block_hash,
+        block_height: transaction.height,
+        is_coinbase: transaction.is_coinbase,
+        pk_script: output.script_pubkey.clone(),
+        value: output.value.to_sat(),
+        vout: outpoint.vout,
+        txid: outpoint.txid,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash;
+    use bitcoin::Network;
+    use bitcoin::ScriptBuf;
+
+    use super::*;
+
+    struct FixtureChain {
+        blocks: Mutex<Vec<Block>>,
+    }
+
+    impl Blockchain for FixtureChain {
+        fn get_block(&self, hash: BlockHash) -> anyhow::Result<Block> {
+            self.blocks
+                .lock()
+                .iter()
+                .find(|block| block.block_hash() == hash)
+                .cloned()
+                .context("fixture block missing")
+        }
+
+        fn get_block_with_prevouts(
+            &self,
+            hash: BlockHash,
+        ) -> anyhow::Result<crate::chaininterface::BlockWithPrevouts> {
+            let block = self.get_block(hash)?;
+            let mut prevouts = HashMap::new();
+            for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
+                for input in &tx.input {
+                    let previous = self.get_raw_transaction_info(&input.previous_output.txid)?;
+                    let output = &previous.tx.output[input.previous_output.vout as usize];
+                    prevouts.insert(
+                        input.previous_output,
+                        PrevoutInfo {
+                            height: previous.height,
+                            is_coinbase: previous.is_coinbase,
+                            value: output.value.to_sat(),
+                            script_pubkey: output.script_pubkey.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(crate::chaininterface::BlockWithPrevouts { block, prevouts })
+        }
+
+        fn get_block_hash(&self, height: u64) -> anyhow::Result<BlockHash> {
+            self.blocks
+                .lock()
+                .get(height as usize)
+                .map(Block::block_hash)
+                .context("fixture height missing")
+        }
+
+        fn get_block_height(&self, hash: BlockHash) -> anyhow::Result<u32> {
+            self.blocks
+                .lock()
+                .iter()
+                .position(|block| block.block_hash() == hash)
+                .map(|height| height as u32)
+                .context("fixture hash missing")
+        }
+
+        fn get_block_header(&self, hash: BlockHash) -> anyhow::Result<bitcoin::block::Header> {
+            Ok(self.get_block(hash)?.header)
+        }
+
+        fn get_block_count(&self) -> anyhow::Result<u64> {
+            Ok(self.blocks.lock().len() as u64 - 1)
+        }
+
+        fn get_raw_transaction_info(&self, txid: &Txid) -> anyhow::Result<TransactionInfo> {
+            let blocks = self.blocks.lock();
+            for (height, block) in blocks.iter().enumerate() {
+                if let Some(tx) = block.txdata.iter().find(|tx| tx.compute_txid() == *txid) {
+                    return Ok(TransactionInfo {
+                        tx: tx.clone(),
+                        height: height as u32,
+                        blockhash: Some(block.block_hash()),
+                        is_coinbase: tx.is_coinbase(),
+                    });
+                }
+            }
+            anyhow::bail!("fixture transaction missing")
+        }
+    }
+
+    struct PersistenceFixture {
+        root: PathBuf,
+        chain: Arc<FixtureChain>,
+    }
+
+    impl PersistenceFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "bridge-persistence-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut blocks = vec![genesis_block(Network::Signet)];
+            let input = |outpoint| bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            };
+            for height in 1..=220u32 {
+                let mut coinbase = blocks[0].txdata[0].clone();
+                coinbase.input[0].script_sig = ScriptBuf::from_bytes(height.to_le_bytes().to_vec());
+                coinbase.output = (0..if height == 1 { 4 } else { 1 })
+                    .map(|vout| bitcoin::TxOut {
+                        value: bitcoin::Amount::from_sat(1000 + u64::from(height) * 10 + vout),
+                        script_pubkey: ScriptBuf::new(),
+                    })
+                    .collect();
+                let mut txdata = vec![coinbase];
+                if height >= 2 {
+                    let previous_tx = blocks.last().unwrap().txdata.last().unwrap();
+                    let mut inputs = vec![input(OutPoint {
+                        txid: previous_tx.compute_txid(),
+                        vout: 0,
+                    })];
+                    if height == 3 {
+                        inputs.push(input(OutPoint {
+                            txid: blocks[1].txdata[0].compute_txid(),
+                            vout: 1,
+                        }));
+                    }
+                    txdata.push(bitcoin::Transaction {
+                        version: bitcoin::transaction::Version::TWO,
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: inputs,
+                        output: (0..2u64)
+                            .map(|vout| bitcoin::TxOut {
+                                value: bitcoin::Amount::from_sat(u64::from(height) * 100 + vout),
+                                script_pubkey: ScriptBuf::new(),
+                            })
+                            .collect(),
+                    });
+                }
+                let mut header = blocks[0].header;
+                header.prev_blockhash = blocks.last().unwrap().block_hash();
+                header.nonce = height;
+                blocks.push(Block { header, txdata });
+            }
+            let mut config = crate::parallel_forest::ParallelForestConfig::new(root.join("forest"));
+            config.leaf_map_path = root.join("leaf-map");
+            config.header_file_path = root.join("headers");
+            config.header_index_path = root.join("header-index");
+            config.minimum_leaf_capacity = Some(1024);
+            config.leaf_workers = 1;
+            config.chaser_workers = 1;
+            config.lock_pages = false;
+            crate::parallel_forest::tests::bootstrap_fixture(blocks[1].clone(), config).unwrap();
+            Self {
+                root,
+                chain: Arc::new(FixtureChain {
+                    blocks: Mutex::new(blocks),
+                }),
+            }
+        }
+
+        fn open(
+            &self,
+        ) -> (
+            FlatFileProver,
+            Arc<ProofFile>,
+            Arc<BlocksIndex>,
+            std::sync::mpsc::Receiver<BlockHash>,
+        ) {
+            let header_index = Arc::new(
+                HeaderIndex::open(&self.root.join("headers"), &self.root.join("header-index"))
+                    .unwrap(),
+            );
+            let proof_file = Arc::new(ProofFile::new(self.root.join("proofs")).unwrap());
+            let proof_index = Arc::new(BlocksIndex {
+                database: kv::Store::new(kv::Config {
+                    path: self.root.join("proof-index"),
+                    temporary: false,
+                    use_compression: false,
+                    flush_every_ms: None,
+                    cache_capacity: None,
+                    segment_size: None,
+                })
+                .unwrap(),
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let prover = FlatFileProver::new(
+                self.chain.clone(),
+                header_index,
+                &self.root.join("forest"),
+                self.root.join("journal"),
+                &self.root.join("leaf-map"),
+                proof_file.clone(),
+                proof_index.clone(),
+                1,
+                false,
+                1 << 20,
+                Arc::new(AtomicBool::new(false)),
+                sender,
+            )
+            .unwrap();
+            (prover, proof_file, proof_index, receiver)
+        }
+    }
+
+    impl Drop for PersistenceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushGate {
+        released: Mutex<bool>,
+        changed: parking_lot::Condvar,
+    }
+
+    impl FlushGate {
+        fn wait(&self) {
+            let mut released = self.released.lock();
+            while !*released {
+                self.changed.wait(&mut released);
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn asynchronous_persistence_proves_during_flush_and_reopens() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, notifications) = fixture.open();
+        let baseline = prover.acc.read().unwrap().roots().unwrap();
+        prover.prove_range_inner(2, 100).unwrap();
+        assert_eq!(prover.pending_apply.len(), 99);
+        assert_eq!(index.load_height().unwrap(), 1);
+        assert_eq!(prover.acc.read().unwrap().roots().unwrap(), baseline);
+        assert_eq!(
+            std::fs::metadata(fixture.root.join("proofs"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(notifications.try_recv().is_err());
+        for height in 2..=100 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            assert!(prover
+                .header_index
+                .get_by_height(height as u32)
+                .unwrap()
+                .is_none());
+            assert!(index.get_index(hash).unwrap().is_none());
+        }
+
+        let publication_gate = Arc::new(FlushGate::default());
+        let apply_gate = Arc::new(FlushGate::default());
+        let worker_publication_gate = Arc::clone(&publication_gate);
+        let worker_apply_gate = Arc::clone(&apply_gate);
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (applying, apply_waiting) = std::sync::mpsc::sync_channel(1);
+        let (limited, limit_waiting) = std::sync::mpsc::sync_channel(1);
+        let flushes = Arc::new(Mutex::new(Vec::new()));
+        let worker_flushes = Arc::clone(&flushes);
+        *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+            if stage == "before_publication" && height == 101 {
+                entered.send(()).unwrap();
+                worker_publication_gate.wait();
+            }
+            if stage == "state_flush" {
+                worker_flushes.lock().push(height);
+                if height == 101 {
+                    applying.send(()).unwrap();
+                    worker_apply_gate.wait();
+                }
+            }
+            if stage == "backpressure" {
+                let _ = limited.try_send(());
+            }
+            Ok(())
+        }));
+        prover.prove_range_inner(101, 101).unwrap();
+        let reached_publication = waiting.recv_timeout(Duration::from_secs(30));
+        if reached_publication.is_err() {
+            publication_gate.release();
+            apply_gate.release();
+        }
+        reached_publication.unwrap();
+        assert_eq!(prover.submitted_blocks, PUBLICATION_BLOCKS);
+        assert!(prover.publication_window.is_empty());
+        assert_eq!(index.load_height().unwrap(), 1);
+        assert_eq!(prover.acc.read().unwrap().roots().unwrap(), baseline);
+        assert_eq!(
+            std::fs::metadata(fixture.root.join("proofs"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(notifications.try_recv().is_err());
+
+        // Cache eviction must resolve unpublished additions through the overlay.
+        prover.pollard_memory_limit = 1;
+        prover.enforce_pollard_memory_limit().unwrap();
+        prover.leaf_data.clear();
+        prover.prove_range_inner(102, 200).unwrap();
+        assert_eq!(prover.pending_apply.len(), MAX_PENDING_BLOCKS - 1);
+        // Pollard is thread-local: move only the gate observer, not the prover.
+        let observer_index = Arc::clone(&index);
+        let observer = std::thread::spawn(move || {
+            let bounded = limit_waiting.recv_timeout(Duration::from_secs(30));
+            publication_gate.release();
+            let applying = apply_waiting.recv_timeout(Duration::from_secs(30));
+            let applied_height = observer_index.load_height();
+            let premature_notification = notifications.try_recv().is_ok();
+            apply_gate.release();
+            bounded.unwrap();
+            applying.unwrap();
+            assert_eq!(applied_height.unwrap(), 1);
+            assert!(!premature_notification);
+            notifications
+        });
+        prover.prove_range(201, 204).unwrap();
+        let roots = pollard_stump_roots(&prover.pollard);
+        prover.sync_for_shutdown().unwrap();
+        let notifications = observer.join().unwrap();
+        drop(prover);
+        assert_eq!(*flushes.lock(), [101, 201, 204]);
+        assert_eq!(index.load_height().unwrap(), 204);
+        let mut expected_proofs = Vec::new();
+        for height in 2..=204 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            assert_eq!(
+                notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
+                hash
+            );
+            expected_proofs.push(
+                proofs
+                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(notifications.try_recv().is_err());
+        drop(proofs);
+        drop(index);
+        let (mut reopened, proofs, index, _) = fixture.open();
+        assert_eq!(reopened.height, 204);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+        for (height, expected) in (2..=204).zip(expected_proofs) {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            assert_eq!(
+                proofs
+                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn completed_ranges_publish_partial_windows_before_returning() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, notifications) = fixture.open();
+        prover.prove_range(2, 3).unwrap();
+        assert_eq!(index.load_height().unwrap(), 3);
+        assert!(prover.pending_apply.is_empty());
+        prover.prove_range(4, 4).unwrap();
+        assert_eq!(index.load_height().unwrap(), 4);
+        prover.prove_range(5, 5).unwrap();
+        assert_eq!(index.load_height().unwrap(), 5);
+        let roots = pollard_stump_roots(&prover.pollard);
+        for height in 2..=5 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            let stored = index.get_index(hash).unwrap().unwrap();
+            assert!(proofs.get(&stored).is_some());
+        }
+        for height in 2..=5 {
+            assert_eq!(
+                notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
+                fixture.chain.get_block_hash(height).unwrap()
+            );
+        }
+        prover.sync_for_shutdown().unwrap();
+        drop(prover);
+        drop(proofs);
+        drop(index);
+        let (mut reopened, _, _, _) = fixture.open();
+        assert_eq!(reopened.height, 5);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn drop_discards_even_fully_written_unpublished_suffix() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, notifications) = fixture.open();
+        let roots = pollard_stump_roots(&prover.pollard);
+        prover.prove_range_inner(2, 100).unwrap();
+        // Make the suffix physically durable without publishing its boundary.
+        prover.journal.lock().flush().unwrap();
+        assert_eq!(index.load_height().unwrap(), 1);
+        assert!(notifications.try_recv().is_err());
+        drop(prover);
+        drop(proofs);
+        drop(index);
+        let (mut reopened, _, index, _) = fixture.open();
+        assert_eq!(reopened.height, 1);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+        assert!(reopened.journal.lock().records().is_empty());
+        assert!(reopened.header_index.get_by_height(2).unwrap().is_none());
+        assert!(index
+            .get_index(fixture.chain.get_block_hash(2).unwrap())
+            .unwrap()
+            .is_none());
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn reopen_keeps_published_window_and_discards_written_next_window() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, notifications) = fixture.open();
+        prover.prove_range(2, 101).unwrap();
+        prover.drain_pending_apply().unwrap();
+        let roots = pollard_stump_roots(&prover.pollard);
+        assert_eq!(notifications.try_iter().count(), PUBLICATION_BLOCKS);
+        prover.prove_range_inner(102, 108).unwrap();
+        prover.journal.lock().flush().unwrap();
+        assert_eq!(index.load_height().unwrap(), 101);
+        assert!(notifications.try_recv().is_err());
+        drop(prover);
+        drop(proofs);
+        drop(index);
+        let (mut reopened, proofs, index, _) = fixture.open();
+        assert_eq!(reopened.height, 101);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+        for height in 2..=101 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            assert!(proofs
+                .get(&index.get_index(hash).unwrap().unwrap())
+                .is_some());
+        }
+        assert!(reopened.header_index.get_by_height(102).unwrap().is_none());
+        assert!(index
+            .get_index(fixture.chain.get_block_hash(102).unwrap())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reopened
+                .journal
+                .lock()
+                .records()
+                .last()
+                .unwrap()
+                .entry
+                .height,
+            101
+        );
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn published_journal_recovers_missing_headers_proofs_and_forest() {
+        for stage in ["before_publication", "journal", "state_flush"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, proofs, index, notifications) = fixture.open();
+            let baseline = pollard_stump_roots(&prover.pollard);
+            *prover.persistence.hook.lock() = Some(Arc::new(move |at, _| {
+                if at == stage {
+                    anyhow::bail!("injected persistence failure");
+                }
+                Ok(())
+            }));
+            prover.prove_range_inner(2, 4).unwrap();
+            let advanced = pollard_stump_roots(&prover.pollard);
+            let expected = prover
+                .publication_window
+                .iter()
+                .map(|block| {
+                    (
+                        block.entry.block_hash,
+                        Arc::clone(&block.proof),
+                        block.proof_forest_rows,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(prover.sync().is_err());
+            assert!(prover.prove_range(5, 5).is_err());
+            assert!(prover.sync_for_shutdown().is_err());
+            assert_eq!(index.load_height().unwrap(), 1);
+            assert!(notifications.try_recv().is_err());
+            if stage == "journal" {
+                assert!(prover.header_index.get_by_height(2).unwrap().is_none());
+                assert_eq!(
+                    std::fs::metadata(fixture.root.join("proofs"))
+                        .unwrap()
+                        .len(),
+                    0
+                );
+            }
+            drop(prover);
+            drop(proofs);
+            drop(index);
+            let (mut reopened, proofs, index, _) = fixture.open();
+            if stage == "before_publication" {
+                assert_eq!(reopened.height, 1);
+                assert_eq!(pollard_stump_roots(&reopened.pollard), baseline);
+            } else {
+                assert_eq!(reopened.height, 4);
+                assert_eq!(pollard_stump_roots(&reopened.pollard), advanced);
+                for (offset, (hash, expected, rows)) in expected.into_iter().enumerate() {
+                    let stored = index.get_index(hash).unwrap().unwrap();
+                    assert_eq!(stored.proof_forest_rows, Some(rows));
+                    assert_eq!(proofs.get(&stored).as_ref(), Some(expected.as_ref()));
+                    assert_eq!(
+                        reopened
+                            .header_index
+                            .get_by_height(offset as u32 + 2)
+                            .unwrap()
+                            .unwrap()
+                            .block_hash(),
+                        hash
+                    );
+                }
+            }
+            reopened.sync_for_shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn published_journal_repairs_interior_proof_gap_without_truncating_redo() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, _) = fixture.open();
+        prover.prove_range(2, 5).unwrap();
+        prover.sync().unwrap();
+        let expected = (2..=5)
+            .map(|height| {
+                let hash = fixture.chain.get_block_hash(height).unwrap();
+                (
+                    hash,
+                    proofs
+                        .get(&index.get_index(hash).unwrap().unwrap())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let missing_hash = fixture.chain.get_block_hash(3).unwrap();
+        index.remove(missing_hash).unwrap();
+        prover.header_index.remove(3, missing_hash).unwrap();
+        prover.header_index.sync().unwrap();
+        drop(prover);
+        drop(proofs);
+        drop(index);
+        let (mut reopened, proofs, index, _) = fixture.open();
+        assert_eq!(reopened.height, 5);
+        for (hash, expected) in expected {
+            assert_eq!(
+                proofs
+                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            reopened
+                .header_index
+                .get_by_height(3)
+                .unwrap()
+                .unwrap()
+                .block_hash(),
+            missing_hash
+        );
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_pipeline_discards_speculation_before_reorg() {
+        let fixture = Arc::new(PersistenceFixture::new());
+        let (mut prover, proofs, index, notifications) = fixture.open();
+        let gate = Arc::new(FlushGate::default());
+        let worker_gate = Arc::clone(&gate);
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+            if stage == "journal" && height == 101 {
+                entered.send(()).unwrap();
+                worker_gate.wait();
+            }
+            Ok(())
+        }));
+        prover.prove_range_inner(2, 100).unwrap();
+        let roots_at_100 = pollard_stump_roots(&prover.pollard);
+        prover.prove_range_inner(101, 104).unwrap();
+        fixture.chain.blocks.lock().truncate(101);
+        let observer = std::thread::spawn(move || {
+            let entered = waiting.recv_timeout(Duration::from_secs(30));
+            gate.release();
+            entered.unwrap();
+        });
+        assert_eq!(prover.reconcile_chain().unwrap(), 4);
+        assert_eq!(prover.height, 100);
+        assert!(prover.publication_window.is_empty());
+        assert!(prover.pending_apply.is_empty());
+        assert_eq!(pollard_stump_roots(&prover.pollard), roots_at_100);
+        prover.sync_for_shutdown().unwrap();
+        observer.join().unwrap();
+        drop(prover);
+        assert_eq!(index.load_height().unwrap(), 100);
+        assert_eq!(notifications.try_iter().count(), PUBLICATION_BLOCKS);
+        drop(proofs);
+        drop(index);
+        let (mut reopened, _, index, _) = fixture.open();
+        assert_eq!(reopened.height, 100);
+        assert_eq!(pollard_stump_roots(&reopened.pollard), roots_at_100);
+        assert!(index
+            .get_index(fixture.chain.get_block_hash(100).unwrap())
+            .unwrap()
+            .is_some());
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn capacity_barrier_explicitly_publishes_partial_window() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, _, index, notifications) = fixture.open();
+        prover.prove_range_inner(2, 4).unwrap();
+        let capacity = prover.acc.read().unwrap().leaf_capacity().unwrap();
+        prover.ensure_forest_capacity(capacity as usize).unwrap();
+        assert_eq!(index.load_height().unwrap(), 4);
+        assert!(prover.pending_apply.is_empty());
+        assert_eq!(notifications.try_iter().count(), 3);
+        assert!(prover.acc.read().unwrap().leaf_capacity().unwrap() > capacity);
+        prover.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn resized_journal_replays_and_rolls_back_across_layouts() {
+        let fixture = PersistenceFixture::new();
+        let (roots_at_two, roots_at_six, resized_rows) = {
+            let (mut prover, _, _, _) = fixture.open();
+            prover.prove_range(2, 2).unwrap();
+            prover.sync().unwrap();
+            let roots_at_two = pollard_stump_roots(&prover.pollard);
+            prover.prove_range(3, 4).unwrap();
+            let capacity = prover.acc.read().unwrap().leaf_capacity().unwrap();
+            prover.ensure_forest_capacity(capacity as usize).unwrap();
+            let resized_rows = prover.acc.read().unwrap().forest_rows();
+            prover.prove_range(5, 6).unwrap();
+            prover.sync().unwrap();
+            // No clean-shutdown marker: reopening must replay both layouts.
+            (
+                roots_at_two,
+                pollard_stump_roots(&prover.pollard),
+                resized_rows,
+            )
+        };
+        {
+            let (mut prover, _, index, _) = fixture.open();
+            assert_eq!(prover.height, 6);
+            assert_eq!(pollard_stump_roots(&prover.pollard), roots_at_six);
+            assert_eq!(prover.acc.read().unwrap().forest_rows(), resized_rows);
+            fixture.chain.blocks.lock().truncate(3);
+            assert_eq!(prover.reconcile_chain().unwrap(), 4);
+            assert_eq!(index.load_height().unwrap(), 2);
+            assert_eq!(pollard_stump_roots(&prover.pollard), roots_at_two);
+            // Rolled-back records from both layouts must also replay correctly.
+        }
+        let (mut prover, _, _, _) = fixture.open();
+        assert_eq!(prover.height, 2);
+        assert_eq!(pollard_stump_roots(&prover.pollard), roots_at_two);
+        prover.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_proofs_for_reactivated_blocks() {
+        let fixture = PersistenceFixture::new();
+        let expected_roots = {
+            let (mut prover, _, _, _) = fixture.open();
+            prover.prove_range(2, 4).unwrap();
+            prover.sync().unwrap();
+            let expected_roots = pollard_stump_roots(&prover.pollard);
+            let detached = fixture.chain.blocks.lock().split_off(3);
+            assert_eq!(prover.reconcile_chain().unwrap(), 2);
+            fixture.chain.blocks.lock().extend(detached);
+            prover.prove_range(3, 4).unwrap();
+            prover.sync().unwrap();
+            expected_roots
+        };
+        let (mut prover, proofs, index, _) = fixture.open();
+        assert_eq!(prover.height, 4);
+        assert_eq!(pollard_stump_roots(&prover.pollard), expected_roots);
+        for height in 2..=4 {
+            let hash = fixture.chain.get_block_hash(height).unwrap();
+            let entry = index.get_index(hash).unwrap().unwrap();
+            assert!(proofs.get(&entry).is_some());
+            assert_eq!(
+                prover.header_index.get_height(hash).unwrap(),
+                Some(height as u32)
+            );
+        }
+        prover.sync_for_shutdown().unwrap();
+    }
+
+    fn leaf(outpoint: OutPoint) -> LeafContext {
+        LeafContext {
+            block_hash: BlockHash::all_zeros(),
+            txid: outpoint.txid,
+            vout: outpoint.vout,
+            value: 42,
+            pk_script: ScriptBuf::new(),
+            block_height: 10,
+            is_coinbase: false,
+        }
+    }
+
+    #[test]
+    fn startup_rolls_back_past_a_skipped_proof_height() {
+        let root =
+            std::env::temp_dir().join(format!("bridge-skipped-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut header_11 = genesis_block(Network::Signet).header;
+        header_11.nonce = 11;
+        let hash_11 = header_11.block_hash();
+        let mut header_12 = header_11;
+        header_12.prev_blockhash = hash_11;
+        header_12.nonce = 12;
+        let hash_12 = header_12.block_hash();
+        let mut header_13 = header_12;
+        header_13.prev_blockhash = hash_12;
+        header_13.nonce = 13;
+        let hash_13 = header_13.block_hash();
+        let header_index =
+            HeaderIndex::create(&root.join("headers"), &root.join("header-index"), 13).unwrap();
+        for (height, header) in [(11, &header_11), (12, &header_12), (13, &header_13)] {
+            header_index.put(height, header).unwrap();
+        }
+        header_index.sync().unwrap();
+
+        let mut journal = ForestJournal::open(root.join("journal")).unwrap();
+        for (height, block_hash, previous_block_hash) in [
+            (11, hash_11, BlockHash::from_byte_array([10; 32])),
+            (12, hash_12, hash_11),
+            (13, hash_13, hash_12),
+        ] {
+            journal
+                .append(JournalEntry {
+                    height,
+                    forest_rows: None,
+                    block_hash,
+                    num_leaves: 100 + u64::from(height),
+                    previous_block_hash,
+                    forest: Vec::new(),
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                })
+                .unwrap();
+        }
+        journal
+            .publisher()
+            .unwrap()
+            .publish(journal.boundary())
+            .unwrap();
+
+        let proof_file = ProofFile::new(root.join("proofs")).unwrap();
+        let proof = CompactBlockProof::default();
+        let index_11 = proof_file.append(&proof).unwrap();
+        let index_13 = proof_file.append(&proof).unwrap();
+        proof_file.sync().unwrap();
+        let proof_index = BlocksIndex {
+            database: kv::Store::new(kv::Config {
+                path: root.join("proof-index"),
+                temporary: false,
+                use_compression: false,
+                flush_every_ms: None,
+                cache_capacity: None,
+                segment_size: None,
+            })
+            .unwrap(),
+        };
+        proof_index.append(index_11, hash_11).unwrap();
+        proof_index.append(index_13, hash_13).unwrap();
+        proof_index.update_height(13).unwrap();
+
+        assert_eq!(
+            recoverable_journal_height(
+                &mut journal,
+                &header_index,
+                &proof_index,
+                &proof_file,
+                13,
+                10,
+            )
+            .unwrap(),
+            11
+        );
+        assert_eq!(journal.records()[0].status, JournalStatus::Forward);
+        assert_eq!(journal.records()[1].status, JournalStatus::RolledBack);
+        assert_eq!(journal.records()[2].status, JournalStatus::RolledBack);
+
+        header_index.close().unwrap();
+        drop(proof_index);
+        drop(proof_file);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn steady_leaf_cache_bypasses_fallback_fetch() {
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([1; 32]),
+            vout: 2,
+        };
+        let mut cache = HashMap::new();
+        cache.insert(
+            outpoint,
+            CachedLeaf {
+                context: leaf(outpoint),
+                position: 7,
+            },
+        );
+        let mut fetched = false;
+
+        let (cached, hit) = cached_leaf_context(&cache, outpoint, || {
+            fetched = true;
+            anyhow::bail!("fallback must not run for a cache hit")
+        })
+        .unwrap();
+
+        assert!(hit);
+        assert!(!fetched);
+        assert_eq!(cached.txid, outpoint.txid);
+        assert_eq!(cached.vout, outpoint.vout);
+    }
+
+    #[test]
+    fn steady_leaf_position_cache_survives_pollard_eviction() {
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([3; 32]),
+            vout: 4,
+        };
+        let cached = CachedLeaf {
+            context: leaf(outpoint),
+            position: 7,
+        };
+
+        assert_eq!(cached_bottom_position(None, Some(&cached)), Some(7));
+        assert_eq!(
+            cached_bottom_position(Some(9), Some(&cached)),
+            Some(9),
+            "the Pollard remains the preferred position cache"
+        );
+    }
+
+    #[test]
+    fn steady_leaf_cache_uses_fallback_on_miss() {
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([2; 32]),
+            vout: 3,
+        };
+        let mut fetched = false;
+
+        let (leaf, hit) = cached_leaf_context(&HashMap::new(), outpoint, || {
+            fetched = true;
+            Ok(leaf(outpoint))
+        })
+        .unwrap();
+
+        assert!(!hit);
+        assert!(fetched);
+        assert_eq!(leaf.value, 42);
+    }
+
+    #[test]
+    fn pollard_quota_evicts_oldest_leaves_to_low_watermark() {
+        let additions = (0u8..64)
+            .map(|value| PollardAddition {
+                hash: BitcoinNodeHash::from([value; 32]),
+                remember: true,
+            })
+            .collect::<Vec<_>>();
+        let mut pollard = Pollard::new();
+        pollard.modify(&additions, &[], &Proof::default()).unwrap();
+        let mut leaves = BinaryHeap::new();
+        for (position, addition) in additions.iter().enumerate() {
+            leaves.push(Reverse(CachedPollardLeaf {
+                creation_height: position as u32,
+                position: position as u64,
+                hash: addition.hash,
+            }));
+        }
+        let quota = pollard.estimated_memory_usage();
+        let (evicted, before, after) =
+            evict_pollard_cache(&mut pollard, &mut leaves, quota).unwrap();
+
+        assert!(evicted > 0);
+        assert_eq!(before, quota);
+        assert!(
+            after <= quota / 5,
+            "before={before} after={after} target={} evicted={evicted} nodes={}",
+            quota / 5,
+            pollard.cached_nodes()
+        );
+        assert_eq!(pollard.position_hash(0), None);
+        assert_eq!(pollard.leaf_position(&additions[0].hash), None);
+        assert_eq!(pollard.position_hash(63), Some(additions[63].hash));
+        assert_eq!(pollard.leaf_position(&additions[63].hash), Some(63));
+    }
 }
