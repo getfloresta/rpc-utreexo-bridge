@@ -7,7 +7,6 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -96,14 +95,11 @@ struct SteadyBlockTimings {
 }
 
 const PUBLICATION_BLOCKS: usize = 100;
-// One submitted window and one accumulating window. A byte gate cannot stop a
-// partial window: only publication makes its memory eligible for retirement.
-const MAX_PENDING_BLOCKS: usize = 2 * PUBLICATION_BLOCKS;
+const APPLICATION_BLOCKS: usize = 100;
 
 #[derive(Default)]
 struct ApplyTimings {
     blocks: usize,
-    publication: Duration,
     apply: Duration,
     state_flush: Duration,
     proof_store: Duration,
@@ -126,15 +122,9 @@ struct PersistenceBlock {
     proof_forest_rows: u8,
 }
 
-enum PersistenceCommand {
-    Publish {
-        blocks: Vec<PersistenceBlock>,
-        boundary: JournalBoundary,
-    },
-    Barrier {
-        operation: PersistenceBarrier,
-        completion: std::sync::mpsc::SyncSender<anyhow::Result<DurableTip>>,
-    },
+struct PersistenceCommand {
+    operation: PersistenceBarrier,
+    completion: std::sync::mpsc::SyncSender<anyhow::Result<DurableTip>>,
 }
 
 enum PersistenceBarrier {
@@ -152,7 +142,6 @@ type PersistenceHook = Arc<dyn Fn(&str, u32) -> anyhow::Result<()> + Send + Sync
 struct PersistenceState {
     forest: Arc<RwLock<SteadyStateForest>>,
     journal: Arc<Mutex<ForestJournal>>,
-    publisher: JournalPublisher,
     proof_file: Arc<ProofFile>,
     proof_index: Arc<BlocksIndex>,
     header_index: Arc<HeaderIndex>,
@@ -160,6 +149,7 @@ struct PersistenceState {
     height: u32,
     tip_hash: BlockHash,
     bootstrap_height: u32,
+    applied_count: u64,
     #[cfg(test)]
     hook: Arc<Mutex<Option<PersistenceHook>>>,
 }
@@ -168,7 +158,7 @@ impl PersistenceState {
     fn persist(
         &mut self,
         blocks: &[PersistenceBlock],
-        boundary: JournalBoundary,
+        applied_count: u64,
     ) -> anyhow::Result<ApplyTimings> {
         let last = blocks.last().context("empty persistence batch")?;
         let mut height = self.height;
@@ -184,14 +174,8 @@ impl PersistenceState {
             blocks: blocks.len(),
             ..Default::default()
         };
-        let started = Instant::now();
         #[cfg(test)]
-        self.checkpoint("before_publication", last.entry.height)?;
-        self.publisher.publish(boundary)?;
-        timings.publication = started.elapsed();
-        #[cfg(test)]
-        self.checkpoint("journal", last.entry.height)?;
-
+        self.checkpoint("before_apply", last.entry.height)?;
         let started = Instant::now();
         let mut indexes = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -219,13 +203,23 @@ impl PersistenceState {
 
         let started = Instant::now();
         let entries: Vec<_> = blocks.iter().map(|block| block.entry.as_ref()).collect();
-        {
-            let mut forest = self
+        let applied = {
+            // All in-flight touched positions and outpoints remain in the producer
+            // overlay until the durable applied cursor is acknowledged. Consequently
+            // ForestView reads only disjoint, unchanged disk records during this I/O.
+            let forest = self
                 .forest
-                .write()
+                .read()
                 .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
-            forest.apply_forward_batch(&entries)?;
-        }
+            let prepared = forest.prepare_forward_batch(&entries)?;
+            #[cfg(test)]
+            self.checkpoint("apply_io", last.entry.height)?;
+            forest.apply_prepared_batch(prepared)?
+        };
+        self.forest
+            .write()
+            .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?
+            .commit_forward_batch(applied)?;
         timings.apply = started.elapsed();
         let started = Instant::now();
         {
@@ -244,11 +238,10 @@ impl PersistenceState {
         timings.height_commit = started.elapsed();
         self.height = last.entry.height;
         self.tip_hash = last.entry.block_hash;
-        let prune = self.journal.lock().prepare_prune(144)?;
+        self.applied_count = applied_count;
+        let prune = self.journal.lock().prepare_prune(144, applied_count)?;
         if let Some(prune) = prune {
-            if let Err(error) = prune.finish() {
-                warn!("journal pruning failed; retaining older recovery records: {error:#}");
-            }
+            prune.finish()?;
         }
         for block in blocks {
             let _ = self.block_notification.send(block.entry.block_hash);
@@ -330,7 +323,7 @@ impl PersistenceState {
                     let (index, record) = journal.latest_forward().context(
                         "reorg exceeds retained journal; rebuild from a newer bootstrap",
                     )?;
-                    (index, Arc::clone(&record.entry))
+                    (index, journal.read_record(record)?.entry)
                 };
                 if (entry.height, entry.block_hash) != (height, hash) {
                     anyhow::bail!("rollback journal does not match the durable tip");
@@ -381,75 +374,169 @@ impl PersistenceState {
     }
 }
 
+#[derive(Default)]
+struct PersistenceProgress {
+    applied_count: u64,
+    applied_height: u32,
+    error: Option<String>,
+    stopping: bool,
+}
+
+struct PersistenceSignal {
+    progress: Mutex<PersistenceProgress>,
+    changed: parking_lot::Condvar,
+}
+
+impl PersistenceSignal {
+    fn fail(&self, error: &anyhow::Error) {
+        self.progress.lock().error = Some(format!("{error:#}"));
+        self.changed.notify_all();
+    }
+}
+
+/// Independent publication and state threads exchange metadata, never decoded payloads.
+/// Completion is a coalesced cursor, never a bounded message queue.
 struct PersistenceWorker {
-    sender: Option<std::sync::mpsc::SyncSender<PersistenceCommand>>,
-    completions: std::sync::mpsc::Receiver<anyhow::Result<ApplyTimings>>,
-    error: Arc<Mutex<Option<String>>>,
+    publisher: Option<Sender<JournalBoundary>>,
+    sender: Sender<PersistenceCommand>,
+    signal: Arc<PersistenceSignal>,
+    publication_handle: Option<std::thread::JoinHandle<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     hook: Arc<Mutex<Option<PersistenceHook>>>,
 }
 
 impl PersistenceWorker {
-    fn new(mut state: PersistenceState) -> anyhow::Result<Self> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let (completed, completions) = std::sync::mpsc::sync_channel(1);
-        let error = Arc::new(Mutex::new(None));
-        let worker_error = Arc::clone(&error);
+    fn new(mut state: PersistenceState, publisher: JournalPublisher) -> anyhow::Result<Self> {
+        let reader = state.journal.lock().reader()?;
+        let signal = Arc::new(PersistenceSignal {
+            progress: Mutex::new(PersistenceProgress {
+                applied_count: state.applied_count,
+                applied_height: state.height,
+                ..Default::default()
+            }),
+            changed: parking_lot::Condvar::new(),
+        });
+        let (sender, receiver) = std::sync::mpsc::channel::<PersistenceCommand>();
+        let (publication_sender, publication_receiver) =
+            std::sync::mpsc::channel::<JournalBoundary>();
         #[cfg(test)]
         let hook = Arc::clone(&state.hook);
-        let handle = std::thread::Builder::new()
-            .name("bridge-persistence".to_string())
-            .spawn(move || loop {
-                let command = match receiver.recv() {
-                    Ok(command) => command,
-                    Err(_) => break,
-                };
-                let (failure, shutdown) = match command {
-                    PersistenceCommand::Publish { blocks, boundary } => {
-                        let result = state.persist(&blocks, boundary);
-                        let result = result.map_err(|error| {
-                            *worker_error.lock() = Some(format!("{error:#}"));
-                            state.finish_failed(error)
-                        });
-                        let failure = result.as_ref().err().map(|error| format!("{error:#}"));
-                        if let Some(error) = &failure {
-                            *worker_error.lock() = Some(error.clone());
-                        }
-                        let _ = completed.send(result);
-                        (failure, false)
+        #[cfg(test)]
+        let publication_hook = Arc::clone(&state.hook);
+        let publication_signal = Arc::clone(&signal);
+        let publication_handle = std::thread::Builder::new()
+            .name("bridge-wal-publisher".to_string())
+            .spawn(move || {
+                while let Ok(boundary) = publication_receiver.recv() {
+                    if publication_signal.progress.lock().error.is_some() {
+                        break;
                     }
-                    PersistenceCommand::Barrier {
-                        operation,
-                        completion,
-                    } => {
-                        let shutdown = matches!(
-                            operation,
-                            PersistenceBarrier::Sync {
-                                clean_shutdown: true
+                    let result = (|| -> anyhow::Result<()> {
+                        #[cfg(test)]
+                        {
+                            let hook = publication_hook.lock().clone();
+                            if let Some(hook) = hook {
+                                hook("before_publication", boundary.height())?;
                             }
-                        );
-                        let result = state.barrier(operation);
-                        let result = result.map_err(|error| {
-                            *worker_error.lock() = Some(format!("{error:#}"));
-                            state.finish_failed(error)
-                        });
-                        let failure = result.as_ref().err().map(|error| format!("{error:#}"));
-                        if let Some(error) = &failure {
-                            *worker_error.lock() = Some(error.clone());
                         }
-                        let _ = completion.send(result);
-                        (failure, shutdown)
+                        publisher.publish(boundary)?;
+                        #[cfg(test)]
+                        {
+                            let hook = publication_hook.lock().clone();
+                            if let Some(hook) = hook {
+                                hook("journal", boundary.height())?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        publication_signal.fail(&error);
+                        break;
                     }
-                };
-                if failure.is_some() || shutdown {
-                    break;
+                    let _progress = publication_signal.progress.lock();
+                    publication_signal.changed.notify_all();
                 }
             })?;
+        let state_signal = Arc::clone(&signal);
+        let handle_result = std::thread::Builder::new()
+            .name("bridge-state-flusher".to_string())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    loop {
+                        let mut progress = state_signal.progress.lock();
+                        if progress.error.is_some() { return Ok(()); }
+                        let records = state.journal.lock()
+                            .records_after(state.applied_count, APPLICATION_BLOCKS);
+                        if !records.is_empty() {
+                            drop(progress);
+                            let mut blocks = Vec::with_capacity(records.len());
+                            for record in &records {
+                                let payload = reader.read_record(record)?;
+                                if payload.status != JournalStatus::Forward {
+                                    anyhow::bail!("state tail encountered an unexpected rollback");
+                                }
+                                let replay = payload.replay.context("published block has no replay payload")?;
+                                blocks.push(PersistenceBlock {
+                                    entry: payload.entry,
+                                    header: replay.header,
+                                    proof: Arc::clone(&replay.proof),
+                                    proof_forest_rows: replay.proof_forest_rows,
+                                });
+                            }
+                            let count = records.last().unwrap().count;
+                            let timings = state.persist(&blocks, count)?;
+                            debug!(
+                                "background-persistence height={} blocks={} apply={:?} state_flush={:?} proof_store={:?} header_store={:?} proof_index_write={:?} height_commit={:?}",
+                                state.height, timings.blocks, timings.apply, timings.state_flush,
+                                timings.proof_store, timings.header_store, timings.proof_index_write, timings.height_commit
+                            );
+                            let mut progress = state_signal.progress.lock();
+                            progress.applied_count = state.applied_count;
+                            progress.applied_height = state.height;
+                            state_signal.changed.notify_all();
+                            continue;
+                        }
+                        if let Ok(command) = receiver.try_recv() {
+                            drop(progress);
+                            let shutdown = matches!(command.operation, PersistenceBarrier::Sync { clean_shutdown: true });
+                            let result = state.barrier(command.operation).map_err(|error| {
+                                state_signal.fail(&error);
+                                let error = state.finish_failed(error);
+                                state_signal.fail(&error);
+                                error
+                            });
+                            let failed = result.is_err();
+                            let _ = command.completion.send(result);
+                            if failed { return Ok(()); }
+                            if shutdown { return Ok(()); }
+                            let mut progress = state_signal.progress.lock();
+                            progress.applied_height = state.height;
+                            continue;
+                        }
+                        if progress.stopping { return Ok(()); }
+                        state_signal.changed.wait(&mut progress);
+                    }
+                })();
+                if let Err(error) = result {
+                    state_signal.fail(&error);
+                    let error = state.finish_failed(error);
+                    state_signal.fail(&error);
+                }
+            });
+        let handle = match handle_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(publication_sender);
+                let _ = publication_handle.join();
+                return Err(error.into());
+            }
+        };
         Ok(Self {
-            sender: Some(sender),
-            completions,
-            error,
+            publisher: Some(publication_sender),
+            sender,
+            signal,
+            publication_handle: Some(publication_handle),
             handle: Some(handle),
             #[cfg(test)]
             hook,
@@ -457,43 +544,92 @@ impl PersistenceWorker {
     }
 
     fn check(&self) -> anyhow::Result<()> {
-        if let Some(error) = self.error.lock().as_ref() {
+        if let Some(error) = self.signal.progress.lock().error.as_ref() {
             anyhow::bail!("background persistence failed: {error}");
         }
         if self
             .handle
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
+            || self
+                .publication_handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
         {
             anyhow::bail!("background persistence worker stopped");
         }
         Ok(())
     }
 
-    fn send(&self, command: PersistenceCommand) -> anyhow::Result<()> {
+    fn publish(&self, boundary: JournalBoundary) -> anyhow::Result<()> {
         self.check()?;
-        self.sender
+        self.publisher
             .as_ref()
-            .context("persistence worker stopped")?
-            .send(command)
-            .map_err(|_| anyhow::anyhow!("persistence worker stopped"))
+            .context("publisher stopped")?
+            .send(boundary)
+            .context("publisher stopped")
+    }
+
+    fn wait_applied(&self, count: u64) -> anyhow::Result<()> {
+        let mut progress = self.signal.progress.lock();
+        loop {
+            if let Some(error) = &progress.error {
+                anyhow::bail!("background persistence failed: {error}");
+            }
+            if progress.applied_count >= count {
+                return Ok(());
+            }
+            if self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+                || self
+                    .publication_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_finished())
+            {
+                anyhow::bail!("persistence worker stopped with outstanding blocks");
+            }
+            self.signal
+                .changed
+                .wait_for(&mut progress, Duration::from_millis(100));
+        }
     }
 
     fn barrier(&self, operation: PersistenceBarrier) -> anyhow::Result<DurableTip> {
+        self.check()?;
         let (completion, receiver) = std::sync::mpsc::sync_channel(1);
-        self.send(PersistenceCommand::Barrier {
-            operation,
-            completion,
-        })?;
-        receiver
-            .recv()
-            .context("persistence worker stopped during barrier")?
+        {
+            let _progress = self.signal.progress.lock();
+            self.sender
+                .send(PersistenceCommand {
+                    operation,
+                    completion,
+                })
+                .context("persistence worker stopped")?;
+            self.signal.changed.notify_all();
+        }
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.check()?,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.check()?;
+                    anyhow::bail!("persistence worker stopped during barrier");
+                }
+            }
+        }
     }
 }
 
 impl Drop for PersistenceWorker {
     fn drop(&mut self) {
-        self.sender.take();
+        self.publisher.take();
+        if let Some(handle) = self.publication_handle.take() {
+            let _ = handle.join();
+        }
+        self.signal.progress.lock().stopping = true;
+        self.signal.changed.notify_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -561,10 +697,6 @@ fn evict_pollard_cache(
     Ok((evicted, initial_usage, pollard.estimated_memory_usage()))
 }
 
-struct PendingApply {
-    entry: Arc<JournalEntry>,
-}
-
 struct PreparedBlock {
     entry: JournalEntry,
     proof_forest_rows: u8,
@@ -577,9 +709,10 @@ pub struct FlatFileProver {
     persistence: PersistenceWorker,
     acc: Arc<RwLock<SteadyStateForest>>,
     journal: Arc<Mutex<ForestJournal>>,
-    publication_window: Vec<PersistenceBlock>,
+    publication_window: usize,
     publication_boundary: Option<JournalBoundary>,
-    submitted_blocks: usize,
+    submitted_count: u64,
+    applied_count: u64,
     overlay: ForestOverlay,
     pollard: Pollard<BitcoinNodeHash>,
     pollard_leaves: BinaryHeap<Reverse<CachedPollardLeaf>>,
@@ -588,7 +721,6 @@ pub struct FlatFileProver {
     shutdown_flag: Arc<AtomicBool>,
     leaf_data: HashMap<OutPoint, CachedLeaf>,
     block_hash_cache: HashMap<u32, BlockHash>,
-    pending_apply: VecDeque<PendingApply>,
     tip_hash: BlockHash,
 }
 
@@ -608,6 +740,7 @@ fn recoverable_journal_height(
         if record.status != JournalStatus::Forward {
             continue;
         }
+        let record = journal.read_record(record)?;
         let Some(replay) = &record.replay else {
             continue;
         };
@@ -765,6 +898,7 @@ impl FlatFileProver {
                             .get_by_height(record.entry.height)?
                             .is_some_and(|header| header.block_hash() == record.entry.block_hash);
                     if !indexed {
+                        let record = journal.read_record(record)?;
                         let header = match &record.replay {
                             Some(replay) => replay.header,
                             None => rpc.get_block_header(record.entry.block_hash)?,
@@ -796,7 +930,7 @@ impl FlatFileProver {
                 record.entry.num_leaves,
             ),
             None if !journal.records().is_empty() => {
-                let first = &journal.records()[0].entry;
+                let first = journal.read_record(&journal.records()[0])?.entry;
                 (
                     first.height.saturating_sub(1),
                     first.previous_block_hash,
@@ -853,30 +987,35 @@ impl FlatFileProver {
         }
         let acc = Arc::new(RwLock::new(acc));
         let publisher = journal.publisher()?;
+        let applied_count = journal.published_count();
         let journal = Arc::new(Mutex::new(journal));
-        let persistence = PersistenceWorker::new(PersistenceState {
-            forest: Arc::clone(&acc),
-            journal: Arc::clone(&journal),
+        let persistence = PersistenceWorker::new(
+            PersistenceState {
+                forest: Arc::clone(&acc),
+                journal: Arc::clone(&journal),
+                proof_file,
+                proof_index,
+                header_index: Arc::clone(&header_index),
+                block_notification,
+                height,
+                tip_hash,
+                bootstrap_height,
+                applied_count,
+                #[cfg(test)]
+                hook: Arc::new(Mutex::new(None)),
+            },
             publisher,
-            proof_file,
-            proof_index,
-            header_index: Arc::clone(&header_index),
-            block_notification,
-            height,
-            tip_hash,
-            bootstrap_height,
-            #[cfg(test)]
-            hook: Arc::new(Mutex::new(None)),
-        })?;
+        )?;
         Ok(Self {
             rpc,
             header_index,
             persistence,
             acc,
             journal,
-            publication_window: Vec::with_capacity(PUBLICATION_BLOCKS),
+            publication_window: 0,
             publication_boundary: None,
-            submitted_blocks: 0,
+            submitted_count: applied_count,
+            applied_count,
             overlay: ForestOverlay::default(),
             pollard,
             pollard_leaves: BinaryHeap::new(),
@@ -885,7 +1024,6 @@ impl FlatFileProver {
             shutdown_flag,
             leaf_data: HashMap::new(),
             block_hash_cache,
-            pending_apply: VecDeque::new(),
             tip_hash,
         })
     }
@@ -917,105 +1055,41 @@ impl FlatFileProver {
         Ok(())
     }
 
-    fn retire_apply(&mut self, timings: ApplyTimings) -> anyhow::Result<()> {
-        let first_height = self
-            .pending_apply
-            .front()
-            .context("unexpected persistence completion")?
-            .entry
-            .height;
-        let mut height = first_height;
-        for _ in 0..timings.blocks {
-            let pending = self
-                .pending_apply
-                .pop_front()
-                .context("persistence batch exceeds pending blocks")?;
-            self.overlay.retire(&pending.entry);
-            height = pending.entry.height;
-        }
-        self.submitted_blocks = self
-            .submitted_blocks
-            .checked_sub(timings.blocks)
-            .context("persistence completion exceeds submitted window")?;
-        debug!(
-            "background-persistence height={height} first_height={first_height} blocks={} publication={:?} apply={:?} state_flush={:?} proof_store={:?} header_store={:?} proof_index_write={:?} height_commit={:?}",
-            timings.blocks, timings.publication, timings.apply, timings.state_flush,
-            timings.proof_store, timings.header_store, timings.proof_index_write, timings.height_commit
-        );
-        Ok(())
-    }
-
     fn collect_completed(&mut self) -> anyhow::Result<()> {
         self.persistence.check()?;
-        loop {
-            match self.persistence.completions.try_recv() {
-                Ok(result) => self.retire_apply(result?)?,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    anyhow::bail!("persistence completion channel closed");
-                }
-            }
+        let (applied_count, applied_height) = {
+            let progress = self.persistence.signal.progress.lock();
+            (progress.applied_count, progress.applied_height)
+        };
+        if applied_count > self.applied_count {
+            self.overlay.retire_through(applied_height);
+            self.applied_count = applied_count;
         }
-    }
-
-    fn wait_for_apply(&mut self) -> anyhow::Result<()> {
-        let result = self
-            .persistence
-            .completions
-            .recv()
-            .context("persistence worker stopped with outstanding blocks")?;
-        self.retire_apply(result?)
+        Ok(())
     }
 
     fn drain_pending_apply(&mut self) -> anyhow::Result<()> {
-        while self.submitted_blocks != 0 {
-            self.wait_for_apply()?;
-        }
-        self.persistence.check()
-    }
-
-    fn reserve_persistence(&mut self) -> anyhow::Result<()> {
-        self.collect_completed()?;
-        // Retain at most 200 protocol-bounded blocks, rather than 256 MiB. A byte
-        // gate on unpublished work would deadlock before reaching block 100.
-        while self.pending_apply.len() >= MAX_PENDING_BLOCKS {
-            #[cfg(test)]
-            {
-                let hook = self.persistence.hook.lock().clone();
-                if let Some(hook) = hook {
-                    hook("backpressure", self.height)?;
-                }
-            }
-            self.wait_for_apply()?;
-        }
-        Ok(())
+        self.persistence.wait_applied(self.submitted_count)?;
+        self.collect_completed()
     }
 
     fn publish_pending(&mut self) -> anyhow::Result<()> {
-        if self.publication_window.is_empty() {
+        if self.publication_window == 0 {
             return Ok(());
         }
-        // Production of the next window overlaps application, but at most one
-        // window is submitted at a time.
-        #[cfg(test)]
-        if self.submitted_blocks != 0 {
-            let hook = self.persistence.hook.lock().clone();
-            if let Some(hook) = hook {
-                hook("backpressure", self.height)?;
-            }
-        }
-        self.drain_pending_apply()?;
         let boundary = self
             .publication_boundary
             .take()
             .context("publication window has no journal boundary")?;
-        let blocks = std::mem::replace(
-            &mut self.publication_window,
-            Vec::with_capacity(PUBLICATION_BLOCKS),
-        );
-        self.submitted_blocks = blocks.len();
-        self.persistence
-            .send(PersistenceCommand::Publish { blocks, boundary })
+        self.persistence.publish(boundary)?;
+        self.submitted_count = boundary.count();
+        self.publication_window = 0;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pending_blocks(&self) -> u64 {
+        self.journal.lock().boundary().count() - self.applied_count
     }
 
     fn verify_durable_tip(&self, tip: &DurableTip) -> anyhow::Result<()> {
@@ -1074,14 +1148,13 @@ impl FlatFileProver {
                 break;
             }
             self.drain_pending_apply()?;
-            if !self.publication_window.is_empty() {
-                let discarded = self.publication_window.len() as u32;
+            if self.publication_window != 0 {
+                let discarded = self.publication_window as u32;
                 let tip = self
                     .persistence
                     .barrier(PersistenceBarrier::DiscardUnpublished)?;
-                self.publication_window.clear();
+                self.publication_window = 0;
                 self.publication_boundary = None;
-                self.pending_apply.clear();
                 self.overlay = ForestOverlay::default();
                 self.pollard = pollard_from_stump_roots(tip.roots, tip.leaves);
                 self.pollard_leaves.clear();
@@ -1136,7 +1209,7 @@ impl FlatFileProver {
             let total_started = Instant::now();
             let mut timings = SteadyBlockTimings::default();
             let started = Instant::now();
-            self.reserve_persistence()?;
+            self.collect_completed()?;
             timings.persistence_enqueue = started.elapsed();
             if self.shutdown_flag.load(Ordering::Acquire) {
                 break;
@@ -1195,15 +1268,9 @@ impl FlatFileProver {
                 pending.proof_forest_rows,
             )?;
             self.publication_boundary = Some(boundary);
-            self.publication_window.push(PersistenceBlock {
-                entry: Arc::clone(&entry),
-                header: block.header,
-                proof,
-                proof_forest_rows: pending.proof_forest_rows,
-            });
+            self.publication_window += 1;
             self.overlay.push(&entry);
-            self.pending_apply.push_back(PendingApply { entry });
-            if self.publication_window.len() == PUBLICATION_BLOCKS {
+            if self.publication_window == PUBLICATION_BLOCKS {
                 self.publish_pending()?;
             }
             timings.persistence_enqueue += started.elapsed();
@@ -1965,7 +2032,7 @@ mod tests {
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::new(),
             };
-            for height in 1..=220u32 {
+            for height in 1..=620u32 {
                 let mut coinbase = blocks[0].txdata[0].clone();
                 coinbase.input[0].script_sig = ScriptBuf::from_bytes(height.to_le_bytes().to_vec());
                 coinbase.output = (0..if height == 1 { 4 } else { 1 })
@@ -2008,7 +2075,7 @@ mod tests {
             config.leaf_map_path = root.join("leaf-map");
             config.header_file_path = root.join("headers");
             config.header_index_path = root.join("header-index");
-            config.minimum_leaf_capacity = Some(1024);
+            config.minimum_leaf_capacity = Some(4096);
             config.leaf_workers = 1;
             config.chaser_workers = 1;
             config.lock_pages = false;
@@ -2092,133 +2159,168 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_persistence_proves_during_flush_and_reopens() {
-        let fixture = PersistenceFixture::new();
-        let (mut prover, proofs, index, notifications) = fixture.open();
-        let baseline = prover.acc.read().unwrap().roots().unwrap();
-        prover.prove_range_inner(2, 100).unwrap();
-        assert_eq!(prover.pending_apply.len(), 99);
-        assert_eq!(index.load_height().unwrap(), 1);
-        assert_eq!(prover.acc.read().unwrap().roots().unwrap(), baseline);
-        assert_eq!(
-            std::fs::metadata(fixture.root.join("proofs"))
-                .unwrap()
-                .len(),
-            0
-        );
-        assert!(notifications.try_recv().is_err());
-        for height in 2..=100 {
-            let hash = fixture.chain.get_block_hash(height).unwrap();
-            assert!(prover
-                .header_index
-                .get_by_height(height as u32)
-                .unwrap()
-                .is_none());
-            assert!(index.get_index(hash).unwrap().is_none());
-        }
-
-        let publication_gate = Arc::new(FlushGate::default());
-        let apply_gate = Arc::new(FlushGate::default());
-        let worker_publication_gate = Arc::clone(&publication_gate);
-        let worker_apply_gate = Arc::clone(&apply_gate);
-        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
-        let (applying, apply_waiting) = std::sync::mpsc::sync_channel(1);
-        let (limited, limit_waiting) = std::sync::mpsc::sync_channel(1);
-        let flushes = Arc::new(Mutex::new(Vec::new()));
-        let worker_flushes = Arc::clone(&flushes);
-        *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
-            if stage == "before_publication" && height == 101 {
-                entered.send(()).unwrap();
-                worker_publication_gate.wait();
+    fn independent_publication_and_disk_tail_prove_through_slow_forest_io() {
+        for gated_stage in ["apply_io", "state_flush"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, proofs, index, notifications) = fixture.open();
+            let baseline = prover.acc.read().unwrap().roots().unwrap();
+            prover.prove_range_inner(2, 100).unwrap();
+            assert_eq!(prover.pending_blocks(), 99);
+            assert_eq!(prover.journal.lock().published_count(), 0);
+            assert_eq!(index.load_height().unwrap(), 1);
+            assert_eq!(prover.acc.read().unwrap().roots().unwrap(), baseline);
+            assert_eq!(
+                std::fs::metadata(fixture.root.join("proofs"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert!(notifications.try_recv().is_err());
+            for height in 2..=100 {
+                let hash = fixture.chain.get_block_hash(height).unwrap();
+                assert!(prover
+                    .header_index
+                    .get_by_height(height as u32)
+                    .unwrap()
+                    .is_none());
+                assert!(index.get_index(hash).unwrap().is_none());
             }
-            if stage == "state_flush" {
-                worker_flushes.lock().push(height);
-                if height == 101 {
-                    applying.send(()).unwrap();
-                    worker_apply_gate.wait();
+
+            let gate = Arc::new(FlushGate::default());
+            let worker_gate = Arc::clone(&gate);
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let (published, publications) = std::sync::mpsc::channel();
+            *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                if stage == gated_stage && height == 101 {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                if stage == "journal" {
+                    published.send(height).unwrap();
+                }
+                Ok(())
+            }));
+            // A watchdog releases the gate even on a regression, making lock/backpressure
+            // failures assertions rather than hanging the test process indefinitely.
+            let (release, released) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                let result = released.recv_timeout(Duration::from_secs(60));
+                gate.release();
+                result
+            });
+            prover.prove_range_inner(101, 101).unwrap();
+            waiting.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert_eq!(
+                publications.recv_timeout(Duration::from_secs(30)).unwrap(),
+                101
+            );
+            prover.pollard_memory_limit = 1;
+            prover.enforce_pollard_memory_limit().unwrap();
+            prover.leaf_data.clear();
+            let proved = prover.prove_range_inner(102, 601);
+            let mut published_heights = Vec::new();
+            for _ in 0..5 {
+                match publications.recv_timeout(Duration::from_secs(30)) {
+                    Ok(height) => published_heights.push(height),
+                    Err(_) => break,
                 }
             }
-            if stage == "backpressure" {
-                let _ = limited.try_send(());
-            }
-            Ok(())
-        }));
-        prover.prove_range_inner(101, 101).unwrap();
-        let reached_publication = waiting.recv_timeout(Duration::from_secs(30));
-        if reached_publication.is_err() {
-            publication_gate.release();
-            apply_gate.release();
-        }
-        reached_publication.unwrap();
-        assert_eq!(prover.submitted_blocks, PUBLICATION_BLOCKS);
-        assert!(prover.publication_window.is_empty());
-        assert_eq!(index.load_height().unwrap(), 1);
-        assert_eq!(prover.acc.read().unwrap().roots().unwrap(), baseline);
-        assert_eq!(
-            std::fs::metadata(fixture.root.join("proofs"))
-                .unwrap()
-                .len(),
-            0
-        );
-        assert!(notifications.try_recv().is_err());
-
-        // Cache eviction must resolve unpublished additions through the overlay.
-        prover.pollard_memory_limit = 1;
-        prover.enforce_pollard_memory_limit().unwrap();
-        prover.leaf_data.clear();
-        prover.prove_range_inner(102, 200).unwrap();
-        assert_eq!(prover.pending_apply.len(), MAX_PENDING_BLOCKS - 1);
-        // Pollard is thread-local: move only the gate observer, not the prover.
-        let observer_index = Arc::clone(&index);
-        let observer = std::thread::spawn(move || {
-            let bounded = limit_waiting.recv_timeout(Duration::from_secs(30));
-            publication_gate.release();
-            let applying = apply_waiting.recv_timeout(Duration::from_secs(30));
-            let applied_height = observer_index.load_height();
+            let published_count = prover.journal.lock().published_count();
+            let applied_count = prover.persistence.signal.progress.lock().applied_count;
+            let durable_height = index.load_height().unwrap();
             let premature_notification = notifications.try_recv().is_ok();
-            apply_gate.release();
-            bounded.unwrap();
-            applying.unwrap();
-            assert_eq!(applied_height.unwrap(), 1);
+            let pending = prover.pending_blocks();
+            release.send(()).unwrap();
+            watchdog.join().unwrap().unwrap();
+            proved.unwrap();
+            assert_eq!(published_heights, [201, 301, 401, 501, 601]);
+            assert_eq!(published_count, 600);
+            assert_eq!(applied_count, 0);
+            assert_eq!(pending, 600);
+            assert_eq!(durable_height, 1);
             assert!(!premature_notification);
-            notifications
-        });
-        prover.prove_range(201, 204).unwrap();
-        let roots = pollard_stump_roots(&prover.pollard);
-        prover.sync_for_shutdown().unwrap();
-        let notifications = observer.join().unwrap();
-        drop(prover);
-        assert_eq!(*flushes.lock(), [101, 201, 204]);
-        assert_eq!(index.load_height().unwrap(), 204);
-        let mut expected_proofs = Vec::new();
-        for height in 2..=204 {
-            let hash = fixture.chain.get_block_hash(height).unwrap();
-            assert_eq!(
-                notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
-                hash
-            );
-            expected_proofs.push(
-                proofs
-                    .get(&index.get_index(hash).unwrap().unwrap())
-                    .unwrap(),
-            );
+            // No append or producer completion collection is needed to wake/drain the tail.
+            prover.persistence.wait_applied(600).unwrap();
+            assert_eq!(index.load_height().unwrap(), 601);
+            prover.collect_completed().unwrap();
+            assert_eq!(prover.pending_blocks(), 0);
+            prover.prove_range(602, 604).unwrap();
+            let roots = pollard_stump_roots(&prover.pollard);
+            assert_eq!(index.load_height().unwrap(), 604);
+            prover.sync_for_shutdown().unwrap();
+            drop(prover);
+            let mut expected_proofs = Vec::new();
+            for height in 2..=604 {
+                let hash = fixture.chain.get_block_hash(height).unwrap();
+                assert_eq!(
+                    notifications.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    hash
+                );
+                expected_proofs.push(
+                    proofs
+                        .get(&index.get_index(hash).unwrap().unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(notifications.try_recv().is_err());
+            drop(proofs);
+            drop(index);
+            let (mut reopened, proofs, index, _) = fixture.open();
+            assert_eq!(reopened.height, 604);
+            assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
+            for (height, expected) in (2..=604).zip(expected_proofs) {
+                let hash = fixture.chain.get_block_hash(height).unwrap();
+                assert_eq!(
+                    proofs
+                        .get(&index.get_index(hash).unwrap().unwrap())
+                        .unwrap(),
+                    expected
+                );
+            }
+            reopened.sync_for_shutdown().unwrap();
         }
-        assert!(notifications.try_recv().is_err());
-        drop(proofs);
-        drop(index);
-        let (mut reopened, proofs, index, _) = fixture.open();
-        assert_eq!(reopened.height, 204);
-        assert_eq!(pollard_stump_roots(&reopened.pollard), roots);
-        for (height, expected) in (2..=204).zip(expected_proofs) {
-            let hash = fixture.chain.get_block_hash(height).unwrap();
-            assert_eq!(
-                proofs
-                    .get(&index.get_index(hash).unwrap().unwrap())
-                    .unwrap(),
-                expected
-            );
+    }
+
+    #[test]
+    fn explicit_range_and_shutdown_barriers_wait_for_partial_state_application() {
+        for operation in ["sync", "range", "shutdown"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, _, index, _) = fixture.open();
+            prover.prove_range_inner(2, 3).unwrap();
+            let end = if operation == "range" { 4 } else { 3 };
+            let gate = Arc::new(FlushGate::default());
+            let worker_gate = Arc::clone(&gate);
+            let (entered, waiting) = std::sync::mpsc::channel();
+            *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                if stage == "state_flush" && height == end {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                Ok(())
+            }));
+            let (returned, returns) = std::sync::mpsc::channel();
+            let observer_index = Arc::clone(&index);
+            let observer = std::thread::spawn(move || {
+                let reached = waiting.recv_timeout(Duration::from_secs(30));
+                let premature = returns.recv_timeout(Duration::from_millis(100)).is_ok();
+                let height = observer_index.load_height();
+                gate.release();
+                reached.unwrap();
+                assert!(!premature, "barrier returned before state application");
+                assert_eq!(height.unwrap(), 1);
+            });
+            let result = match operation {
+                "sync" => prover.sync(),
+                "range" => prover.prove_range(4, 4),
+                _ => prover.sync_for_shutdown(),
+            };
+            let _ = returned.send(());
+            observer.join().unwrap();
+            result.unwrap();
+            assert_eq!(index.load_height().unwrap(), end as usize);
+            assert_eq!(prover.journal.lock().published_count(), u64::from(end - 1));
+            assert_eq!(prover.pending_blocks(), 0);
         }
-        reopened.sync_for_shutdown().unwrap();
     }
 
     #[test]
@@ -2227,7 +2329,7 @@ mod tests {
         let (mut prover, proofs, index, notifications) = fixture.open();
         prover.prove_range(2, 3).unwrap();
         assert_eq!(index.load_height().unwrap(), 3);
-        assert!(prover.pending_apply.is_empty());
+        assert_eq!(prover.pending_blocks(), 0);
         prover.prove_range(4, 4).unwrap();
         assert_eq!(index.load_height().unwrap(), 4);
         prover.prove_range(5, 5).unwrap();
@@ -2324,7 +2426,12 @@ mod tests {
 
     #[test]
     fn published_journal_recovers_missing_headers_proofs_and_forest() {
-        for stage in ["before_publication", "journal", "state_flush"] {
+        for stage in [
+            "before_publication",
+            "before_apply",
+            "apply_io",
+            "state_flush",
+        ] {
             let fixture = PersistenceFixture::new();
             let (mut prover, proofs, index, notifications) = fixture.open();
             let baseline = pollard_stump_roots(&prover.pollard);
@@ -2336,23 +2443,28 @@ mod tests {
             }));
             prover.prove_range_inner(2, 4).unwrap();
             let advanced = pollard_stump_roots(&prover.pollard);
-            let expected = prover
-                .publication_window
-                .iter()
-                .map(|block| {
-                    (
-                        block.entry.block_hash,
-                        Arc::clone(&block.proof),
-                        block.proof_forest_rows,
-                    )
-                })
-                .collect::<Vec<_>>();
+            let expected = {
+                let journal = prover.journal.lock();
+                journal
+                    .appended_records()
+                    .iter()
+                    .map(|record| {
+                        let payload = journal.read_record(record).unwrap();
+                        let replay = payload.replay.unwrap();
+                        (
+                            payload.entry.block_hash,
+                            Arc::clone(&replay.proof),
+                            replay.proof_forest_rows,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert!(prover.sync().is_err());
             assert!(prover.prove_range(5, 5).is_err());
             assert!(prover.sync_for_shutdown().is_err());
             assert_eq!(index.load_height().unwrap(), 1);
             assert!(notifications.try_recv().is_err());
-            if stage == "journal" {
+            if stage == "before_apply" {
                 assert!(prover.header_index.get_by_height(2).unwrap().is_none());
                 assert_eq!(
                     std::fs::metadata(fixture.root.join("proofs"))
@@ -2437,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_pipeline_discards_speculation_before_reorg() {
+    fn disk_tailing_pipeline_discards_speculation_before_reorg() {
         let fixture = Arc::new(PersistenceFixture::new());
         let (mut prover, proofs, index, notifications) = fixture.open();
         let gate = Arc::new(FlushGate::default());
@@ -2461,8 +2573,8 @@ mod tests {
         });
         assert_eq!(prover.reconcile_chain().unwrap(), 4);
         assert_eq!(prover.height, 100);
-        assert!(prover.publication_window.is_empty());
-        assert!(prover.pending_apply.is_empty());
+        assert_eq!(prover.publication_window, 0);
+        assert_eq!(prover.pending_blocks(), 0);
         assert_eq!(pollard_stump_roots(&prover.pollard), roots_at_100);
         prover.sync_for_shutdown().unwrap();
         observer.join().unwrap();
@@ -2489,7 +2601,7 @@ mod tests {
         let capacity = prover.acc.read().unwrap().leaf_capacity().unwrap();
         prover.ensure_forest_capacity(capacity as usize).unwrap();
         assert_eq!(index.load_height().unwrap(), 4);
-        assert!(prover.pending_apply.is_empty());
+        assert_eq!(prover.pending_blocks(), 0);
         assert_eq!(notifications.try_iter().count(), 3);
         assert!(prover.acc.read().unwrap().leaf_capacity().unwrap() > capacity);
         prover.sync_for_shutdown().unwrap();

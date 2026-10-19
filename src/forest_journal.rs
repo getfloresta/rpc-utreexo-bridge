@@ -3,11 +3,12 @@
 //! Unsynced block WAL with explicitly published, crash-recoverable prefixes.
 //!
 //! Appenders only write complete records. A detached publisher flushes the WAL, advances an
-//! alternating checksummed marker, then flushes that marker before exposing the prefix.
+//! alternating checksummed count/boundary marker in the same file, then flushes it before
+//! exposing the prefix. Header and marker slots occupy three independent reserved pages.
 //! Recovery discards everything past the marker, including valid, previously flushed records.
-//! Each published block carries its header and compact proof as well as the forest delta.
-//! Pruning advances both marker slots' replay floors before sparse reclamation; offsets never
-//! move while producers and publishers are alive. Legacy files are imported only at startup.
+//! Payloads remain disk-backed; the resident index contains only identities and locations.
+//! Pruning advances both replay floors before sparse reclamation. Runtime offsets never move;
+//! legacy formats are migrated by durable temporary-file replacement only at startup.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -45,13 +46,15 @@ const REPLAY_RECORD_VERSION: u16 = 2;
 const RECORD_VERSION: u16 = 3;
 const RECORD_HEADER_SIZE: usize = 64;
 const STATUS_OFFSET: u64 = 10;
-const WAL_MAGIC: [u8; 8] = *b"BRWAL002";
-const PUBLICATION_MAGIC: [u8; 8] = *b"BRPUB001";
+const WAL_MAGIC: [u8; 8] = *b"BRWAL003";
+const LEGACY_WAL_MAGIC: [u8; 8] = *b"BRWAL002";
+const PUBLICATION_MAGIC: [u8; 8] = *b"BRPUB002";
+const LEGACY_PUBLICATION_MAGIC: [u8; 8] = *b"BRPUB001";
 const PUBLICATION_SUFFIX: &str = ".published";
 const INITIALIZE_SUFFIX: &str = ".initialize";
 const FOREST_ROWS_SUFFIX: &str = ".forest-rows";
 const PUBLICATION_SLOT_SIZE: u64 = 4096;
-const PUBLICATION_BYTES: usize = 172;
+const PUBLICATION_BYTES: usize = 188;
 const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const CLEAN_SHUTDOWN_MARKER: &[u8] = b"BRJNL-CLEAN-1";
 const CLEAN_SHUTDOWN_SUFFIX: &str = ".clean";
@@ -145,15 +148,85 @@ pub struct JournalReplayPayload {
     pub proof_forest_rows: u8,
 }
 
-#[derive(Clone, Debug)]
+/// The resident index contains identities and disk locations, never decoded deltas or proofs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalEntryMetadata {
+    pub height: u32,
+    pub block_hash: BlockHash,
+    pub previous_block_hash: BlockHash,
+    pub num_leaves: u64,
+    pub forest_rows: Option<u8>,
+}
+
+impl From<&JournalEntry> for JournalEntryMetadata {
+    fn from(entry: &JournalEntry) -> Self {
+        Self {
+            height: entry.height,
+            block_hash: entry.block_hash,
+            previous_block_hash: entry.previous_block_hash,
+            num_leaves: entry.num_leaves,
+            forest_rows: entry.forest_rows,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct JournalRecord {
+    pub entry: JournalEntryMetadata,
+    pub status: JournalStatus,
+    offset: u64,
+    span: u64,
+    checksum: [u8; 32],
+    pub count: u64,
+}
+
+pub struct JournalPayload {
     pub entry: Arc<JournalEntry>,
     pub status: JournalStatus,
-    /// Absent only for imported legacy entries and forest-only test fixtures.
     pub replay: Option<Arc<JournalReplayPayload>>,
     offset: u64,
     span: u64,
     checksum: [u8; 32],
+}
+
+impl JournalPayload {
+    fn metadata(&self, count: u64) -> JournalRecord {
+        JournalRecord {
+            entry: self.entry.as_ref().into(),
+            status: self.status,
+            offset: self.offset,
+            span: self.span,
+            checksum: self.checksum,
+            count,
+        }
+    }
+}
+
+/// Independent descriptor for bounded, disk-sourced state-application batches.
+pub struct JournalReader {
+    file: File,
+    page_size: u64,
+}
+
+impl JournalReader {
+    pub fn read_record(&self, record: &JournalRecord) -> Result<JournalPayload> {
+        read_indexed_record(&self.file, self.page_size, record)
+    }
+}
+
+fn read_indexed_record(
+    file: &File,
+    page_size: u64,
+    record: &JournalRecord,
+) -> Result<JournalPayload> {
+    let mut payload = read_record(file, page_size, record.offset, record.offset + record.span)?;
+    if payload.checksum != record.checksum || payload.status != record.status {
+        bail!("journal record changed while being consumed");
+    }
+    if payload.entry.forest_rows.is_none() {
+        Arc::make_mut(&mut payload.entry).forest_rows = record.entry.forest_rows;
+    }
+    Ok(payload)
 }
 
 /// An immutable, complete append boundary, never the file's changing length.
@@ -166,6 +239,17 @@ pub struct JournalBoundary {
     height: u32,
     block_hash: BlockHash,
     checksum: [u8; 32],
+    count: u64,
+}
+
+impl JournalBoundary {
+    pub fn count(self) -> u64 {
+        self.count
+    }
+    #[cfg(test)]
+    pub fn height(self) -> u32 {
+        self.height
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +257,7 @@ struct PublicationMarker {
     generation: u64,
     replay_start: u64,
     boundary: JournalBoundary,
+    replay_count: u64,
 }
 
 struct PublicationState {
@@ -186,7 +271,6 @@ struct PublicationState {
 /// Owns independent descriptors so publication never holds the producer's journal lock.
 pub struct JournalPublisher {
     file: File,
-    marker_file: File,
     page_size: u64,
     journal_id: [u8; 32],
     shared: Arc<PublicationState>,
@@ -196,12 +280,12 @@ pub struct JournalPublisher {
 pub struct JournalPrune {
     publisher: JournalPublisher,
     replay_start: u64,
+    replay_count: u64,
     count: usize,
 }
 
 pub struct ForestJournal {
     file: File,
-    marker_file: File,
     path: PathBuf,
     page_size: u64,
     journal_id: [u8; 32],
@@ -228,8 +312,10 @@ impl ForestJournal {
             .open(path)
             .with_context(|| format!("failed to open forest journal {}", path.display()))?;
         let mut magic = [0u8; 8];
-        let initialized = file.read_exact_at(&mut magic, 0).is_ok() && magic == WAL_MAGIC;
-        if !initialized {
+        let has_magic = file.read_exact_at(&mut magic, 0).is_ok();
+        if has_magic && magic == LEGACY_WAL_MAGIC {
+            file = migrate_publication_journal(path, &file)?;
+        } else if !has_magic || magic != WAL_MAGIC {
             let initializing = append_path_suffix(path, INITIALIZE_SUFFIX).try_exists()?;
             if append_path_suffix(path, PUBLICATION_SUFFIX).try_exists()? && !initializing {
                 bail!("publication journal is missing its initialization header");
@@ -237,12 +323,7 @@ impl ForestJournal {
             file = initialize_journal(path, &file)?;
         }
         let (page_size, journal_id) = read_superblock(&file)?;
-        let marker_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(append_path_suffix(path, PUBLICATION_SUFFIX))
-            .context("initialized journal is missing its publication marker")?;
-        let marker = read_publication_marker(&marker_file, journal_id, page_size)?;
+        let marker = read_publication_marker(&file, journal_id, page_size)?;
         let file_len = file.metadata()?.len();
         if file_len < marker.boundary.end {
             bail!("published journal data is truncated");
@@ -250,6 +331,13 @@ impl ForestJournal {
         // Validate only the eligible prefix before mutating the file. A corrupt
         // published record must not cause even a speculative suffix to be lost.
         let records = scan_published(&file, page_size, &marker)?;
+        // A crash after the migration rename can leave the old sidecar behind. A v3
+        // superblock never uses it as fallback, even if its embedded markers are corrupt.
+        let sidecar = append_path_suffix(path, PUBLICATION_SUFFIX);
+        if sidecar.try_exists()? {
+            std::fs::remove_file(sidecar)?;
+            sync_parent_directory(path)?;
+        }
         if file_len != marker.boundary.end {
             file.set_len(marker.boundary.end)?;
         }
@@ -262,7 +350,6 @@ impl ForestJournal {
         });
         Ok(Self {
             file,
-            marker_file,
             path: path.to_path_buf(),
             page_size,
             journal_id,
@@ -279,6 +366,33 @@ impl ForestJournal {
             .records
             .partition_point(|record| record.offset + record.span <= end);
         &self.records[..count]
+    }
+
+    #[cfg(test)]
+    pub fn appended_records(&self) -> &[JournalRecord] {
+        &self.records
+    }
+
+    pub fn read_record(&self, record: &JournalRecord) -> Result<JournalPayload> {
+        read_indexed_record(&self.file, self.page_size, record)
+    }
+
+    pub fn reader(&self) -> Result<JournalReader> {
+        Ok(JournalReader {
+            file: self.file.try_clone()?,
+            page_size: self.page_size,
+        })
+    }
+
+    pub fn published_count(&self) -> u64 {
+        self.shared.marker.lock().boundary.count
+    }
+
+    /// Capture only bounded metadata under the producer lock; decode after releasing it.
+    pub fn records_after(&self, count: u64, limit: usize) -> Vec<JournalRecord> {
+        let records = self.records();
+        let first = records.partition_point(|record| record.count <= count);
+        records[first..records.len().min(first.saturating_add(limit))].to_vec()
     }
 
     /// Opening consumes the clean marker, so an interruption always requires recovery.
@@ -338,7 +452,7 @@ impl ForestJournal {
         };
         for record in &mut self.records {
             if record.entry.forest_rows.is_none() {
-                Arc::make_mut(&mut record.entry).forest_rows = Some(rows);
+                record.entry.forest_rows = Some(rows);
             }
         }
         Ok(())
@@ -407,11 +521,11 @@ impl ForestJournal {
         {
             bail!("journal replay header does not match its forest entry");
         }
-        let replay = Arc::new(JournalReplayPayload {
+        let replay = JournalReplayPayload {
             header,
             proof,
             proof_forest_rows,
-        });
+        };
         let mut payload = vec![0; 4];
         encode_entry_into(&entry, &mut payload)?;
         let entry_len = u32::try_from(payload.len() - 4).context("journal entry exceeds u32")?;
@@ -419,7 +533,7 @@ impl ForestJournal {
         replay.header.consensus_encode(&mut payload)?;
         payload.push(replay.proof_forest_rows);
         replay.proof.consensus_encode(&mut payload)?;
-        self.append_payload(entry, Some(replay), &payload, RECORD_VERSION)?;
+        self.append_payload(entry, &payload, RECORD_VERSION)?;
         Ok(self.boundary())
     }
 
@@ -428,13 +542,12 @@ impl ForestJournal {
     pub fn append(&mut self, entry: impl Into<Arc<JournalEntry>>) -> Result<usize> {
         let entry = entry.into();
         let payload = entry.encode()?;
-        self.append_payload(entry, None, &payload, LEGACY_RECORD_VERSION)
+        self.append_payload(entry, &payload, LEGACY_RECORD_VERSION)
     }
 
     fn append_payload(
         &mut self,
         entry: Arc<JournalEntry>,
-        replay: Option<Arc<JournalReplayPayload>>,
         payload: &[u8],
         version: u16,
     ) -> Result<usize> {
@@ -446,10 +559,13 @@ impl ForestJournal {
             &self.file,
             self.page_size,
             offset,
-            entry,
-            replay,
+            &entry,
             payload,
             version,
+            self.boundary()
+                .count
+                .checked_add(1)
+                .context("journal record count overflow")?,
         ) {
             Ok(record) => record,
             Err(error) => {
@@ -481,7 +597,6 @@ impl ForestJournal {
     pub fn publisher(&self) -> Result<JournalPublisher> {
         Ok(JournalPublisher {
             file: self.file.try_clone()?,
-            marker_file: self.marker_file.try_clone()?,
             page_size: self.page_size,
             journal_id: self.journal_id,
             shared: Arc::clone(&self.shared),
@@ -546,11 +661,17 @@ impl ForestJournal {
     ///
     /// Keep the last physical record even when all entries are rolled back, because the
     /// publication marker authenticates that record. No runtime compaction moves offsets.
-    pub fn prepare_prune(&mut self, keep: usize) -> Result<Option<JournalPrune>> {
+    pub fn prepare_prune(
+        &mut self,
+        keep: usize,
+        applied_count: u64,
+    ) -> Result<Option<JournalPrune>> {
         if self.shared.poisoned.load(Ordering::Acquire) {
             bail!("cannot prepare pruning after a failed publication; reopen the journal");
         }
-        let records = self.records();
+        let published = self.records();
+        let applied = published.partition_point(|record| record.count <= applied_count);
+        let records = &published[..applied];
         let mut forward = 0;
         let mut count = 0;
         for (index, record) in records.iter().enumerate().rev() {
@@ -568,6 +689,7 @@ impl ForestJournal {
         let pruning = JournalPrune {
             publisher: self.publisher()?,
             replay_start: records[count].offset,
+            replay_count: records[count].count - 1,
             count,
         };
         self.records.drain(..count);
@@ -612,8 +734,9 @@ impl JournalPublisher {
                     .context("publication generation overflow")?,
                 replay_start: marker.replay_start,
                 boundary,
+                replay_count: marker.replay_count,
             };
-            write_publication_marker(&self.marker_file, &next)?;
+            write_publication_marker(&self.file, self.page_size, &next)?;
             *marker = next;
             self.shared
                 .published_end
@@ -649,8 +772,11 @@ impl JournalPrune {
                 .context("publication generation overflow")?,
             replay_start: self.replay_start,
             boundary: marker.boundary,
+            replay_count: self.replay_count,
         };
-        if let Err(error) = write_publication_marker(&self.publisher.marker_file, &next) {
+        if let Err(error) =
+            write_publication_marker(&self.publisher.file, self.publisher.page_size, &next)
+        {
             self.publisher
                 .shared
                 .poisoned
@@ -666,7 +792,9 @@ impl JournalPrune {
                 .context("publication generation overflow")?,
             ..*marker
         };
-        if let Err(error) = write_publication_marker(&self.publisher.marker_file, &next) {
+        if let Err(error) =
+            write_publication_marker(&self.publisher.file, self.publisher.page_size, &next)
+        {
             self.publisher
                 .shared
                 .poisoned
@@ -701,11 +829,12 @@ fn empty_boundary(journal_id: [u8; 32], epoch: u64, page_size: u64) -> JournalBo
     JournalBoundary {
         journal_id,
         epoch,
-        end: page_size,
+        end: 3 * page_size,
         offset: 0,
         height: 0,
         block_hash: BlockHash::all_zeros(),
         checksum: [0; 32],
+        count: 0,
     }
 }
 
@@ -718,6 +847,7 @@ fn record_boundary(record: &JournalRecord, journal_id: [u8; 32], epoch: u64) -> 
         height: record.entry.height,
         block_hash: record.entry.block_hash,
         checksum: record.checksum,
+        count: record.count,
     }
 }
 
@@ -725,10 +855,10 @@ fn write_record(
     file: &File,
     page_size: u64,
     offset: u64,
-    entry: Arc<JournalEntry>,
-    replay: Option<Arc<JournalReplayPayload>>,
+    entry: &JournalEntry,
     payload: &[u8],
     version: u16,
+    count: u64,
 ) -> Result<JournalRecord> {
     if payload.len() > MAX_RECORD_BYTES {
         bail!("journal entry is too large: {} bytes", payload.len());
@@ -757,12 +887,12 @@ fn write_record(
         offset + RECORD_HEADER_SIZE as u64 + payload.len() as u64,
     )?;
     Ok(JournalRecord {
-        entry,
+        entry: entry.into(),
         status: JournalStatus::Forward,
-        replay,
         offset,
         span,
         checksum,
+        count,
     })
 }
 
@@ -811,7 +941,7 @@ fn read_record_header(
     Ok(header)
 }
 
-fn read_record(file: &File, page_size: u64, offset: u64, end: u64) -> Result<JournalRecord> {
+fn read_record(file: &File, page_size: u64, offset: u64, end: u64) -> Result<JournalPayload> {
     let header = read_record_header(file, page_size, offset, end)?;
     let payload_len = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
     let mut payload = vec![0u8; payload_len];
@@ -857,7 +987,7 @@ fn read_record(file: &File, page_size: u64, offset: u64, end: u64) -> Result<Jou
             })),
         )
     };
-    Ok(JournalRecord {
+    Ok(JournalPayload {
         entry: Arc::new(entry),
         status: JournalStatus::from_byte(header[10])?,
         replay,
@@ -918,13 +1048,14 @@ fn scan_published(
     while offset < marker.boundary.end {
         let record = read_record(file, page_size, offset, marker.boundary.end)?;
         offset += record.span;
-        records.push(record);
+        records.push(record.metadata(marker.replay_count + records.len() as u64 + 1));
     }
     let actual = records.last().map_or_else(
         || empty_boundary(marker.boundary.journal_id, 0, page_size),
         |record| record_boundary(record, marker.boundary.journal_id, 0),
     );
     if actual != marker.boundary {
+        // The empty WAL has no retained prefix; nonempty prefixes authenticate the count.
         bail!("published boundary does not match the final validated journal record");
     }
     Ok(records)
@@ -934,7 +1065,9 @@ fn read_superblock(file: &File) -> Result<(u64, [u8; 32])> {
     let mut bytes = [0u8; 96];
     file.read_exact_at(&mut bytes, 0)
         .context("journal initialization header is truncated")?;
-    if bytes[..8] != WAL_MAGIC || Sha256::digest(&bytes[..64]).as_slice() != &bytes[64..96] {
+    if (bytes[..8] != WAL_MAGIC && bytes[..8] != LEGACY_WAL_MAGIC)
+        || Sha256::digest(&bytes[..64]).as_slice() != &bytes[64..96]
+    {
         bail!("journal initialization header is corrupt");
     }
     let page_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
@@ -942,6 +1075,26 @@ fn read_superblock(file: &File) -> Result<(u64, [u8; 32])> {
         bail!("invalid journal page size {page_size}");
     }
     Ok((page_size, bytes[16..48].try_into().unwrap()))
+}
+
+fn write_superblock(
+    file: &File,
+    page_size: u64,
+    journal_id: [u8; 32],
+    magic: [u8; 8],
+) -> Result<()> {
+    let mut bytes = [0u8; 96];
+    bytes[..8].copy_from_slice(&magic);
+    bytes[8..16].copy_from_slice(&page_size.to_le_bytes());
+    bytes[16..48].copy_from_slice(&journal_id);
+    let checksum = Sha256::digest(&bytes[..64]);
+    bytes[64..96].copy_from_slice(&checksum);
+    file.write_all_at(&bytes, 0)?;
+    Ok(())
+}
+
+fn publication_offsets(page_size: u64) -> [u64; 2] {
+    [page_size, 2 * page_size]
 }
 
 fn encode_publication_marker(marker: &PublicationMarker) -> [u8; PUBLICATION_BYTES] {
@@ -955,15 +1108,17 @@ fn encode_publication_marker(marker: &PublicationMarker) -> [u8; PUBLICATION_BYT
     bytes[72..76].copy_from_slice(&marker.boundary.height.to_le_bytes());
     bytes[76..108].copy_from_slice(&marker.boundary.block_hash.to_byte_array());
     bytes[108..140].copy_from_slice(&marker.boundary.checksum);
-    let checksum = Sha256::digest(&bytes[..140]);
-    bytes[140..172].copy_from_slice(&checksum);
+    bytes[140..148].copy_from_slice(&marker.boundary.count.to_le_bytes());
+    bytes[148..156].copy_from_slice(&marker.replay_count.to_le_bytes());
+    let checksum = Sha256::digest(&bytes[..156]);
+    bytes[156..188].copy_from_slice(&checksum);
     bytes
 }
 
-fn write_publication_marker(file: &File, marker: &PublicationMarker) -> Result<()> {
+fn write_publication_marker(file: &File, page_size: u64, marker: &PublicationMarker) -> Result<()> {
     file.write_all_at(
         &encode_publication_marker(marker),
-        (marker.generation % 2) * PUBLICATION_SLOT_SIZE,
+        publication_offsets(page_size)[(marker.generation % 2) as usize],
     )?;
     file.sync_data()
         .context("failed to flush journal publication marker")
@@ -974,15 +1129,35 @@ fn read_publication_marker(
     journal_id: [u8; 32],
     page_size: u64,
 ) -> Result<PublicationMarker> {
+    decode_publication_marker(file, journal_id, page_size, false)
+}
+
+fn decode_publication_marker(
+    file: &File,
+    journal_id: [u8; 32],
+    page_size: u64,
+    legacy: bool,
+) -> Result<PublicationMarker> {
     let mut valid = [None; 2];
+    let data_start = if legacy { page_size } else { 3 * page_size };
     for slot in 0..2 {
         let mut bytes = [0u8; PUBLICATION_BYTES];
-        if file
-            .read_exact_at(&mut bytes, slot * PUBLICATION_SLOT_SIZE)
-            .is_err()
-            || bytes[..8] != PUBLICATION_MAGIC
+        let length = if legacy { 172 } else { PUBLICATION_BYTES };
+        let checksum_start = length - 32;
+        let offset = if legacy {
+            slot * PUBLICATION_SLOT_SIZE
+        } else {
+            publication_offsets(page_size)[slot as usize]
+        };
+        if file.read_exact_at(&mut bytes[..length], offset).is_err()
+            || bytes[..8]
+                != if legacy {
+                    LEGACY_PUBLICATION_MAGIC
+                } else {
+                    PUBLICATION_MAGIC
+                }
             || bytes[8..40] != journal_id
-            || Sha256::digest(&bytes[..140]).as_slice() != &bytes[140..172]
+            || Sha256::digest(&bytes[..checksum_start]).as_slice() != &bytes[checksum_start..length]
         {
             continue;
         }
@@ -997,14 +1172,25 @@ fn read_publication_marker(
                 height: u32::from_le_bytes(bytes[72..76].try_into().unwrap()),
                 block_hash: BlockHash::from_byte_array(bytes[76..108].try_into().unwrap()),
                 checksum: bytes[108..140].try_into().unwrap(),
+                count: if legacy {
+                    0
+                } else {
+                    u64::from_le_bytes(bytes[140..148].try_into().unwrap())
+                },
+            },
+            replay_count: if legacy {
+                0
+            } else {
+                u64::from_le_bytes(bytes[148..156].try_into().unwrap())
             },
         };
         if marker.generation % 2 != slot
-            || marker.replay_start < page_size
+            || marker.replay_start < data_start
             || marker.replay_start % page_size != 0
             || marker.boundary.end < marker.replay_start
             || marker.boundary.end % page_size != 0
-            || (marker.boundary.end > page_size
+            || (!legacy && marker.boundary.count < marker.replay_count)
+            || (marker.boundary.end > data_start
                 && (marker.boundary.offset < marker.replay_start
                     || marker.boundary.offset >= marker.boundary.end
                     || marker.boundary.offset % page_size != 0))
@@ -1021,6 +1207,8 @@ fn read_publication_marker(
         };
         if newer.boundary.end < older.boundary.end
             || newer.replay_start < older.replay_start
+            || newer.boundary.count < older.boundary.count
+            || newer.replay_count < older.replay_count
             || (newer.boundary.end == older.boundary.end && newer.boundary != older.boundary)
         {
             bail!("journal publication slots are not monotonic");
@@ -1032,10 +1220,67 @@ fn read_publication_marker(
         .context("initialized journal has no valid publication marker")
 }
 
-/// Imports legacy records once, without changing the old inode until both new files are durable.
-///
-/// The temporary inode also identifies an interrupted initialization. A permanently initialized
-/// WAL never falls back to legacy scanning when its publication marker is absent or damaged.
+/// Retain every validated published v3 record/status and the WAL identity/layout binding.
+/// The legacy marker has no historical count; count zero precedes its retained prefix.
+/// The source inode and sidecar remain untouched until the new WAL is completely durable.
+fn migrate_publication_journal(path: &Path, legacy: &File) -> Result<File> {
+    let (page_size, journal_id) = read_superblock(legacy)?;
+    let sidecar = File::open(append_path_suffix(path, PUBLICATION_SUFFIX))
+        .context("initialized legacy WAL is missing its publication marker")?;
+    let marker = decode_publication_marker(&sidecar, journal_id, page_size, true)?;
+    let temporary_path = append_path_suffix(path, INITIALIZE_SUFFIX);
+    let temporary = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&temporary_path)?;
+    temporary.set_len(3 * page_size)?;
+    write_superblock(&temporary, page_size, journal_id, WAL_MAGIC)?;
+    let mut boundary = empty_boundary(journal_id, 0, page_size);
+    let mut old_boundary = empty_boundary(journal_id, 0, page_size);
+    old_boundary.end = page_size;
+    let mut offset = marker.replay_start;
+    let mut buffer = [0u8; 64 * 1024];
+    while offset < marker.boundary.end {
+        let payload = read_record(legacy, page_size, offset, marker.boundary.end)?;
+        let mut record = payload.metadata(0);
+        old_boundary = record_boundary(&record, journal_id, 0);
+        let mut copied = 0;
+        while copied < record.span {
+            let count = (record.span - copied).min(buffer.len() as u64) as usize;
+            legacy.read_exact_at(&mut buffer[..count], offset + copied)?;
+            temporary.write_all_at(&buffer[..count], boundary.end + copied)?;
+            copied += count as u64;
+        }
+        offset += record.span;
+        record.offset = boundary.end;
+        record.count = boundary.count + 1;
+        boundary = record_boundary(&record, journal_id, 0);
+    }
+    if old_boundary != marker.boundary {
+        bail!("legacy publication marker does not match its validated prefix");
+    }
+    temporary.sync_all()?;
+    for generation in 0..2 {
+        write_publication_marker(
+            &temporary,
+            page_size,
+            &PublicationMarker {
+                generation,
+                replay_start: 3 * page_size,
+                replay_count: 0,
+                boundary,
+            },
+        )?;
+    }
+    temporary.sync_all()?;
+    std::fs::rename(&temporary_path, path)?;
+    sync_parent_directory(path)?;
+    Ok(temporary)
+}
+
+/// Imports legacy records once, replacing the old inode only after the complete new WAL is durable.
 fn initialize_journal(path: &Path, legacy: &File) -> Result<File> {
     let page_size = page_size();
     let legacy_records = scan_legacy(legacy, page_size)?;
@@ -1048,25 +1293,20 @@ fn initialize_journal(path: &Path, legacy: &File) -> Result<File> {
         .open(&temporary_path)?;
     let mut journal_id = [0u8; 32];
     File::open("/dev/urandom")?.read_exact(&mut journal_id)?;
-    let mut superblock = [0u8; 96];
-    superblock[..8].copy_from_slice(&WAL_MAGIC);
-    superblock[8..16].copy_from_slice(&page_size.to_le_bytes());
-    superblock[16..48].copy_from_slice(&journal_id);
-    let checksum = Sha256::digest(&superblock[..64]);
-    superblock[64..96].copy_from_slice(&checksum);
-    temporary.set_len(page_size)?;
-    temporary.write_all_at(&superblock, 0)?;
+    temporary.set_len(3 * page_size)?;
+    write_superblock(&temporary, page_size, journal_id, WAL_MAGIC)?;
     let mut boundary = empty_boundary(journal_id, 0, page_size);
     for legacy_record in legacy_records {
+        let legacy_record = read_indexed_record(legacy, page_size, &legacy_record)?;
         let payload = legacy_record.entry.encode()?;
         let record = write_record(
             &temporary,
             page_size,
             boundary.end,
-            legacy_record.entry,
-            None,
+            &legacy_record.entry,
             &payload,
             LEGACY_RECORD_VERSION,
+            boundary.count + 1,
         )?;
         if legacy_record.status == JournalStatus::RolledBack {
             temporary.write_all_at(
@@ -1077,29 +1317,26 @@ fn initialize_journal(path: &Path, legacy: &File) -> Result<File> {
         boundary = record_boundary(&record, journal_id, 0);
     }
     temporary.sync_all()?;
-    // Persist the temporary name before creating a marker which may outlive a crash.
-    sync_parent_directory(path)?;
-    let marker_path = append_path_suffix(path, PUBLICATION_SUFFIX);
-    let marker_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&marker_path)?;
-    marker_file.set_len(PUBLICATION_SLOT_SIZE * 2)?;
     for generation in 0..2 {
         write_publication_marker(
-            &marker_file,
+            &temporary,
+            page_size,
             &PublicationMarker {
                 generation,
-                replay_start: page_size,
+                replay_start: 3 * page_size,
                 boundary,
+                replay_count: 0,
             },
         )?;
     }
-    sync_parent_directory(&marker_path)?;
+    temporary.sync_all()?;
     std::fs::rename(&temporary_path, path)?;
     sync_parent_directory(path)?;
+    let old_sidecar = append_path_suffix(path, PUBLICATION_SUFFIX);
+    if old_sidecar.try_exists()? {
+        std::fs::remove_file(old_sidecar)?;
+        sync_parent_directory(path)?;
+    }
     Ok(temporary)
 }
 
@@ -1139,7 +1376,7 @@ fn scan_legacy(file: &File, page_size: u64) -> Result<Vec<JournalRecord>> {
         match read_record(file, page_size, offset, file_len) {
             Ok(record) => {
                 offset += record.span;
-                records.push(record);
+                records.push(record.metadata(records.len() as u64 + 1));
             }
             Err(error) => {
                 let span = u64::from_le_bytes(header[16..24].try_into().unwrap());
@@ -1448,6 +1685,24 @@ mod tests {
             .unwrap();
     }
 
+    fn legacy_sidecar(path: &Path, mut marker: PublicationMarker) {
+        let sidecar = File::create(append_path_suffix(path, PUBLICATION_SUFFIX)).unwrap();
+        sidecar.set_len(2 * PUBLICATION_SLOT_SIZE).unwrap();
+        for generation in 0..2 {
+            marker.generation = generation;
+            let current = encode_publication_marker(&marker);
+            let mut old = [0u8; 172];
+            old[..140].copy_from_slice(&current[..140]);
+            old[..8].copy_from_slice(&LEGACY_PUBLICATION_MAGIC);
+            let checksum = Sha256::digest(&old[..140]);
+            old[140..].copy_from_slice(&checksum);
+            sidecar
+                .write_all_at(&old, generation * PUBLICATION_SLOT_SIZE)
+                .unwrap();
+        }
+        sidecar.sync_all().unwrap();
+    }
+
     fn proof() -> Arc<CompactBlockProof> {
         Arc::new(CompactBlockProof {
             proof: crate::udata::BatchProof {
@@ -1519,14 +1774,22 @@ mod tests {
         payload.push(8);
         proof().consensus_encode(&mut payload).unwrap();
         journal
-            .append_payload(Arc::new(legacy), None, &payload, REPLAY_RECORD_VERSION)
+            .append_payload(Arc::new(legacy), &payload, REPLAY_RECORD_VERSION)
             .unwrap();
         publish(&journal);
         drop(journal);
 
         let mut journal = fixture.open();
         assert_eq!(journal.records()[0].entry.forest_rows, None);
-        assert_eq!(journal.records()[0].replay.as_ref().unwrap().proof, proof());
+        assert_eq!(
+            journal
+                .read_record(&journal.records()[0])
+                .unwrap()
+                .replay
+                .unwrap()
+                .proof,
+            proof()
+        );
         journal.bind_legacy_forest_rows(12).unwrap();
         assert_eq!(journal.records()[0].entry.forest_rows, Some(12));
     }
@@ -1608,7 +1871,10 @@ mod tests {
             journal.append(entry(height)).unwrap();
         }
         publish(&journal);
-        let pruning = journal.prepare_prune(2).unwrap().unwrap();
+        let pruning = journal
+            .prepare_prune(2, journal.published_count())
+            .unwrap()
+            .unwrap();
         let generation = journal.shared.marker.lock().generation;
         journal.shared.poisoned.store(true, Ordering::Release);
         assert!(pruning.finish().is_err());
@@ -1627,9 +1893,11 @@ mod tests {
             journal.append(entry(height)).unwrap();
         }
         publish(&journal);
-        let mut pruning = journal.prepare_prune(2).unwrap().unwrap();
-        pruning.publisher.marker_file =
-            File::open(append_path_suffix(&fixture.path, PUBLICATION_SUFFIX)).unwrap();
+        let mut pruning = journal
+            .prepare_prune(2, journal.published_count())
+            .unwrap()
+            .unwrap();
+        pruning.publisher.file = File::open(&fixture.path).unwrap();
         assert!(pruning.finish().is_err());
         assert!(journal.shared.poisoned.load(Ordering::Acquire));
         assert!(journal
@@ -1650,14 +1918,16 @@ mod tests {
         assert!(journal.records().is_empty());
         assert!(journal.latest_forward().is_none());
         journal.publisher().unwrap().publish(boundary).unwrap();
-        let entry = Arc::clone(&journal.records()[0].entry);
-        let header = journal.records()[0].replay.as_ref().unwrap().header;
+        let payload = journal.read_record(&journal.records()[0]).unwrap();
+        let entry = payload.entry;
+        let header = payload.replay.unwrap().header;
         drop(journal);
 
         let journal = fixture.open();
         assert_eq!(journal.records().len(), 1);
-        assert_eq!(journal.records()[0].entry, entry);
-        let replay = journal.records()[0].replay.as_ref().unwrap();
+        let payload = journal.read_record(&journal.records()[0]).unwrap();
+        assert_eq!(payload.entry, entry);
+        let replay = payload.replay.unwrap();
         assert_eq!(replay.header, header);
         assert_eq!(replay.proof, proof());
         assert_eq!(replay.proof_forest_rows, 8);
@@ -1673,10 +1943,12 @@ mod tests {
         append_block(&mut journal, 2);
         journal.flush().unwrap(); // Crash between WAL fsync and marker bump.
         assert_eq!(journal.records().len(), 1);
+        assert_eq!(journal.published_count(), 1);
         drop(journal);
 
         let journal = fixture.open();
         assert_eq!(journal.records().len(), 1);
+        assert_eq!(journal.published_count(), 1);
         assert_eq!(journal.file.metadata().unwrap().len(), published_end);
     }
 
@@ -1708,7 +1980,10 @@ mod tests {
         drop(journal);
         let journal = fixture.open();
         assert!(journal.records().is_empty());
-        assert_eq!(journal.file.metadata().unwrap().len(), journal.page_size);
+        assert_eq!(
+            journal.file.metadata().unwrap().len(),
+            3 * journal.page_size
+        );
     }
 
     #[test]
@@ -1767,26 +2042,27 @@ mod tests {
         };
         let bytes = encode_publication_marker(&attempted);
         journal
-            .marker_file
+            .file
             .write_all_at(
                 &bytes[..76],
-                (attempted.generation % 2) * PUBLICATION_SLOT_SIZE,
+                publication_offsets(journal.page_size)[(attempted.generation % 2) as usize],
             )
             .unwrap();
-        journal.marker_file.sync_data().unwrap();
+        journal.file.sync_data().unwrap();
         drop(journal);
         let journal = fixture.open();
         assert_eq!(journal.records().len(), 1);
+        assert_eq!(journal.published_count(), 1);
         assert_eq!(journal.file.metadata().unwrap().len(), first_end);
     }
 
     #[test]
     fn missing_or_corrupt_markers_never_import_a_publication_wal_as_legacy() {
-        for remove in [false, true] {
-            let fixture = Fixture::new(if remove {
-                "missing-marker"
-            } else {
+        for corrupt_checksum in [false, true] {
+            let fixture = Fixture::new(if corrupt_checksum {
                 "corrupt-marker"
+            } else {
+                "missing-marker"
             });
             let mut journal = fixture.open();
             append_block(&mut journal, 1);
@@ -1794,13 +2070,15 @@ mod tests {
             append_block(&mut journal, 2);
             journal.flush().unwrap();
             let file_len = journal.file.metadata().unwrap().len();
-            drop(journal);
-            let marker_path = append_path_suffix(&fixture.path, PUBLICATION_SUFFIX);
-            if remove {
-                std::fs::remove_file(marker_path).unwrap();
-            } else {
-                std::fs::write(marker_path, [0; PUBLICATION_BYTES]).unwrap();
+            // Even a valid sidecar left by an interrupted migration is not a fallback
+            // once the new superblock identifies the same-file publication format.
+            legacy_sidecar(&fixture.path, *journal.shared.marker.lock());
+            for offset in publication_offsets(journal.page_size) {
+                let offset = offset + if corrupt_checksum { 156 } else { 0 };
+                journal.file.write_all_at(&[0; 32], offset).unwrap();
             }
+            journal.flush().unwrap();
+            drop(journal);
             assert!(ForestJournal::open(&fixture.path).is_err());
             assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), file_len);
         }
@@ -1849,7 +2127,7 @@ mod tests {
             }
             for generation in marker.generation + 1..=marker.generation + 2 {
                 marker.generation = generation;
-                write_publication_marker(&journal.marker_file, &marker).unwrap();
+                write_publication_marker(&journal.file, journal.page_size, &marker).unwrap();
             }
             drop(journal);
             assert!(ForestJournal::open(&fixture.path).is_err());
@@ -1904,7 +2182,10 @@ mod tests {
         publish(&journal);
         journal.append(entry(150)).unwrap();
         let boundary = journal.boundary();
-        let pruning = journal.prepare_prune(144).unwrap().unwrap();
+        let pruning = journal
+            .prepare_prune(144, journal.published_count())
+            .unwrap()
+            .unwrap();
         assert_eq!(journal.records().len(), 144);
         assert_eq!(pruning.finish().unwrap(), 6);
         assert_eq!(journal.boundary(), boundary);
@@ -1924,13 +2205,21 @@ mod tests {
             journal.append(entry(height)).unwrap();
         }
         publish(&journal);
-        journal.prepare_prune(3).unwrap().unwrap().finish().unwrap();
+        journal
+            .prepare_prune(3, journal.published_count())
+            .unwrap()
+            .unwrap()
+            .finish()
+            .unwrap();
         let marker = *journal.shared.marker.lock();
         journal
-            .marker_file
-            .write_all_at(&[0; 8], (marker.generation % 2) * PUBLICATION_SLOT_SIZE)
+            .file
+            .write_all_at(
+                &[0; 8],
+                publication_offsets(journal.page_size)[(marker.generation % 2) as usize],
+            )
             .unwrap();
-        journal.marker_file.sync_data().unwrap();
+        journal.file.sync_data().unwrap();
         drop(journal);
         let journal = fixture.open();
         assert_eq!(journal.records().len(), 3);
@@ -1948,7 +2237,10 @@ mod tests {
         for index in (140..150).rev() {
             journal.mark_rolled_back(index).unwrap();
         }
-        assert!(journal.prepare_prune(144).unwrap().is_none());
+        assert!(journal
+            .prepare_prune(144, journal.published_count())
+            .unwrap()
+            .is_none());
         drop(journal);
         let journal = fixture.open();
         assert_eq!(journal.records().len(), 150);
@@ -1971,10 +2263,10 @@ mod tests {
                 &file,
                 page_size(),
                 offset,
-                entry,
-                None,
+                &entry,
                 &payload,
                 LEGACY_RECORD_VERSION,
+                u64::from(height),
             )
             .unwrap();
             if height == 1 {
@@ -1998,12 +2290,16 @@ mod tests {
         legacy_file(&fixture);
         let mut journal = fixture.open();
         assert_eq!(journal.records().len(), 2);
-        assert_eq!(*journal.records()[0].entry, entry(2));
+        assert_eq!(
+            *journal.read_record(&journal.records()[0]).unwrap().entry,
+            entry(2)
+        );
         assert_eq!(journal.records()[0].status, JournalStatus::RolledBack);
-        assert!(journal
-            .records()
-            .iter()
-            .all(|record| record.replay.is_none()));
+        assert!(journal.records().iter().all(|record| journal
+            .read_record(record)
+            .unwrap()
+            .replay
+            .is_none()));
         let id = journal.journal_id;
         append_block(&mut journal, 4);
         journal.flush().unwrap();
@@ -2033,5 +2329,121 @@ mod tests {
         assert_eq!(journal.records()[0].entry.height, 2);
         assert_eq!(journal.records()[0].status, JournalStatus::RolledBack);
         assert!(!append_path_suffix(&fixture.path, INITIALIZE_SUFFIX).exists());
+    }
+
+    #[test]
+    fn payloads_are_read_from_disk_and_append_does_not_advance_count() {
+        let fixture = Fixture::new("lazy-payload-count");
+        let mut journal = fixture.open();
+        let header = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin).header;
+        let mut entry = entry(1);
+        entry.block_hash = header.block_hash();
+        entry.previous_block_hash = header.prev_blockhash;
+        entry.forest_rows = Some(8);
+        let entry = Arc::new(entry);
+        let proof = proof();
+        journal
+            .append_block(Arc::clone(&entry), header, Arc::clone(&proof), 8)
+            .unwrap();
+        assert_eq!(Arc::strong_count(&entry), 1);
+        assert_eq!(Arc::strong_count(&proof), 1);
+        assert_eq!(journal.published_count(), 0);
+        journal.flush().unwrap();
+        assert_eq!(journal.published_count(), 0);
+        publish(&journal);
+        assert_eq!(journal.published_count(), 1);
+        let record = journal.records()[0];
+        let reader = journal.reader().unwrap();
+        assert_eq!(reader.read_record(&record).unwrap().entry, entry);
+        journal
+            .file
+            .write_all_at(&[0xff], record.offset + RECORD_HEADER_SIZE as u64)
+            .unwrap();
+        assert!(
+            reader.read_record(&record).is_err(),
+            "consumer must not return a cached payload"
+        );
+    }
+
+    #[test]
+    fn pruning_never_removes_published_unapplied_records() {
+        let fixture = Fixture::new("prune-applied-edge");
+        let mut journal = fixture.open();
+        for height in 1..=600 {
+            append_block(&mut journal, height);
+        }
+        publish(&journal);
+        assert!(journal.prepare_prune(144, 100).unwrap().is_none());
+        journal
+            .prepare_prune(144, 200)
+            .unwrap()
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(journal.records()[0].count, 57);
+        assert_eq!(journal.records().last().unwrap().count, 600);
+        assert_eq!(journal.records_after(200, 100).len(), 100);
+        drop(journal);
+        let journal = fixture.open();
+        assert_eq!(journal.published_count(), 600);
+        assert_eq!(journal.records()[0].count, 57);
+    }
+
+    #[test]
+    fn initialized_v3_sidecar_migrates_published_payloads_and_status() {
+        let fixture = Fixture::new("initialized-v3-migration");
+        let mut journal = fixture.open();
+        append_block(&mut journal, 1);
+        append_block(&mut journal, 2);
+        publish(&journal);
+        journal.mark_rolled_back(0).unwrap();
+        let boundary = journal.boundary();
+        let id = journal.journal_id;
+        append_block(&mut journal, 3);
+        journal.flush().unwrap();
+        let page_size = journal.page_size;
+        let old_path = fixture.root.join("old-wal");
+        let old_file = File::create(&old_path).unwrap();
+        old_file.set_len(page_size).unwrap();
+        write_superblock(&old_file, page_size, id, LEGACY_WAL_MAGIC).unwrap();
+        let mut bytes = vec![0; (journal.file.metadata().unwrap().len() - 3 * page_size) as usize];
+        journal
+            .file
+            .read_exact_at(&mut bytes, 3 * page_size)
+            .unwrap();
+        old_file.write_all_at(&bytes, page_size).unwrap();
+        old_file.sync_all().unwrap();
+        let sidecar_path = append_path_suffix(&fixture.path, PUBLICATION_SUFFIX);
+        let mut marker = *journal.shared.marker.lock();
+        marker.replay_start -= 2 * page_size;
+        marker.boundary.end -= 2 * page_size;
+        marker.boundary.offset -= 2 * page_size;
+        legacy_sidecar(&fixture.path, marker);
+        // An interrupted attempt may leave a temporary new WAL next to the intact old one.
+        std::fs::copy(
+            &fixture.path,
+            append_path_suffix(&fixture.path, INITIALIZE_SUFFIX),
+        )
+        .unwrap();
+        drop(journal);
+        std::fs::rename(&old_path, &fixture.path).unwrap();
+        let journal = fixture.open();
+        assert_eq!(journal.journal_id, id);
+        assert_eq!(journal.boundary(), boundary);
+        assert_eq!(journal.published_count(), 2);
+        assert_eq!(journal.records()[0].status, JournalStatus::RolledBack);
+        assert_eq!(
+            journal
+                .read_record(&journal.records()[1])
+                .unwrap()
+                .replay
+                .unwrap()
+                .proof,
+            proof()
+        );
+        assert!(!sidecar_path.exists());
+        assert!(!append_path_suffix(&fixture.path, INITIALIZE_SUFFIX).exists());
+        drop(journal);
+        assert_eq!(fixture.open().published_count(), 2);
     }
 }

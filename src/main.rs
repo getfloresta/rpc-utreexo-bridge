@@ -9,6 +9,7 @@ mod blockfile;
 mod esplora;
 mod forest_journal;
 mod forest_reader;
+mod forest_writer;
 mod header_index;
 
 mod node;

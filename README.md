@@ -247,8 +247,8 @@ Pending journal-overlay nodes take precedence and are omitted from disk reads. T
 lock excludes concurrent mutation/remapping until the snapshot is complete. Target promotion,
 canonical proof-hash lookup, and deletion leaf-hash checks then use only the owned in-memory
 snapshot; target order and duplicates remain aligned with deletion hashes and leaf data.
-The file mapping remains for mutation, startup, and explicit recovery paths, not normal proof
-reads. This still uses the kernel's buffered file cache and does not eliminate cold disk I/O.
+The file mapping remains for update planning, startup/recovery reads, bootstrap, and resize,
+not normal proof reads or state-flusher writes. Buffered I/O still uses the kernel file cache.
 Steady-state opens apply `POSIX_FADV_RANDOM` to disable file readahead, and the remaining
 mapping uses `MADV_RANDOM` and `MADV_NOHUGEPAGE`, including after growth. Steady state
 does not issue `MADV_WILLNEED` or fall back from on-fault locking to eager `mlock`.
@@ -293,20 +293,19 @@ Journal application and rollback use per-block, key-sorted `batch_delete` and `p
 They remove the union of affected keys before reinsertion so replay remains idempotent even
 though the database's append-only batch writer retains duplicate keys.
 
-For each published window, the worker merges the blocks' position-sorted forest deltas and
-writes each touched position exactly once, in ascending physical order. The last block's state
-wins when positions overlap. A heap holds one cursor per nonempty block instead of copying
-or sorting all node states into another window-sized buffer. Leaf-map changes and compaction
-boundaries retain block order under the same exclusive lock. Per-block journal before/after
-states remain unchanged for rollback and recovery of interrupted writes.
+For each bounded application batch, the flusher merges position-sorted forest deltas with
+last-write-wins semantics. Adjacent 33-byte nodes are serialized into one positional write,
+and a reusable `io_uring` submits up to 256 coalesced ranges per wave. It does not read old
+node bytes merely to overwrite them. Forest synchronization uses `fdatasync`; no readahead
+or speculative mapping advice is enabled in steady state. Rollback/replay writes use the
+same writer; bootstrap and online relocation retain their separate mapping operations.
 
-After applying each steady-state block with `height % 1_000 == 0`, the background
-worker compacts leaf-map pages below half occupancy (16,384 live nodes per
-1 MiB page), then syncs the forest and database before publishing completion.
-The worker holds an exclusive forest lock only during mutation, relocation, and compaction;
-foreground lookups cannot retain stale node offsets. During forest/database sync it holds a
-shared lock, allowing proof planning and cache misses to run concurrently. Compaction failures
-stop persistence rather than marking the height durable.
+Leaf-map changes and the every-1,000-block compaction retain block order. Application I/O
+holds shared forest access, allowing the prover to continue: its overlay covers every
+in-flight touched node and outpoint until durable acknowledgement. Only the final in-memory
+leaf-count commit needs brief exclusive access. Raw applied-state reads, repair, rollback,
+and resize remain behind explicit barriers. Errors stop persistence rather than certify a
+durable height.
 Header reads, bootstrap batches, synchronization, and steady-state index replacement/removal
 share a separate storage read/write lock. The header index keeps 64 MiB of body append headroom
 at startup. If a steady-state insertion exhausts that mapping, the persistence worker takes
@@ -337,25 +336,31 @@ before/after hashes and flags, added/removed outpoints with stable bottom positi
 header, compact proof, and both physical and proof forest-row counts. Pending changes remain in the foreground
 overlay; no corresponding forest, leaf-map, header, proof, or proof-index writes occur yet.
 
-Every **100 new blocks**, the prover submits an immutable journal end offset to the persistence
-worker. The worker flushes the journal, advances the checksummed publication marker in
-`forest.journal.published`, then flushes that marker. Alternating marker slots protect against a
-torn update. Later appends may reach disk during this operation, but are not included in the
-captured publication boundary. Journal publication holds no producer metadata lock across sync.
+Every **100 new blocks**, the prover submits an immutable journal count/boundary to a
+dedicated publication thread, independently of the state flusher. Append never advances the
+published count. The publisher flushes journal data, updates the checksummed count/boundary,
+then flushes that metadata. The `BRWAL003` file reserves separate pages for its header and
+two alternating `BRPUB002` publication slots, protecting the previous boundary from a torn
+update. Concurrent later appends are not included in that captured boundary.
 
-Only after publication succeeds does the worker write proofs, headers, and proof-index entries,
-apply merged forest writes and block-ordered leaf-map changes, sync those stores, and commit the final applied
-height. Notifications and completions follow that applied-height commit, not journal publication.
-There is at most one submitted window and one accumulating window: **200 pending blocks**.
-The old 256 MiB pending-memory gate is removed because it could prevent reaching publication;
-memory usage now depends on the contents of those bounded windows, separately from the Pollard
-cache quota. Journal entries and proof payloads are shared rather than copied into each queue.
+The state flusher tails only the published prefix, decoding at most **100 records** per
+application batch directly from the journal. It keeps consuming until it reaches the
+published edge, then sleeps until publication or an explicit operation wakes it. Proofs,
+headers, indexes, and forest state are applied before the durable height and notifications
+advance. Pruning never removes unapplied records and retains 144 applied forward records.
 
-`persistence_enqueue` includes unsynced journal append and window-boundary backpressure.
-`background-persistence` reports `publication` (journal flush, marker bump, marker flush),
-`apply`, `state_flush`, `proof_store`, `header_store`, `proof_index_write`, and `height_commit`.
-Its `first_height`, `height` (last height), and `blocks` identify the window; durations are window
-totals. Completing a prover range publishes its partial window and waits for application before
+There is no 200-block application gate or decoded block-payload queue. A slow state flusher
+does not block subsequent 100-block publications or normal catch-up proving. The disk journal
+holds the backlog; RAM still tracks lightweight journal metadata and the latest pending
+node/outpoint overlay, so memory use can grow with the distinct pending changes. Completion
+uses a coalesced applied cursor rather than a queue requiring producer acknowledgement.
+Shared storage contention and brief metadata locking remain; no filesystem promises
+unbounded throughput or disk capacity.
+
+`persistence_enqueue` includes unsynced append and boundary submission, not an application
+barrier. `background-persistence` reports `apply`, `state_flush`, `proof_store`, `header_store`,
+`proof_index_write`, and `height_commit` for its applied `blocks` ending at `height`. These are
+batch durations, not per-block durations. Completing a prover range publishes its partial window and waits for application before
 returning, so catching up to Core's tip makes every generated proof available to P2P. During
 normal operation, even a single newly mined block is published at the end of its range.
 
@@ -388,11 +393,14 @@ Storage opening and crash recovery also run on named startup workers, including 
 metadata initialization and proof truncation. Startup joins these workers before constructing the
 thread-local Pollard; no recovery flush is issued by the caller.
 
-Existing legacy journals are imported once at startup into the publication format. A permanent
-initialization header distinguishes them from publication journals: a missing or corrupt marker
-on an initialized journal is an error, never permission to replay an unpublished tail.
-Keep `forest.journal`, `forest.journal.published`, and any `forest.journal.forest-rows` together;
-do not downgrade to an older binary against the new journal format. Version-3 records store
+Legacy journals are imported at startup. Initialized `BRWAL002` journals and their
+`.published` sidecars migrate by a fully synced temporary-file replacement that preserves
+WAL identity, retained published records/status, and layout binding, while discarding the
+unpublished tail. Migration temporarily needs disk space for that published prefix.
+The old sidecar is removed durably after migration; a `BRWAL003` journal never falls back
+to a stale sidecar when its embedded markers are corrupt.
+Keep `forest.journal` and any `forest.journal.forest-rows` together (and retain the old
+`.published` sidecar until migration). Do not downgrade after migration. Version-3 records store
 their physical layout; older records are bound once to a checksummed `.forest-rows` sidecar
 before replay or resuming a resize. An interrupted resize supplies its original row count.
 Histories that already completed a resize under an older binary without layout metadata have

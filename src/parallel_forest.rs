@@ -37,6 +37,7 @@ use crate::forest_journal::JournalForestDelta;
 use crate::forest_journal::JournalIndexDelta;
 use crate::forest_journal::JournalNodeState;
 use crate::forest_reader::ForestReader;
+use crate::forest_writer::ForestWriter;
 use crate::header_index::HeaderBuildWriter;
 use crate::header_index::HeaderIndex;
 use crate::position_timing::PositionTimer;
@@ -321,6 +322,7 @@ impl FlatForestReader {
 struct FlatForest {
     map: MmapMut,
     file: File,
+    writer: ForestWriter,
     path: PathBuf,
     node_count: u64,
     lock_pages: bool,
@@ -416,8 +418,10 @@ fn forest_rows_from_node_count(node_count: u64) -> Result<u8> {
     u8::try_from(positional_size.ilog2() - 1).context("forest height exceeds u8")
 }
 
-// Each position has exactly one writer. `ForestNode::flags` publishes the non-atomic hash bytes
-// with release/acquire ordering before any other thread reads them.
+// Bootstrap positions have one writer; READY release/acquire publishes hash bytes.
+// Steady-state writes run through one serialized io_uring writer. Its caller either
+// holds exclusive forest access or permits only overlay-isolated reads of disjoint
+// records until all completions arrive. Remapping always requires exclusive access.
 unsafe impl Send for FlatForest {}
 unsafe impl Sync for FlatForest {}
 
@@ -481,6 +485,7 @@ impl FlatForest {
         let mut forest = Self {
             map,
             file,
+            writer: ForestWriter::default(),
             path: path.to_path_buf(),
             node_count,
             lock_pages,
@@ -502,7 +507,8 @@ impl FlatForest {
             .with_context(|| format!("failed to open forest file {}", path.display()))?;
         // io_uring buffered reads use this file description's readahead policy.
         // Sorted sparse requests are not a sequential scan of the intervening bytes.
-        let advice = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        let advice =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
         if advice != 0 {
             return Err(std::io::Error::from_raw_os_error(advice))
                 .context("failed to disable steady-state forest readahead");
@@ -522,6 +528,7 @@ impl FlatForest {
         let mut forest = Self {
             map,
             file,
+            writer: ForestWriter::default(),
             path: path.to_path_buf(),
             node_count,
             lock_pages,
@@ -819,23 +826,50 @@ impl FlatForest {
         })
     }
 
-    fn set_journal_state(&self, position: u64, state: JournalNodeState) -> Result<()> {
-        let node = self.node(position)?;
-        node.flags.store(WRITING, Ordering::Release);
-        unsafe {
-            *node.hash.get() = state.hash;
+    /// Serialize only new values; bounds checks do not fault old mapped nodes.
+    fn prepare_journal_states(
+        &self,
+        states: impl IntoIterator<Item = (u64, JournalNodeState)>,
+    ) -> Result<(Vec<u64>, Vec<u8>)> {
+        let states = states.into_iter();
+        let mut positions = Vec::with_capacity(states.size_hint().0);
+        let mut bytes =
+            Vec::with_capacity(states.size_hint().0.saturating_mul(size_of::<ForestNode>()));
+        for (position, state) in states {
+            if position >= self.node_count {
+                bail!("forest position {position} is outside the mapped file");
+            }
+            positions.push(position);
+            bytes.extend_from_slice(&state.hash);
+            bytes.push(if state.ready {
+                READY | if state.spent { SPENT } else { 0 }
+            } else {
+                0
+            });
         }
-        let flags = if state.ready {
-            READY | if state.spent { SPENT } else { 0 }
-        } else {
-            0
-        };
-        node.flags.store(flags, Ordering::Release);
-        Ok(())
+        Ok((positions, bytes))
+    }
+
+    fn set_journal_states(
+        &self,
+        states: impl IntoIterator<Item = (u64, JournalNodeState)>,
+    ) -> Result<()> {
+        let (positions, bytes) = self.prepare_journal_states(states)?;
+        self.writer
+            .write_nodes(&self.file, &positions, size_of::<ForestNode>(), bytes)
+    }
+
+    #[cfg(test)]
+    fn set_journal_state(&self, position: u64, state: JournalNodeState) -> Result<()> {
+        self.set_journal_states([(position, state)])
     }
 
     fn flush(&self) -> Result<()> {
-        self.map.flush().context("failed to flush completed forest")
+        // fdatasync covers buffered io_uring writes and bootstrap/resize mmap dirties.
+        // A mapping-only flush does not express the explicit writer's durability.
+        self.file
+            .sync_data()
+            .context("failed to sync completed forest")
     }
 }
 
@@ -1178,13 +1212,27 @@ fn merged_forest_writes<'a>(
     })
 }
 
-/// A completed flat forest: mutation requires exclusive access, while reads and sync may share it.
+/// A completed flat forest. Layout/scalar changes require exclusive access.
+/// Published I/O may share access only with fully overlay-isolated producer reads.
 pub struct SteadyStateForest {
     forest: FlatForest,
     reader: ForestReader,
     leaf_map: Database,
     leaves: u64,
     forest_rows: u8,
+}
+
+/// Owned serialization plus borrowed bounded WAL payloads; preparation performs no I/O.
+pub(crate) struct PreparedForestBatch<'a> {
+    entries: &'a [&'a JournalEntry],
+    positions: Vec<u64>,
+    bytes: Vec<u8>,
+    forest_rows: u8,
+}
+
+/// Produced only after all node/index writes have completed; committing is memory-only.
+pub(crate) struct AppliedForestBatch {
+    leaves: Option<u64>,
 }
 
 /// Foreground state newer than the durability worker's forest. Entries are retired by
@@ -1211,6 +1259,22 @@ impl ForestOverlay {
         }
     }
 
+    /// Retire only acknowledged heights; newer overwrites of the same key survive.
+    pub(crate) fn retire_through(&mut self, height: u32) {
+        let nodes = &mut self.nodes;
+        self.node_heights.retain(|position, last_height| {
+            if *last_height <= height {
+                nodes.remove(position);
+                false
+            } else {
+                true
+            }
+        });
+        self.positions
+            .retain(|_, (last_height, _)| *last_height > height);
+    }
+
+    #[cfg(test)]
     pub(crate) fn retire(&mut self, entry: &JournalEntry) {
         for delta in &entry.forest {
             if self.node_heights.get(&delta.position) == Some(&entry.height) {
@@ -1230,8 +1294,11 @@ impl ForestOverlay {
     }
 }
 
-/// A read-locked physical forest plus the producer's not-yet-durable mutations.
-/// The lock excludes mmap writes/remapping, but is shared with background fsync.
+/// A read-locked physical forest plus every producer mutation not yet acknowledged.
+/// All reads consult the overlay first, including planning and recovery. During
+/// shared background I/O it must cover every touched node/outpoint, even entries
+/// newer than the worker's batch; retirement follows completed application/sync.
+/// The lock prevents remapping, while disjoint disk reads may share explicit writes.
 pub(crate) struct ForestView<'a> {
     forest: &'a SteadyStateForest,
     overlay: &'a ForestOverlay,
@@ -2152,49 +2219,112 @@ impl SteadyStateForest {
         Ok(roots)
     }
 
-    /// Applies one published window under exclusive access. Each entry's forest
-    /// deltas must be position-sorted and use the same physical forest layout.
-    /// Write each touched node once, then preserve block order for leaf-map changes.
-    pub(crate) fn apply_forward_batch(&mut self, entries: &[&JournalEntry]) -> Result<()> {
+    /// Prepare a published window without reading or writing old node bytes.
+    pub(crate) fn prepare_forward_batch<'a>(
+        &self,
+        entries: &'a [&'a JournalEntry],
+    ) -> Result<PreparedForestBatch<'a>> {
         for entry in entries {
             if self.journal_forest_rows(entry)? != self.forest_rows {
                 bail!("published window spans different physical forest layouts");
             }
-            debug_assert!(entry
+            if entry
                 .forest
                 .windows(2)
-                .all(|pair| pair[0].position <= pair[1].position));
+                .any(|pair| pair[0].position > pair[1].position)
+            {
+                bail!("published forest deltas are not position-sorted");
+            }
         }
-        for (position, state) in merged_forest_writes(entries) {
-            self.forest.set_journal_state(position, state)?;
+        let (positions, bytes) = self
+            .forest
+            .prepare_journal_states(merged_forest_writes(entries))?;
+        Ok(PreparedForestBatch {
+            entries,
+            positions,
+            bytes,
+            forest_rows: self.forest_rows,
+        })
+    }
+
+    /// Write each touched node once, then preserve block order for index changes.
+    ///
+    /// The one application worker retains the forest lock through all completions.
+    /// Shared access is permitted ONLY with ForestView reads whose producer overlay
+    /// covers all in-flight changed records/keys. Raw roots, scalar recovery,
+    /// rollback, repair, and resize must remain behind the application's barrier.
+    pub(crate) fn apply_prepared_batch(
+        &self,
+        prepared: PreparedForestBatch<'_>,
+    ) -> Result<AppliedForestBatch> {
+        if prepared.forest_rows != self.forest_rows {
+            bail!("forest layout changed after preparing published writes");
         }
-        for entry in entries {
+        self.forest.writer.write_nodes(
+            &self.forest.file,
+            &prepared.positions,
+            size_of::<ForestNode>(),
+            prepared.bytes,
+        )?;
+        for entry in prepared.entries {
             self.apply_leaf_map_delta(&entry.removed, &entry.added)?;
-            self.leaves = entry.num_leaves;
             if entry.height % 1_000 == 0 {
                 self.compact_leaf_map()?;
             }
         }
+        Ok(AppliedForestBatch {
+            leaves: prepared.entries.last().map(|entry| entry.num_leaves),
+        })
+    }
+
+    pub(crate) fn commit_forward_batch(&mut self, applied: AppliedForestBatch) -> Result<()> {
+        if let Some(leaves) = applied.leaves {
+            self.leaves = leaves;
+        }
         Ok(())
     }
 
-    pub fn apply_forward(&mut self, entry: &JournalEntry) -> Result<()> {
+    /// Exclusive convenience path for recovery/tests; the worker uses the split API.
+    pub(crate) fn apply_forward_batch(&mut self, entries: &[&JournalEntry]) -> Result<()> {
+        let prepared = self.prepare_forward_batch(entries)?;
+        let applied = self.apply_prepared_batch(prepared)?;
+        self.commit_forward_batch(applied)
+    }
+
+    fn apply_journal_nodes(&self, entry: &JournalEntry, forward: bool) -> Result<()> {
         let rows = self.journal_forest_rows(entry)?;
-        for delta in &entry.forest {
-            let position = self.journal_position(delta.position, rows)?;
-            self.forest.set_journal_state(position, delta.after)?;
-        }
+        // Recovery accepts legacy unsorted/repeated deltas. Sort by position and
+        // original application precedence, retaining exactly the scalar last write.
+        let mut writes = entry
+            .forest
+            .iter()
+            .enumerate()
+            .map(|(index, delta)| {
+                Ok((
+                    self.journal_position(delta.position, rows)?,
+                    if forward { usize::MAX - index } else { index },
+                    if forward { delta.after } else { delta.before },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writes.sort_unstable_by_key(|&(position, precedence, _)| (position, precedence));
+        writes.dedup_by_key(|write| write.0);
+        self.forest.set_journal_states(
+            writes
+                .into_iter()
+                .map(|(position, _, state)| (position, state)),
+        )
+    }
+
+    pub fn apply_forward(&mut self, entry: &JournalEntry) -> Result<()> {
+        self.apply_journal_nodes(entry, true)?;
         self.apply_leaf_map_delta(&entry.removed, &entry.added)?;
         self.leaves = entry.num_leaves;
         Ok(())
     }
 
     pub fn apply_backward(&mut self, entry: &JournalEntry) -> Result<()> {
-        let rows = self.journal_forest_rows(entry)?;
-        for delta in entry.forest.iter().rev() {
-            let position = self.journal_position(delta.position, rows)?;
-            self.forest.set_journal_state(position, delta.before)?;
-        }
+        self.apply_journal_nodes(entry, false)?;
         self.apply_leaf_map_delta(&entry.added, &entry.removed)?;
         self.leaves = entry.previous_num_leaves()?;
         Ok(())
@@ -2221,7 +2351,7 @@ impl SteadyStateForest {
     }
 
     fn apply_leaf_map_delta(
-        &mut self,
+        &self,
         removed: &[JournalIndexDelta],
         inserted: &[JournalIndexDelta],
     ) -> Result<()> {
@@ -2278,11 +2408,11 @@ impl SteadyStateForest {
             return Ok(false);
         }
         for record in journal.records().iter().rev() {
-            self.apply_backward(&record.entry)?;
+            self.apply_backward(&journal.read_record(record)?.entry)?;
         }
         for record in journal.records() {
             if record.status == crate::forest_journal::JournalStatus::Forward {
-                self.apply_forward(&record.entry)?;
+                self.apply_forward(&journal.read_record(record)?.entry)?;
             }
         }
         if !journal.records().is_empty() {
@@ -3998,7 +4128,6 @@ pub(crate) mod tests {
         }
         drop(forest);
         std::fs::remove_file(journal_path).unwrap();
-        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -4387,7 +4516,7 @@ pub(crate) mod tests {
             assert!(!resize_marker_path(&path).exists());
             assert_eq!(SteadyStateForest::legacy_journal_rows(&path).unwrap(), 3);
             assert!(steady.leaf_position(&outpoint).is_err());
-            let entry = Arc::clone(&journal.records()[0].entry);
+            let entry = journal.read_record(&journal.records()[0]).unwrap().entry;
             journal.mark_rolled_back(0).unwrap();
             steady.apply_backward(&entry).unwrap();
             steady.sync().unwrap();
@@ -4396,7 +4525,6 @@ pub(crate) mod tests {
         }
         drop(journal);
         std::fs::remove_file(&journal_path).unwrap();
-        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         std::fs::remove_file(path.with_extension("journal.forest-rows")).unwrap();
 
         remove_bootstrap_files(&path, &leaf_map_path);
@@ -4548,10 +4676,26 @@ pub(crate) mod tests {
             merged_forest_writes(&[&repeated, &entries[0]]).next(),
             Some((first_delta.position, first_delta.after))
         );
+        let baseline_bytes = std::fs::read(&path).unwrap();
+        // Exercise duplicate precedence on the real file, not only the merge plan.
+        for batched in [false, true] {
+            if batched {
+                forest.apply_forward_batch(&[&repeated]).unwrap();
+            } else {
+                forest.apply_forward(&repeated).unwrap();
+            }
+            assert_eq!(
+                forest.forest.journal_state(first_delta.position).unwrap(),
+                JournalNodeState::UNINITIALIZED
+            );
+            forest.apply_backward(&repeated).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), baseline_bytes);
+        }
         for entry in &entries {
             forest.apply_forward(entry).unwrap();
         }
         let expected_roots = forest.roots().unwrap();
+        let expected_bytes = std::fs::read(&path).unwrap();
         let expected_states: Vec<_> = merged
             .iter()
             .map(|(position, _)| (*position, forest.forest.journal_state(*position).unwrap()))
@@ -4560,6 +4704,59 @@ pub(crate) mod tests {
             forest.apply_backward(entry).unwrap();
         }
         assert_eq!(forest.roots().unwrap(), baseline);
+        assert_eq!(std::fs::read(&path).unwrap(), baseline_bytes);
+        let mut producer_overlay = ForestOverlay::default();
+        for entry in &entries {
+            producer_overlay.push(entry);
+        }
+        let expected_proof = ForestView::new(&forest, &producer_overlay, leaves)
+            .read_proof(&[position])
+            .unwrap();
+        let prepared = forest.prepare_forward_batch(&borrowed).unwrap();
+        let applied = thread::scope(|scope| {
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let worker_gate = Arc::clone(&gate);
+            let shared_forest = &forest;
+            let worker = scope.spawn(move || {
+                worker_gate.wait();
+                shared_forest.apply_prepared_batch(prepared).unwrap()
+            });
+            gate.wait();
+            for _ in 0..32 {
+                let view = ForestView::new(&forest, &producer_overlay, leaves);
+                assert_eq!(
+                    view.leaf_positions(&[previous]).unwrap().positions[0]
+                        .as_ref()
+                        .unwrap(),
+                    &position
+                );
+                let proof = view.read_proof(&[position]).unwrap();
+                assert_eq!(proof.targets, expected_proof.targets);
+                assert_eq!(proof.hashes, expected_proof.hashes);
+                assert_eq!(proof.leaves, expected_proof.leaves);
+            }
+            worker.join().unwrap()
+        });
+        // The shared I/O phase cannot publish scalar metadata prematurely.
+        assert_eq!(forest.leaves(), entries[0].previous_num_leaves().unwrap());
+        forest.commit_forward_batch(applied).unwrap();
+        forest.sync().unwrap();
+        producer_overlay.retire_through(50);
+        assert!(producer_overlay
+            .node_heights
+            .values()
+            .all(|height| *height > 50));
+        assert!(producer_overlay.nodes.contains_key(&position));
+        producer_overlay.retire_through(entries.last().unwrap().height);
+        assert!(producer_overlay.nodes.is_empty());
+        assert!(producer_overlay.node_heights.is_empty());
+        assert!(producer_overlay.positions.is_empty());
+        let proof = ForestView::new(&forest, &producer_overlay, leaves)
+            .read_proof(&[position])
+            .unwrap();
+        assert_eq!(proof.targets, expected_proof.targets);
+        assert_eq!(proof.hashes, expected_proof.hashes);
+        assert_eq!(proof.leaves, expected_proof.leaves);
         for _ in 0..2 {
             forest.apply_forward_batch(&borrowed).unwrap();
             assert_eq!(forest.roots().unwrap(), expected_roots);
@@ -4569,6 +4766,7 @@ pub(crate) mod tests {
             for (position, state) in &expected_states {
                 assert_eq!(forest.forest.journal_state(*position).unwrap(), *state);
             }
+            assert_eq!(std::fs::read(&path).unwrap(), expected_bytes);
         }
         // Model an interrupted sorted write pass: some nodes retain old states.
         forest
@@ -4594,12 +4792,12 @@ pub(crate) mod tests {
         for (position, state) in &expected_states {
             assert_eq!(forest.forest.journal_state(*position).unwrap(), *state);
         }
+        assert_eq!(std::fs::read(&path).unwrap(), expected_bytes);
         println!("forest-window-smoke blocks={} scalar_writes={} sorted_unique_writes={} roots_leaf_map_reopen_recovery=ok",
             entries.len(), entries.iter().map(|entry| entry.forest.len()).sum::<usize>(), merged.len());
         drop(journal);
         drop(forest);
         std::fs::remove_file(journal_path).unwrap();
-        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -4836,7 +5034,6 @@ pub(crate) mod tests {
         }
 
         std::fs::remove_file(journal_path).unwrap();
-        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
@@ -4895,7 +5092,6 @@ pub(crate) mod tests {
         drop(forest);
 
         std::fs::remove_file(journal_path).unwrap();
-        std::fs::remove_file(path.with_extension("journal.published")).unwrap();
         remove_bootstrap_files(&path, &leaf_map_path);
     }
 
