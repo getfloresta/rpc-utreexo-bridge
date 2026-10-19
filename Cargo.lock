@@ -1446,7 +1446,7 @@ dependencies = [
 [[package]]
 name = "rustreexo"
 version = "0.7.0"
-source = "git+https://github.com/Davidson-Souza/rustreexo?branch=bridge#558120be4e815181c5440280d921d629e123256b"
+source = "git+https://github.com/Davidson-Souza/rustreexo?branch=bridge#e66950cb2658fb23af0263189c55d4b54c7bbf97"
 dependencies = [
  "bitcoin-io 0.6.0",
  "bitcoin_hashes 1.2.0",

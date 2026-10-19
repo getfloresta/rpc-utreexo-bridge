@@ -48,8 +48,8 @@ use crate::forest_journal::JournalEntry;
 use crate::forest_journal::JournalPublisher;
 use crate::forest_journal::JournalStatus;
 use crate::header_index::HeaderIndex;
+use crate::parallel_forest::retain_pollard_update;
 use crate::parallel_forest::tree_rows;
-use crate::parallel_forest::ForestOverlay;
 use crate::parallel_forest::ForestView;
 use crate::parallel_forest::SteadyStateForest;
 use crate::position_timing::PositionTimer;
@@ -63,7 +63,6 @@ use crate::udata::LeafData;
 
 const MIN_PARALLEL_ADDITION_HASHES: usize = 128;
 
-const LEAF_CACHE_BLOCKS: u32 = 144;
 pub(crate) fn is_unspendable(script: &Script) -> bool {
     script.len() > 10_000 || script.as_bytes().first() == Some(&0x6a)
 }
@@ -204,9 +203,9 @@ impl PersistenceState {
         let started = Instant::now();
         let entries: Vec<_> = blocks.iter().map(|block| block.entry.as_ref()).collect();
         let applied = {
-            // All in-flight touched positions and outpoints remain in the producer
-            // overlay until the durable applied cursor is acknowledged. Consequently
-            // ForestView reads only disjoint, unchanged disk records during this I/O.
+            // Pollard retains every changed physical node until a producer-tip
+            // durability barrier permits pruning. ForestView therefore reads
+            // only unchanged disk records while these writes are in flight.
             let forest = self
                 .forest
                 .read()
@@ -377,7 +376,6 @@ impl PersistenceState {
 #[derive(Default)]
 struct PersistenceProgress {
     applied_count: u64,
-    applied_height: u32,
     error: Option<String>,
     stopping: bool,
 }
@@ -412,7 +410,6 @@ impl PersistenceWorker {
         let signal = Arc::new(PersistenceSignal {
             progress: Mutex::new(PersistenceProgress {
                 applied_count: state.applied_count,
-                applied_height: state.height,
                 ..Default::default()
             }),
             changed: parking_lot::Condvar::new(),
@@ -493,7 +490,6 @@ impl PersistenceWorker {
                             );
                             let mut progress = state_signal.progress.lock();
                             progress.applied_count = state.applied_count;
-                            progress.applied_height = state.height;
                             state_signal.changed.notify_all();
                             continue;
                         }
@@ -510,8 +506,6 @@ impl PersistenceWorker {
                             let _ = command.completion.send(result);
                             if failed { return Ok(()); }
                             if shutdown { return Ok(()); }
-                            let mut progress = state_signal.progress.lock();
-                            progress.applied_height = state.height;
                             continue;
                         }
                         if progress.stopping { return Ok(()); }
@@ -640,21 +634,8 @@ impl Drop for PersistenceWorker {
 struct CachedPollardLeaf {
     creation_height: u32,
     position: u64,
-    hash: BitcoinNodeHash,
 }
 
-#[derive(Clone)]
-struct CachedLeaf {
-    context: LeafContext,
-    position: u64,
-}
-
-fn cached_bottom_position(
-    pollard_position: Option<u64>,
-    cached_leaf: Option<&CachedLeaf>,
-) -> Option<u64> {
-    pollard_position.or_else(|| cached_leaf.map(|leaf| leaf.position))
-}
 fn pollard_from_stump_roots(
     mut roots: Vec<BitcoinNodeHash>,
     leaves: u64,
@@ -678,6 +659,9 @@ fn evict_pollard_cache(
     if initial_usage < memory_limit {
         return Ok((0, initial_usage, initial_usage));
     }
+    // The production caller has applied the complete producer tip before
+    // entering this eviction path. Physical roles are no longer needed.
+    pollard.clear_physical_nodes();
 
     let target = memory_limit / 5;
     let mut evicted = 0usize;
@@ -685,7 +669,7 @@ fn evict_pollard_cache(
         let Some(Reverse(cached)) = leaves.pop() else {
             break;
         };
-        if pollard.position_hash(cached.position) != Some(cached.hash) {
+        if pollard.remembered_leaf_hash(cached.position).is_none() {
             continue;
         }
         pollard
@@ -713,13 +697,11 @@ pub struct FlatFileProver {
     publication_boundary: Option<JournalBoundary>,
     submitted_count: u64,
     applied_count: u64,
-    overlay: ForestOverlay,
     pollard: Pollard<BitcoinNodeHash>,
     pollard_leaves: BinaryHeap<Reverse<CachedPollardLeaf>>,
     pollard_memory_limit: usize,
     height: u32,
     shutdown_flag: Arc<AtomicBool>,
-    leaf_data: HashMap<OutPoint, CachedLeaf>,
     block_hash_cache: HashMap<u32, BlockHash>,
     tip_hash: BlockHash,
 }
@@ -1016,13 +998,11 @@ impl FlatFileProver {
             publication_boundary: None,
             submitted_count: applied_count,
             applied_count,
-            overlay: ForestOverlay::default(),
             pollard,
             pollard_leaves: BinaryHeap::new(),
             pollard_memory_limit,
             height,
             shutdown_flag,
-            leaf_data: HashMap::new(),
             block_hash_cache,
             tip_hash,
         })
@@ -1032,14 +1012,19 @@ impl FlatFileProver {
         if self.pollard.estimated_memory_usage() < self.pollard_memory_limit {
             return Ok(());
         }
-        // Cache misses remain correct through the pending overlay; eviction is not a
-        // durability barrier.
+        // Pending state exists only in Pollard. Publish even a partial window and
+        // wait for the producer tip before allowing any structural/cache pruning.
+        self.sync()?;
+        #[cfg(test)]
+        if let Some(hook) = self.persistence.hook.lock().clone() {
+            hook("before_prune", self.height)?;
+        }
         let (evicted, initial_usage, final_usage) = evict_pollard_cache(
             &mut self.pollard,
             &mut self.pollard_leaves,
             self.pollard_memory_limit,
         )?;
-        if evicted == 0 {
+        if evicted == 0 && initial_usage == final_usage {
             return Ok(());
         }
 
@@ -1057,14 +1042,8 @@ impl FlatFileProver {
 
     fn collect_completed(&mut self) -> anyhow::Result<()> {
         self.persistence.check()?;
-        let (applied_count, applied_height) = {
-            let progress = self.persistence.signal.progress.lock();
-            (progress.applied_count, progress.applied_height)
-        };
-        if applied_count > self.applied_count {
-            self.overlay.retire_through(applied_height);
-            self.applied_count = applied_count;
-        }
+        let applied_count = self.persistence.signal.progress.lock().applied_count;
+        self.applied_count = self.applied_count.max(applied_count);
         Ok(())
     }
 
@@ -1155,14 +1134,12 @@ impl FlatFileProver {
                     .barrier(PersistenceBarrier::DiscardUnpublished)?;
                 self.publication_window = 0;
                 self.publication_boundary = None;
-                self.overlay = ForestOverlay::default();
                 self.pollard = pollard_from_stump_roots(tip.roots, tip.leaves);
                 self.pollard_leaves.clear();
                 self.height = tip.height;
                 self.tip_hash = tip.hash;
                 self.block_hash_cache
                     .retain(|height, _| *height <= tip.height);
-                self.leaf_data.clear();
                 rolled_back += discarded;
                 continue;
             }
@@ -1178,7 +1155,6 @@ impl FlatFileProver {
             self.tip_hash = tip.hash;
             self.block_hash_cache
                 .retain(|height, _| *height <= tip.height);
-            self.leaf_data.clear();
             rolled_back += 1;
             info!(
                 "rolled back orphaned block height={orphan_height} hash={orphan_hash} leaves={}",
@@ -1229,14 +1205,8 @@ impl FlatFileProver {
                     self.tip_hash
                 );
             }
-            let (
-                compact_proof,
-                leaf_cache_hits,
-                leaf_cache_misses,
-                prevout_creation_heights,
-                process_timings,
-                pending,
-            ) = self.process_block(&block, &prevouts, height)?;
+            let (compact_proof, prevout_creation_heights, process_timings, pending) =
+                self.process_block(&block, &prevouts, height)?;
             timings.scan_prevouts = process_timings.scan_prevouts;
             timings.positions = process_timings.positions;
             timings.position_cache = process_timings.position_cache;
@@ -1261,26 +1231,31 @@ impl FlatFileProver {
             let started = Instant::now();
             let entry = Arc::new(pending.entry);
             let proof = Arc::new(compact_proof);
-            let boundary = self.journal.lock().append_block(
+            let appended = self.journal.lock().append_block(
                 Arc::clone(&entry),
                 block.header,
                 Arc::clone(&proof),
                 pending.proof_forest_rows,
-            )?;
+            );
+            let boundary = appended.map_err(|error| {
+                // Pollard already includes this block. Never retry proving from
+                // that state when its WAL record could not be appended.
+                self.persistence.signal.fail(&error);
+                error
+            })?;
             self.publication_boundary = Some(boundary);
             self.publication_window += 1;
-            self.overlay.push(&entry);
             if self.publication_window == PUBLICATION_BLOCKS {
                 self.publish_pending()?;
             }
             timings.persistence_enqueue += started.elapsed();
-            self.enforce_pollard_memory_limit()?;
 
             let started = Instant::now();
             self.block_hash_cache.insert(height, block_hash);
             self.height = height;
             self.tip_hash = block_hash;
             timings.cache_update += started.elapsed();
+            self.enforce_pollard_memory_limit()?;
 
             timings.total = total_started.elapsed();
             let leaves = self.pollard.leaves();
@@ -1290,11 +1265,8 @@ impl FlatFileProver {
                 proof_hash_count,
             );
             debug!(
-                "steady-state-cache height={height} leaf_data={} leaf_cache_hits={} leaf_cache_misses={} leaf_cache_entries={} position_cache_hits={} position_cache_misses={} forest_positions_loaded={} prevout_creation_heights={} pollard_cached_nodes={} pollard_ingested_positions={} pollard_bytes={} pollard_quota={}",
+                "steady-state-cache height={height} leaf_data={} position_cache_hits={} position_cache_misses={} forest_positions_loaded={} prevout_creation_heights={} pollard_cached_nodes={} pollard_ingested_positions={} pollard_bytes={} pollard_quota={}",
                 leaf_count,
-                leaf_cache_hits,
-                leaf_cache_misses,
-                self.leaf_data.len(),
                 timings.position_cache_hits,
                 timings.position_cache_misses,
                 timings.forest_positions_loaded,
@@ -1364,47 +1336,12 @@ impl FlatFileProver {
         acc.recover_leaf_position_from_block(outpoint, leaf_hash, &block_leaves)
     }
 
-    fn recover_missing_leaf_position(
-        &self,
-        acc: &ForestView<'_>,
-        outpoint: OutPoint,
-        prevouts: &HashMap<OutPoint, PrevoutInfo>,
-        creating_block_hashes: &HashMap<u32, BlockHash>,
-    ) -> anyhow::Result<(u64, LeafContext)> {
-        let leaf = if let Some(leaf) = self.leaf_data.get(&outpoint) {
-            leaf.context.clone()
-        } else if let Some(prevout) = prevouts.get(&outpoint) {
-            let block_hash = creating_block_hashes
-                .get(&prevout.height)
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("missing creating block hash for height {}", prevout.height)
-                })?;
-            leaf_context_from_prevout(block_hash, prevout, outpoint)
-        } else {
-            let transaction = self
-                .rpc
-                .get_raw_transaction_info(&outpoint.txid)
-                .with_context(|| format!("failed to recover transaction for {outpoint}"))?;
-            leaf_context_from_transaction(&transaction, outpoint)?
-        };
-        let position = self.recover_leaf_position(acc, outpoint, &leaf)?;
-        Ok((position, leaf))
-    }
-
     fn process_block(
         &mut self,
         block: &Block,
         prevouts: &HashMap<OutPoint, PrevoutInfo>,
         height: u32,
-    ) -> anyhow::Result<(
-        CompactBlockProof,
-        usize,
-        usize,
-        usize,
-        SteadyBlockTimings,
-        PreparedBlock,
-    )> {
+    ) -> anyhow::Result<(CompactBlockProof, usize, SteadyBlockTimings, PreparedBlock)> {
         let mut timings = SteadyBlockTimings::default();
         let started = Instant::now();
         let spent_in_block = same_block_spends(block);
@@ -1418,7 +1355,6 @@ impl FlatFileProver {
             .collect();
         let missing_heights: HashSet<u32> = external_outpoints
             .iter()
-            .filter(|outpoint| !self.leaf_data.contains_key(outpoint))
             .filter_map(|outpoint| prevouts.get(outpoint).map(|prevout| prevout.height))
             .collect();
         timings.scan_prevouts = started.elapsed();
@@ -1464,7 +1400,6 @@ impl FlatFileProver {
                 .collect()
         };
         let mut additions = Vec::with_capacity(addition_contexts.len());
-        let mut added_leaf_data = Vec::with_capacity(addition_contexts.len());
         for (leaf, hash) in addition_contexts
             .into_iter()
             .zip(addition_hashes.iter().copied())
@@ -1474,7 +1409,6 @@ impl FlatFileProver {
                 vout: leaf.vout,
             };
             additions.push((outpoint, hash));
-            added_leaf_data.push((outpoint, leaf));
         }
         timings.additions = started.elapsed();
         self.ensure_forest_capacity(addition_hashes.len())?;
@@ -1488,22 +1422,41 @@ impl FlatFileProver {
         let started = Instant::now();
         let timer = PositionTimer::start();
 
-        let cached_leaf_hashes = external_outpoints
-            .iter()
-            .filter_map(|outpoint| {
-                self.leaf_data
-                    .get(outpoint)
-                    .map(|leaf| (*outpoint, LeafData::get_leaf_hashes(&leaf.context)))
-            })
-            .collect::<HashMap<_, _>>();
-        let cached_bottom_positions = cached_leaf_hashes
+        // Resolve every target hash before consulting the leaf map. Pending
+        // additions have no durable outpoint entry yet, including inputs whose
+        // verbosity-three prevout data was omitted.
+        let mut leaf_contexts = HashMap::with_capacity(external_outpoints.len());
+        let mut prevout_hashes = HashMap::with_capacity(external_outpoints.len());
+        let mut fallback_transactions = HashMap::<Txid, TransactionInfo>::new();
+        for &outpoint in &external_outpoints {
+            let leaf = if let Some(prevout) = prevouts.get(&outpoint) {
+                let block_hash = creating_block_hashes
+                    .get(&prevout.height)
+                    .copied()
+                    .context("missing creating block hash")?;
+                leaf_context_from_prevout(block_hash, prevout, outpoint)
+            } else {
+                let transaction = match fallback_transactions.entry(outpoint.txid) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                        self.rpc
+                            .get_raw_transaction_info(&outpoint.txid)
+                            .with_context(|| {
+                                format!("verbosity-three response omitted prevout {outpoint}")
+                            })?,
+                    ),
+                };
+                leaf_context_from_transaction(transaction, outpoint)?
+            };
+            prevout_hashes.insert(outpoint, LeafData::get_leaf_hashes(&leaf));
+            leaf_contexts.insert(outpoint, leaf);
+        }
+        let cached_bottom_positions = prevout_hashes
             .iter()
             .filter_map(|(outpoint, hash)| {
-                cached_bottom_position(
-                    self.pollard.leaf_position(hash),
-                    self.leaf_data.get(outpoint),
-                )
-                .map(|position| (*outpoint, position))
+                self.pollard
+                    .leaf_position(hash)
+                    .map(|position| (*outpoint, position))
             })
             .collect::<HashMap<_, _>>();
         timings.position_cache_hits = cached_bottom_positions.len();
@@ -1513,7 +1466,7 @@ impl FlatFileProver {
             .read()
             .map_err(|_| anyhow::anyhow!("steady forest lock poisoned"))?;
         self.persistence.check()?;
-        let acc = ForestView::new(&forest, &self.overlay, self.pollard.leaves());
+        let acc = ForestView::new(&forest, &self.pollard, self.pollard.leaves());
         let uncached_outpoints: Vec<_> = external_outpoints
             .iter()
             .filter(|outpoint| !cached_bottom_positions.contains_key(outpoint))
@@ -1527,8 +1480,7 @@ impl FlatFileProver {
         let mut uncached_positions = lookup.positions.into_iter();
         let mut deletions = Vec::with_capacity(external_outpoints.len());
         let mut bottom_positions = Vec::with_capacity(external_outpoints.len());
-        let mut recovered_leaf_data = HashMap::new();
-        let mut cached_target_hashes = HashMap::with_capacity(cached_leaf_hashes.len());
+        let mut cached_target_hashes = HashMap::with_capacity(prevout_hashes.len());
         for outpoint in external_outpoints {
             let bottom_position = match cached_bottom_positions.get(&outpoint) {
                 Some(position) => *position,
@@ -1538,13 +1490,9 @@ impl FlatFileProver {
                 {
                     Ok(position) => position,
                     Err(map_error) => {
-                        let (position, leaf) = self
-                            .recover_missing_leaf_position(
-                                &acc,
-                                outpoint,
-                                prevouts,
-                                &creating_block_hashes,
-                            )
+                        let leaf = &leaf_contexts[&outpoint];
+                        let position = self
+                            .recover_leaf_position(&acc, outpoint, leaf)
                             .with_context(|| {
                                 format!(
                                     "failed explicit position recovery after leaf-map error: {map_error}"
@@ -1554,7 +1502,6 @@ impl FlatFileProver {
                             "recovered missing leaf-map position outpoint={outpoint} height={} position={position}",
                             leaf.block_height
                         );
-                        recovered_leaf_data.insert(outpoint, leaf);
                         position
                     }
                 },
@@ -1567,14 +1514,46 @@ impl FlatFileProver {
         let forest_proof = acc.read_proof(&bottom_positions)?;
         let proof_targets = &forest_proof.targets;
         for ((outpoint, _), proof_position) in deletions.iter().zip(proof_targets) {
-            if let Some(hash) = cached_leaf_hashes.get(outpoint) {
+            if let Some(hash) = prevout_hashes.get(outpoint) {
                 cached_target_hashes.insert(*proof_position, *hash);
             }
         }
         timings.position_traversal = timer.finish();
         timings.positions = started.elapsed();
         let started = Instant::now();
-
+        let mut deletion_hashes = Vec::with_capacity(deletions.len());
+        let mut leaf_data = Vec::with_capacity(deletions.len());
+        for (outpoint, bottom_position) in &deletions {
+            let leaf = leaf_contexts
+                .remove(outpoint)
+                .context("missing resolved leaf context")?;
+            let hash = prevout_hashes[outpoint];
+            if !cached_bottom_positions.contains_key(outpoint) {
+                let stored_hash = forest_proof.leaf_hash(*bottom_position)?;
+                if hash != stored_hash {
+                    let recovered_position = self
+                        .recover_leaf_position(&acc, *outpoint, &leaf)
+                        .with_context(|| {
+                            format!(
+                                "failed to recover {outpoint} after hash mismatch at position {bottom_position}"
+                            )
+                        })?;
+                    drop(forest);
+                    self.sync()?;
+                    self.persistence.barrier(PersistenceBarrier::Repair {
+                        outpoint: *outpoint,
+                        position: recovered_position,
+                    })?;
+                    anyhow::bail!(
+                        "repaired leaf-map position for {outpoint}: {bottom_position} -> {recovered_position}; retry the block"
+                    );
+                }
+            }
+            deletion_hashes.push(hash);
+            leaf_data.push(leaf);
+        }
+        timings.leaf_resolution = started.elapsed();
+        let started = Instant::now();
         // The forest batch already contains the complete proof/traversal read set.
         // Resolve only Pollard's missing hashes from memory, without further forest I/O.
         let missing_positions = self.pollard.missing_positions(proof_targets);
@@ -1603,76 +1582,6 @@ impl FlatFileProver {
         };
         timings.proof_build = started.elapsed();
         let started = Instant::now();
-        let mut deletion_hashes = Vec::with_capacity(deletions.len());
-        let mut leaf_data = Vec::with_capacity(deletions.len());
-        let mut leaf_cache_hits = 0usize;
-        let mut leaf_cache_misses = 0usize;
-        let mut fallback_transactions = HashMap::<Txid, TransactionInfo>::new();
-        for (outpoint, bottom_position) in &deletions {
-            let (leaf, cache_hit) = if let Some(leaf) = recovered_leaf_data.remove(outpoint) {
-                (leaf, false)
-            } else {
-                cached_leaf_context(&self.leaf_data, *outpoint, || {
-                    if let Some(prevout) = prevouts.get(outpoint) {
-                        let block_hash = creating_block_hashes
-                            .get(&prevout.height)
-                            .copied()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing creating block hash for height {}",
-                                    prevout.height
-                                )
-                            })?;
-                        return Ok(leaf_context_from_prevout(block_hash, prevout, *outpoint));
-                    }
-                    let transaction = match fallback_transactions.entry(outpoint.txid) {
-                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                            self.rpc
-                                .get_raw_transaction_info(&outpoint.txid)
-                                .with_context(|| {
-                                    format!("verbosity-three response omitted prevout {outpoint}")
-                                })?,
-                        ),
-                    };
-                    leaf_context_from_transaction(transaction, *outpoint)
-                })?
-            };
-            if cache_hit {
-                leaf_cache_hits += 1;
-            } else {
-                leaf_cache_misses += 1;
-            }
-            let hash = cached_leaf_hashes
-                .get(outpoint)
-                .copied()
-                .unwrap_or_else(|| LeafData::get_leaf_hashes(&leaf));
-            if !cached_bottom_positions.contains_key(outpoint) {
-                let stored_hash = forest_proof.leaf_hash(*bottom_position)?;
-                if hash != stored_hash {
-                    let recovered_position = self
-                        .recover_leaf_position(&acc, *outpoint, &leaf)
-                        .with_context(|| {
-                            format!(
-                                "failed to recover {outpoint} after hash mismatch at position {bottom_position}"
-                            )
-                        })?;
-                    drop(forest);
-                    self.sync()?;
-                    self.persistence.barrier(PersistenceBarrier::Repair {
-                        outpoint: *outpoint,
-                        position: recovered_position,
-                    })?;
-                    anyhow::bail!(
-                        "repaired leaf-map position for {outpoint}: {bottom_position} -> {recovered_position}; retry the block"
-                    );
-                }
-            }
-            deletion_hashes.push(hash);
-            leaf_data.push(leaf);
-        }
-        timings.leaf_resolution = started.elapsed();
-        let started = Instant::now();
         let proof_valid = original_stump
             .verify(&proof, &deletion_hashes)
             .map_err(anyhow::Error::msg)?;
@@ -1687,6 +1596,7 @@ impl FlatFileProver {
             .map_err(anyhow::Error::msg)?;
         timings.stump_update = started.elapsed();
         let started = Instant::now();
+        let acc = ForestView::new(&forest, &self.pollard, self.pollard.leaves());
         let journal_entry = acc.plan_update(
             height,
             block_hash,
@@ -1713,18 +1623,14 @@ impl FlatFileProver {
                 remember: true,
             })
             .collect::<Vec<_>>();
-        let cached_pollard_leaves = added_leaf_data
-            .iter()
-            .zip(addition_hashes.iter())
-            .enumerate()
-            .map(|(offset, ((_, leaf), hash))| {
+        let cached_pollard_leaves = (0..addition_hashes.len())
+            .map(|offset| {
                 Ok(CachedPollardLeaf {
-                    creation_height: leaf.block_height,
+                    creation_height: height,
                     position: original_stump
                         .leaves
                         .checked_add(offset as u64)
                         .context("Pollard leaf position overflow")?,
-                    hash: *hash,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1733,19 +1639,19 @@ impl FlatFileProver {
             .modify_stump(&pollard_additions, &deletion_hashes, &proof)
             .map_err(anyhow::Error::msg);
         if let Err(error) = pollard_update {
-            self.pollard =
-                pollard_from_stump_roots(original_stump.roots.clone(), original_stump.leaves);
-            self.pollard_leaves.clear();
-            return Err(error.context("failed to modify Pollard"));
+            let error = error.context("failed to modify Pollard");
+            self.persistence.signal.fail(&error);
+            return Err(error);
         }
         if self.pollard.leaves() != journal_entry.num_leaves
             || pollard_stump_roots(&self.pollard) != expected_stump.roots
         {
-            self.pollard =
-                pollard_from_stump_roots(original_stump.roots.clone(), original_stump.leaves);
-            self.pollard_leaves.clear();
-            anyhow::bail!("Pollard mutation diverged from the planned flat-forest update");
+            let error =
+                anyhow::anyhow!("Pollard mutation diverged from the planned flat-forest update");
+            self.persistence.signal.fail(&error);
+            return Err(error);
         }
+        retain_pollard_update(&mut self.pollard, &journal_entry);
         timings.plan_update = started.elapsed();
 
         let pending = PreparedBlock {
@@ -1753,26 +1659,6 @@ impl FlatFileProver {
             proof_forest_rows: tree_rows(original_stump.leaves),
         };
         let started = Instant::now();
-        for (outpoint, _) in &deletions {
-            self.leaf_data.remove(outpoint);
-        }
-        self.leaf_data.extend(
-            added_leaf_data
-                .into_iter()
-                .zip(cached_pollard_leaves.iter())
-                .map(|((outpoint, context), cached)| {
-                    (
-                        outpoint,
-                        CachedLeaf {
-                            context,
-                            position: cached.position,
-                        },
-                    )
-                }),
-        );
-        let oldest_cached_height = height.saturating_sub(LEAF_CACHE_BLOCKS.saturating_sub(1));
-        self.leaf_data
-            .retain(|_, leaf| leaf.context.block_height >= oldest_cached_height);
         self.pollard_leaves
             .extend(cached_pollard_leaves.into_iter().map(Reverse));
         timings.cache_update = started.elapsed();
@@ -1789,8 +1675,6 @@ impl FlatFileProver {
                 },
                 leaves: leaf_data.iter().map(CompactLeafData::from).collect(),
             },
-            leaf_cache_hits,
-            leaf_cache_misses,
             prevout_creation_heights,
             timings,
             pending,
@@ -1865,17 +1749,6 @@ fn eligible_block_leaves(
         }
     }
     Ok(leaves)
-}
-
-fn cached_leaf_context(
-    cache: &HashMap<OutPoint, CachedLeaf>,
-    outpoint: OutPoint,
-    fetch: impl FnOnce() -> anyhow::Result<LeafContext>,
-) -> anyhow::Result<(LeafContext, bool)> {
-    match cache.get(&outpoint) {
-        Some(leaf) => Ok((leaf.context.clone(), true)),
-        None => fetch().map(|leaf| (leaf, false)),
-    }
 }
 
 fn leaf_context_from_prevout(
@@ -2159,10 +2032,11 @@ mod tests {
     }
 
     #[test]
-    fn independent_publication_and_disk_tail_prove_through_slow_forest_io() {
+    fn no_prune_publication_and_disk_tail_prove_through_slow_forest_io() {
         for gated_stage in ["apply_io", "state_flush"] {
             let fixture = PersistenceFixture::new();
             let (mut prover, proofs, index, notifications) = fixture.open();
+            prover.pollard_memory_limit = usize::MAX;
             let baseline = prover.acc.read().unwrap().roots().unwrap();
             prover.prove_range_inner(2, 100).unwrap();
             assert_eq!(prover.pending_blocks(), 99);
@@ -2214,9 +2088,6 @@ mod tests {
                 publications.recv_timeout(Duration::from_secs(30)).unwrap(),
                 101
             );
-            prover.pollard_memory_limit = 1;
-            prover.enforce_pollard_memory_limit().unwrap();
-            prover.leaf_data.clear();
             let proved = prover.prove_range_inner(102, 601);
             let mut published_heights = Vec::new();
             for _ in 0..5 {
@@ -2278,6 +2149,76 @@ mod tests {
                 );
             }
             reopened.sync_for_shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn quota_pruning_publishes_partial_tip_and_waits_for_application() {
+        for gated_stage in ["apply_io", "state_flush"] {
+            let fixture = PersistenceFixture::new();
+            let (mut prover, _, index, _) = fixture.open();
+            prover.pollard_memory_limit = usize::MAX;
+            prover.prove_range_inner(2, 3).unwrap();
+            assert_eq!(prover.journal.lock().published_count(), 0);
+            let gate = Arc::new(FlushGate::default());
+            let worker_gate = Arc::clone(&gate);
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let (pruning, prunes) = std::sync::mpsc::channel();
+            *prover.persistence.hook.lock() = Some(Arc::new(move |stage, height| {
+                if stage == gated_stage && height == 4 {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                if stage == "before_prune" {
+                    pruning.send(height).unwrap();
+                }
+                Ok(())
+            }));
+            let (returned, returns) = std::sync::mpsc::channel();
+            let observer_index = Arc::clone(&index);
+            let journal = Arc::clone(&prover.journal);
+            let signal = Arc::clone(&prover.persistence.signal);
+            let observer = std::thread::spawn(move || {
+                let reached = waiting.recv_timeout(Duration::from_secs(30));
+                let premature_return = returns.recv_timeout(Duration::from_millis(100)).is_ok();
+                let premature_prune = prunes.try_recv().is_ok();
+                let published = journal.lock().published_count();
+                let applied = signal.progress.lock().applied_count;
+                let height = observer_index.load_height();
+                gate.release();
+                reached.unwrap();
+                assert!(
+                    !premature_return,
+                    "quota barrier returned before application"
+                );
+                assert!(!premature_prune, "Pollard pruned before application");
+                assert_eq!(published, 3, "partial producer tip was not published");
+                assert_eq!(applied, 0);
+                assert_eq!(height.unwrap(), 1);
+                assert_eq!(prunes.recv_timeout(Duration::from_secs(30)).unwrap(), 4);
+            });
+            prover.pollard_memory_limit = 1;
+            let result = prover.prove_range_inner(4, 4);
+            let _ = returned.send(());
+            observer.join().unwrap();
+            *prover.persistence.hook.lock() = None;
+            result.unwrap();
+            assert_eq!(prover.height, 4);
+            assert_eq!(prover.tip_hash, fixture.chain.get_block_hash(4).unwrap());
+            assert_eq!(index.load_height().unwrap(), 4);
+            assert_eq!(prover.pending_blocks(), 0);
+            let forest = prover.acc.read().expect("forest lock poisoned");
+            assert_eq!(
+                forest.roots().unwrap(),
+                pollard_stump_roots(&prover.pollard)
+            );
+            assert!(prover
+                .pollard
+                .physical_node(4, forest.forest_rows())
+                .is_none());
+            drop(forest);
+            prover.prove_range(5, 6).unwrap();
+            prover.sync_for_shutdown().unwrap();
         }
     }
 
@@ -2780,69 +2721,68 @@ mod tests {
     }
 
     #[test]
-    fn steady_leaf_cache_bypasses_fallback_fetch() {
-        let outpoint = OutPoint {
-            txid: Txid::from_byte_array([1; 32]),
-            vout: 2,
-        };
-        let mut cache = HashMap::new();
-        cache.insert(
-            outpoint,
-            CachedLeaf {
-                context: leaf(outpoint),
-                position: 7,
-            },
-        );
-        let mut fetched = false;
+    fn omitted_prevouts_resolve_pending_leaves_without_a_durable_leaf_map() {
+        let fixture = PersistenceFixture::new();
+        let block_hash = fixture.chain.get_block_hash(3).unwrap();
+        let block = fixture.chain.get_block_with_prevouts(block_hash).unwrap();
+        let (mut prover, proofs, index, _) = fixture.open();
+        prover.prove_range_inner(2, 2).unwrap();
+        assert_eq!(prover.journal.lock().published_count(), 0);
+        let (fallback_proof, _, timings, _) = prover
+            .process_block(&block.block, &HashMap::new(), 3)
+            .unwrap();
+        assert_eq!(timings.position_cache_hits, 1);
+        assert_eq!(timings.position_cache_misses, 1);
+        assert_eq!(index.load_height().unwrap(), 1);
+        drop(prover);
+        drop(proofs);
+        drop(index);
 
-        let (cached, hit) = cached_leaf_context(&cache, outpoint, || {
-            fetched = true;
-            anyhow::bail!("fallback must not run for a cache hit")
-        })
-        .unwrap();
-
-        assert!(hit);
-        assert!(!fetched);
-        assert_eq!(cached.txid, outpoint.txid);
-        assert_eq!(cached.vout, outpoint.vout);
+        let (mut prover, _, _, _) = fixture.open();
+        prover.prove_range_inner(2, 2).unwrap();
+        let (prevout_proof, _, _, _) = prover
+            .process_block(&block.block, &block.prevouts, 3)
+            .unwrap();
+        assert_eq!(fallback_proof, prevout_proof);
     }
 
     #[test]
-    fn steady_leaf_position_cache_survives_pollard_eviction() {
-        let outpoint = OutPoint {
-            txid: Txid::from_byte_array([3; 32]),
-            vout: 4,
-        };
-        let cached = CachedLeaf {
-            context: leaf(outpoint),
-            position: 7,
-        };
+    fn prevout_hashes_find_old_pollard_leaves_and_fall_back_after_restart() {
+        let fixture = PersistenceFixture::new();
+        {
+            let mut blocks = fixture.chain.blocks.lock();
+            // Spend a remembered output older than the removed 144-block context cache.
+            let old_outpoint = OutPoint {
+                txid: blocks[2].txdata[1].compute_txid(),
+                vout: 1,
+            };
+            let mut input = blocks[152].txdata[1].input[0].clone();
+            input.previous_output = old_outpoint;
+            blocks[152].txdata[1].input.push(input);
+        }
+        let (mut prover, proof_file, proof_index, _) = fixture.open();
+        prover.prove_range_inner(2, 151).unwrap();
+        prover.sync().unwrap();
+        let hash = fixture.chain.get_block_hash(152).unwrap();
+        let block = fixture.chain.get_block_with_prevouts(hash).unwrap();
+        let (warm_proof, _, warm, _) = prover
+            .process_block(&block.block, &block.prevouts, 152)
+            .unwrap();
+        assert_eq!(warm.position_cache_hits, 2);
+        assert_eq!(warm.position_cache_misses, 0);
+        drop(prover);
+        drop(proof_file);
+        drop(proof_index);
 
-        assert_eq!(cached_bottom_position(None, Some(&cached)), Some(7));
-        assert_eq!(
-            cached_bottom_position(Some(9), Some(&cached)),
-            Some(9),
-            "the Pollard remains the preferred position cache"
-        );
-    }
-
-    #[test]
-    fn steady_leaf_cache_uses_fallback_on_miss() {
-        let outpoint = OutPoint {
-            txid: Txid::from_byte_array([2; 32]),
-            vout: 3,
-        };
-        let mut fetched = false;
-
-        let (leaf, hit) = cached_leaf_context(&HashMap::new(), outpoint, || {
-            fetched = true;
-            Ok(leaf(outpoint))
-        })
-        .unwrap();
-
-        assert!(!hit);
-        assert!(fetched);
-        assert_eq!(leaf.value, 42);
+        // A restarted Pollard has only roots: both inputs must resolve from the forest,
+        // with identical proof/leaf commitments to the remembered-leaf path.
+        let (mut prover, _, _, _) = fixture.open();
+        let (cold_proof, _, cold, _) = prover
+            .process_block(&block.block, &block.prevouts, 152)
+            .unwrap();
+        assert_eq!(cold.position_cache_hits, 0);
+        assert_eq!(cold.position_cache_misses, 2);
+        assert_eq!(warm_proof, cold_proof);
     }
 
     #[test]
@@ -2856,11 +2796,10 @@ mod tests {
         let mut pollard = Pollard::new();
         pollard.modify(&additions, &[], &Proof::default()).unwrap();
         let mut leaves = BinaryHeap::new();
-        for (position, addition) in additions.iter().enumerate() {
+        for position in 0..additions.len() {
             leaves.push(Reverse(CachedPollardLeaf {
                 creation_height: position as u32,
                 position: position as u64,
-                hash: addition.hash,
             }));
         }
         let quota = pollard.estimated_memory_usage();

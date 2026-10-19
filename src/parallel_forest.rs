@@ -84,6 +84,8 @@ use memmap2::RemapOptions;
 use rayon::prelude::*;
 use rustreexo::node_hash::AccumulatorHash;
 use rustreexo::node_hash::BitcoinNodeHash;
+use rustreexo::pollard::PhysicalNodeState;
+use rustreexo::pollard::Pollard;
 #[cfg(test)]
 use rustreexo::proof::Proof;
 const MIN_PARALLEL_PLANNING_NODES: usize = 128;
@@ -420,7 +422,7 @@ fn forest_rows_from_node_count(node_count: u64) -> Result<u8> {
 
 // Bootstrap positions have one writer; READY release/acquire publishes hash bytes.
 // Steady-state writes run through one serialized io_uring writer. Its caller either
-// holds exclusive forest access or permits only overlay-isolated reads of disjoint
+// holds exclusive forest access or permits only Pollard-isolated reads of disjoint
 // records until all completions arrive. Remapping always requires exclusive access.
 unsafe impl Send for FlatForest {}
 unsafe impl Sync for FlatForest {}
@@ -1213,7 +1215,7 @@ fn merged_forest_writes<'a>(
 }
 
 /// A completed flat forest. Layout/scalar changes require exclusive access.
-/// Published I/O may share access only with fully overlay-isolated producer reads.
+/// Published I/O may share access only with fully Pollard-isolated producer reads.
 pub struct SteadyStateForest {
     forest: FlatForest,
     reader: ForestReader,
@@ -1235,73 +1237,33 @@ pub(crate) struct AppliedForestBatch {
     leaves: Option<u64>,
 }
 
-/// Foreground state newer than the durability worker's forest. Entries are retired by
-/// height only after the worker acknowledges the complete persistence transaction.
-#[derive(Default)]
-pub(crate) struct ForestOverlay {
-    nodes: AHashMap<u64, JournalNodeState>,
-    node_heights: AHashMap<u64, u32>,
-    positions: AHashMap<OutPoint, (u32, Option<u64>)>,
+/// Attach the planner's physical writes to Pollard's node graph, never to a
+/// second producer cache. Entries originate in this module and always name rows.
+pub(crate) fn retain_pollard_update(pollard: &mut Pollard<BitcoinNodeHash>, entry: &JournalEntry) {
+    pollard.retain_physical_nodes(
+        entry
+            .forest_rows
+            .expect("planned entry has physical forest rows"),
+        entry.forest.iter().map(|delta| {
+            (
+                delta.position,
+                PhysicalNodeState {
+                    ready: delta.after.ready,
+                    spent: delta.after.spent,
+                    hash: BitcoinNodeHash::from(delta.after.hash),
+                },
+            )
+        }),
+    );
 }
 
-impl ForestOverlay {
-    pub(crate) fn push(&mut self, entry: &JournalEntry) {
-        for delta in &entry.forest {
-            self.nodes.insert(delta.position, delta.after);
-            self.node_heights.insert(delta.position, entry.height);
-        }
-        for delta in &entry.removed {
-            self.positions.insert(delta.outpoint, (entry.height, None));
-        }
-        for delta in &entry.added {
-            self.positions
-                .insert(delta.outpoint, (entry.height, Some(delta.position)));
-        }
-    }
-
-    /// Retire only acknowledged heights; newer overwrites of the same key survive.
-    pub(crate) fn retire_through(&mut self, height: u32) {
-        let nodes = &mut self.nodes;
-        self.node_heights.retain(|position, last_height| {
-            if *last_height <= height {
-                nodes.remove(position);
-                false
-            } else {
-                true
-            }
-        });
-        self.positions
-            .retain(|_, (last_height, _)| *last_height > height);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire(&mut self, entry: &JournalEntry) {
-        for delta in &entry.forest {
-            if self.node_heights.get(&delta.position) == Some(&entry.height) {
-                self.nodes.remove(&delta.position);
-                self.node_heights.remove(&delta.position);
-            }
-        }
-        for delta in entry.removed.iter().chain(&entry.added) {
-            if self
-                .positions
-                .get(&delta.outpoint)
-                .is_some_and(|(height, _)| *height == entry.height)
-            {
-                self.positions.remove(&delta.outpoint);
-            }
-        }
-    }
-}
-
-/// A read-locked physical forest plus every producer mutation not yet acknowledged.
-/// All reads consult the overlay first, including planning and recovery. During
-/// shared background I/O it must cover every touched node/outpoint, even entries
-/// newer than the worker's batch; retirement follows completed application/sync.
-/// The lock prevents remapping, while disjoint disk reads may share explicit writes.
+/// A read-locked durable forest with Pollard's authoritative producer state.
+/// Every changed physical node remains in Pollard until a full durability barrier
+/// permits pruning. Only positions absent from Pollard may fall back to disk;
+/// these records are unchanged by in-flight writes. The lock excludes remapping.
 pub(crate) struct ForestView<'a> {
     forest: &'a SteadyStateForest,
-    overlay: &'a ForestOverlay,
+    pollard: &'a Pollard<BitcoinNodeHash>,
     leaves: u64,
 }
 
@@ -1332,14 +1294,42 @@ impl ForestProofRead {
 impl<'a> ForestView<'a> {
     pub(crate) fn new(
         forest: &'a SteadyStateForest,
-        overlay: &'a ForestOverlay,
+        pollard: &'a Pollard<BitcoinNodeHash>,
         leaves: u64,
     ) -> Self {
         Self {
             forest,
-            overlay,
+            pollard,
             leaves,
         }
+    }
+
+    fn retained_state(&self, position: u64) -> Option<JournalNodeState> {
+        self.pollard
+            .physical_node(position, self.forest.forest_rows)
+            .map(|state| JournalNodeState {
+                ready: state.ready,
+                spent: state.spent,
+                hash: *state.hash,
+            })
+    }
+
+    fn journal_state(&self, position: u64) -> Result<JournalNodeState> {
+        match self.retained_state(position) {
+            Some(state) => Ok(state),
+            None => self.forest.forest.journal_state(position),
+        }
+    }
+
+    fn read_node(&self, position: u64) -> Result<ForestNodeData> {
+        let state = self.journal_state(position)?;
+        if !state.ready {
+            bail!("forest position {position} is uninitialized");
+        }
+        Ok(ForestNodeData {
+            hash: state.hash,
+            spent: state.spent,
+        })
     }
 
     /// Fetch the complete physical path/sibling union before interpreting promotion.
@@ -1390,7 +1380,7 @@ impl<'a> ForestView<'a> {
         let disk_positions: Vec<_> = positions
             .iter()
             .copied()
-            .filter(|position| !self.overlay.nodes.contains_key(position))
+            .filter(|position| self.retained_state(*position).is_none())
             .collect();
         let bytes = self.forest.reader.read_nodes(
             &self.forest.forest.file,
@@ -1400,9 +1390,9 @@ impl<'a> ForestView<'a> {
         let mut records = bytes.chunks_exact(size_of::<ForestNode>());
         let mut nodes = AHashMap::with_capacity(positions.len());
         for &position in &positions {
-            let node = if let Some(state) = self.overlay.nodes.get(&position) {
+            let node = if let Some(state) = self.retained_state(position) {
                 if !state.ready {
-                    bail!("forest position {position} is uninitialized in the overlay");
+                    bail!("forest position {position} is uninitialized in Pollard");
                 }
                 ForestNodeData {
                     hash: state.hash,
@@ -1507,7 +1497,6 @@ impl<'a> ForestView<'a> {
         let timer = PositionTimer::start();
         let keys: Vec<_> = outpoints
             .iter()
-            .filter(|outpoint| !self.overlay.positions.contains_key(outpoint))
             .map(|outpoint| leaf_map_key(outpoint.txid.to_byte_array(), outpoint.vout))
             .collect();
         let values = self
@@ -1521,22 +1510,15 @@ impl<'a> ForestView<'a> {
         let positions = outpoints
             .iter()
             .map(|outpoint| {
-                let position = match self.overlay.positions.get(outpoint) {
-                    Some((_, position)) => {
-                        position.ok_or_else(|| anyhow!("outpoint {outpoint} is spent"))?
-                    }
-                    None => {
-                        let value = values
-                            .next()
-                            .context("leaf-map batch omitted an outpoint")?
-                            .ok_or_else(|| anyhow!("outpoint {outpoint} is not in the leaf map"))?;
-                        let bytes: [u8; LEAF_MAP_VALUE_SIZE] = value
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow!("leaf position has {} bytes", value.len()))?;
-                        u64::from_le_bytes(bytes)
-                    }
-                };
+                let value = values
+                    .next()
+                    .context("leaf-map batch omitted an outpoint")?
+                    .ok_or_else(|| anyhow!("outpoint {outpoint} is not in the leaf map"))?;
+                let bytes: [u8; LEAF_MAP_VALUE_SIZE] = value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("leaf position has {} bytes", value.len()))?;
+                let position = u64::from_le_bytes(bytes);
                 if position >= self.leaves {
                     bail!("outpoint {outpoint} maps beyond {} leaves", self.leaves);
                 }
@@ -1551,9 +1533,7 @@ impl<'a> ForestView<'a> {
     }
 
     fn leaf_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
-        let node = self
-            .forest
-            .read_with_overlay(position, &self.overlay.nodes)?;
+        let node = self.read_node(position)?;
         if node.spent {
             bail!("leaf position {position} is spent");
         }
@@ -1566,19 +1546,16 @@ impl<'a> ForestView<'a> {
             positions,
             self.leaves,
             self.forest.forest_rows,
-            |position| {
-                Ok(self
-                    .forest
-                    .read_with_overlay(position, &self.overlay.nodes)?
-                    .spent)
-            },
+            |position| Ok(self.read_node(position)?.spent),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn position_hash(&self, position: u64) -> Result<BitcoinNodeHash> {
         self.forest
-            .position_hash_with_overlay(position, self.leaves, &self.overlay.nodes)
+            .compressed_hash(position, tree_rows(self.leaves), self.leaves, &|position| {
+                self.read_node(position)
+            })
     }
 
     pub(crate) fn recover_leaf_position_from_block(
@@ -1587,17 +1564,22 @@ impl<'a> ForestView<'a> {
         target_hash: BitcoinNodeHash,
         block_leaves: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<u64> {
+        if let Some(position) = self.pollard.leaf_position(&target_hash) {
+            return Ok(position);
+        }
         let target_index = block_leaves
             .iter()
             .position(|(outpoint, _)| *outpoint == target)
             .context("outpoint is not an eligible leaf in its block")?
             as u64;
-        let outpoints: Vec<_> = block_leaves.iter().map(|(outpoint, _)| *outpoint).collect();
-        let positions = self.leaf_positions(&outpoints)?.positions;
-        for (local_index, (position, (_, hash))) in
-            positions.into_iter().zip(block_leaves).enumerate()
-        {
-            let Ok(position) = position else { continue };
+        // Recovery candidates can include already-spent siblings. Do not read
+        // their leaf-map keys while the flusher may be deleting those keys.
+        // Remembered siblings give a cheap block-start anchor; otherwise scan
+        // physical nodes through the same Pollard-first structural reader.
+        for (local_index, (_, hash)) in block_leaves.iter().enumerate() {
+            let Some(position) = self.pollard.leaf_position(hash) else {
+                continue;
+            };
             if self.leaf_hash(position).ok().as_ref() != Some(hash) {
                 continue;
             }
@@ -1606,18 +1588,14 @@ impl<'a> ForestView<'a> {
                 .and_then(|start| start.checked_add(target_index))
                 .filter(|candidate| *candidate < self.leaves)
             {
-                let node = self
-                    .forest
-                    .read_with_overlay(candidate, &self.overlay.nodes)?;
+                let node = self.read_node(candidate)?;
                 if !node.spent && node.hash == *target_hash {
                     return Ok(candidate);
                 }
             }
         }
         for position in 0..self.leaves {
-            let node = self
-                .forest
-                .read_with_overlay(position, &self.overlay.nodes)?;
+            let node = self.read_node(position)?;
             if !node.spent && node.hash == *target_hash {
                 return Ok(position);
             }
@@ -1633,12 +1611,12 @@ impl<'a> ForestView<'a> {
         deletions: &[(OutPoint, u64)],
         additions: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<JournalEntry> {
-        self.forest.plan_update_with_overlay(
+        self.forest.plan_update_from(
             height,
             block_hash,
             previous_block_hash,
             self.leaves,
-            &self.overlay.nodes,
+            &|position| self.journal_state(position),
             deletions,
             additions,
         )
@@ -1646,7 +1624,7 @@ impl<'a> ForestView<'a> {
 
     pub(crate) fn roots_after(&self, entry: &JournalEntry) -> Result<Vec<BitcoinNodeHash>> {
         self.forest
-            .roots_after_with_overlay(entry, self.leaves, &self.overlay.nodes)
+            .roots_after_from(entry, self.leaves, &|position| self.journal_state(position))
     }
 }
 
@@ -1768,7 +1746,7 @@ impl SteadyStateForest {
 
     #[cfg(test)]
     pub(crate) fn leaf_positions(&self, outpoints: &[OutPoint]) -> Result<LeafPositions> {
-        ForestView::new(self, &ForestOverlay::default(), self.leaves).leaf_positions(outpoints)
+        ForestView::new(self, &Pollard::new(), self.leaves).leaf_positions(outpoints)
     }
 
     pub(crate) fn repair_leaf_position(
@@ -1795,13 +1773,16 @@ impl SteadyStateForest {
         target_hash: BitcoinNodeHash,
         block_leaves: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<u64> {
-        ForestView::new(self, &ForestOverlay::default(), self.leaves)
-            .recover_leaf_position_from_block(target, target_hash, block_leaves)
+        ForestView::new(self, &Pollard::new(), self.leaves).recover_leaf_position_from_block(
+            target,
+            target_hash,
+            block_leaves,
+        )
     }
 
     #[cfg(test)]
     pub fn leaf_hash(&self, bottom_position: u64) -> Result<BitcoinNodeHash> {
-        ForestView::new(self, &ForestOverlay::default(), self.leaves).leaf_hash(bottom_position)
+        ForestView::new(self, &Pollard::new(), self.leaves).leaf_hash(bottom_position)
     }
 
     /// Converts a stable bottom position into its position in the promoted, sparse forest.
@@ -1814,24 +1795,11 @@ impl SteadyStateForest {
 
     #[cfg(test)]
     pub(crate) fn translate_proof_positions(&self, positions: &mut [u64]) -> Result<()> {
-        ForestView::new(self, &ForestOverlay::default(), self.leaves)
-            .translate_proof_positions(positions)
+        ForestView::new(self, &Pollard::new(), self.leaves).translate_proof_positions(positions)
     }
 
-    fn read_with_overlay(
-        &self,
-        position: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
-    ) -> Result<ForestNodeData> {
-        if let Some(state) = overlay.get(&position) {
-            if !state.ready {
-                bail!("forest position {position} is uninitialized");
-            }
-            return Ok(ForestNodeData {
-                hash: state.hash,
-                spent: state.spent,
-            });
-        }
+    #[cfg(test)]
+    fn read_node(&self, position: u64) -> Result<ForestNodeData> {
         self.forest
             .try_read(position)?
             .ok_or_else(|| anyhow!("forest position {position} is uninitialized"))
@@ -1864,7 +1832,7 @@ impl SteadyStateForest {
         position: u64,
         logical_rows: u8,
         leaves: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
+        read_node: &impl Fn(u64) -> Result<ForestNodeData>,
     ) -> Result<BitcoinNodeHash> {
         let position = translate_position(position, logical_rows, self.forest_rows)?;
         let (root, mut original_row) = self.containing_root(position, leaves)?;
@@ -1882,8 +1850,8 @@ impl SteadyStateForest {
                     bail!("compressed position {position} descends below the bottom row");
                 }
                 let left_position = left_child(original_position, self.forest_rows);
-                let left = self.read_with_overlay(left_position, overlay)?;
-                let right = self.read_with_overlay(left_position + 1, overlay)?;
+                let left = read_node(left_position)?;
+                let right = read_node(left_position + 1)?;
                 original_row -= 1;
                 match (left.spent, right.spent) {
                     (true, true) => {
@@ -1899,7 +1867,7 @@ impl SteadyStateForest {
             }
         }
 
-        let node = self.read_with_overlay(original_position, overlay)?;
+        let node = read_node(original_position)?;
         if node.spent {
             bail!("compressed position {position} resolves to an empty subtree");
         }
@@ -1909,10 +1877,13 @@ impl SteadyStateForest {
     #[cfg(test)]
     pub fn prove(&self, targets: &[u64]) -> Result<Proof<BitcoinNodeHash>> {
         let logical_rows = tree_rows(self.leaves);
-        let overlay = AHashMap::new();
         let hashes = get_proof_positions(targets, self.leaves, logical_rows)
             .into_iter()
-            .map(|position| self.compressed_hash(position, logical_rows, self.leaves, &overlay))
+            .map(|position| {
+                self.compressed_hash(position, logical_rows, self.leaves, &|position| {
+                    self.read_node(position)
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let targets = targets
             .iter()
@@ -1921,42 +1892,26 @@ impl SteadyStateForest {
         Ok(Proof::new_with_hash(targets, hashes))
     }
 
-    #[cfg(test)]
-    pub(crate) fn position_hash_with_overlay(
-        &self,
-        position: u64,
-        leaves: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
-    ) -> Result<BitcoinNodeHash> {
-        self.compressed_hash(position, tree_rows(leaves), leaves, overlay)
-    }
-
     fn staged_read(
-        forest: &FlatForest,
-        overlay: &AHashMap<u64, JournalNodeState>,
+        read_state: &impl Fn(u64) -> Result<JournalNodeState>,
         nodes: &AHashMap<u64, PlannedNode>,
         position: u64,
     ) -> Result<ForestNodeData> {
         if let Some(node) = nodes.get(&position) {
             return Ok(node.after);
         }
-        if let Some(state) = overlay.get(&position) {
-            if !state.ready {
-                bail!("forest position {position} is uninitialized");
-            }
-            return Ok(ForestNodeData {
-                hash: state.hash,
-                spent: state.spent,
-            });
+        let state = read_state(position)?;
+        if !state.ready {
+            bail!("forest position {position} is uninitialized");
         }
-        forest
-            .try_read(position)?
-            .ok_or_else(|| anyhow!("forest position {position} is uninitialized"))
+        Ok(ForestNodeData {
+            hash: state.hash,
+            spent: state.spent,
+        })
     }
 
     fn stage_node(
-        forest: &FlatForest,
-        overlay: &AHashMap<u64, JournalNodeState>,
+        read_state: &impl Fn(u64) -> Result<JournalNodeState>,
         nodes: &mut AHashMap<u64, PlannedNode>,
         position: u64,
         after: ForestNodeData,
@@ -1966,11 +1921,7 @@ impl SteadyStateForest {
                 entry.get_mut().after = after;
             }
             Entry::Vacant(entry) => {
-                let before = overlay
-                    .get(&position)
-                    .copied()
-                    .map(Ok)
-                    .unwrap_or_else(|| forest.journal_state(position))?;
+                let before = read_state(position)?;
                 entry.insert(PlannedNode { before, after });
             }
         }
@@ -2012,25 +1963,25 @@ impl SteadyStateForest {
         deletions: &[(OutPoint, u64)],
         additions: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<JournalEntry> {
-        self.plan_update_with_overlay(
+        self.plan_update_from(
             height,
             block_hash,
             previous_block_hash,
             self.leaves,
-            &AHashMap::new(),
+            &|position| self.forest.journal_state(position),
             deletions,
             additions,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn plan_update_with_overlay(
+    fn plan_update_from(
         &self,
         height: u32,
         block_hash: BlockHash,
         previous_block_hash: BlockHash,
         base_leaves: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
+        read_state: &impl Fn(u64) -> Result<JournalNodeState>,
         deletions: &[(OutPoint, u64)],
         additions: &[(OutPoint, BitcoinNodeHash)],
     ) -> Result<JournalEntry> {
@@ -2052,10 +2003,9 @@ impl SteadyStateForest {
         let mut positions = AHashSet::with_capacity(deletions.len());
         let mut removed = Vec::with_capacity(deletions.len());
         for (outpoint, position) in deletions {
-            let node = Self::staged_read(&self.forest, overlay, &nodes, *position)?;
+            let node = Self::staged_read(read_state, &nodes, *position)?;
             Self::stage_node(
-                &self.forest,
-                overlay,
+                read_state,
                 &mut nodes,
                 *position,
                 ForestNodeData {
@@ -2070,7 +2020,6 @@ impl SteadyStateForest {
             });
         }
 
-        let forest = &self.forest;
         let forest_rows = self.forest_rows;
         while !positions.is_empty() {
             let mut parents: Vec<u64> = positions
@@ -2081,35 +2030,29 @@ impl SteadyStateForest {
                 .into_iter()
                 .collect();
             parents.sort_unstable();
-            let staged_parents = if parents.len() >= MIN_PARALLEL_PLANNING_NODES {
-                parents
-                    .par_iter()
-                    .map(|parent_position| {
-                        let left_position = left_child(*parent_position, forest_rows);
-                        let result = Self::staged_read(forest, overlay, &nodes, left_position)
-                            .and_then(|left| {
-                                Self::staged_read(forest, overlay, &nodes, left_position + 1)
-                                    .map(|right| combine_children(left, right))
-                            });
-                        (*parent_position, result)
-                    })
-                    .collect::<Vec<_>>()
+            // Pollard's node graph is producer-local. Resolve its structural reads
+            // here, then parallelize only the independent parent hashing.
+            let mut children = parents
+                .iter()
+                .map(|position| {
+                    let left = left_child(*position, forest_rows);
+                    Ok((
+                        Self::staged_read(read_state, &nodes, left)?,
+                        Self::staged_read(read_state, &nodes, left + 1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if children.len() >= MIN_PARALLEL_PLANNING_NODES {
+                children
+                    .par_iter_mut()
+                    .for_each(|(left, right)| *left = combine_children(*left, *right));
             } else {
-                parents
-                    .iter()
-                    .map(|parent_position| {
-                        let left_position = left_child(*parent_position, forest_rows);
-                        let result = Self::staged_read(forest, overlay, &nodes, left_position)
-                            .and_then(|left| {
-                                Self::staged_read(forest, overlay, &nodes, left_position + 1)
-                                    .map(|right| combine_children(left, right))
-                            });
-                        (*parent_position, result)
-                    })
-                    .collect::<Vec<_>>()
-            };
-            for (parent_position, after) in staged_parents {
-                Self::stage_node(&self.forest, overlay, &mut nodes, parent_position, after?)?;
+                for (left, right) in &mut children {
+                    *left = combine_children(*left, *right);
+                }
+            }
+            for (&parent_position, (after, _)) in parents.iter().zip(children) {
+                Self::stage_node(read_state, &mut nodes, parent_position, after)?;
             }
             positions = parents.into_iter().collect();
         }
@@ -2119,8 +2062,7 @@ impl SteadyStateForest {
         for (outpoint, hash) in additions {
             let bottom_position = leaves;
             Self::stage_node(
-                &self.forest,
-                overlay,
+                read_state,
                 &mut nodes,
                 bottom_position,
                 ForestNodeData {
@@ -2132,12 +2074,11 @@ impl SteadyStateForest {
             let mut row = 0u8;
             while leaves & (1u64 << row) != 0 {
                 let left_position = root_position(leaves, row, self.forest_rows);
-                let left = Self::staged_read(&self.forest, overlay, &nodes, left_position)?;
-                let right = Self::staged_read(&self.forest, overlay, &nodes, position)?;
+                let left = Self::staged_read(read_state, &nodes, left_position)?;
+                let right = Self::staged_read(read_state, &nodes, position)?;
                 position = parent(position, self.forest_rows);
                 Self::stage_node(
-                    &self.forest,
-                    overlay,
+                    read_state,
                     &mut nodes,
                     position,
                     combine_children(left, right),
@@ -2178,14 +2119,16 @@ impl SteadyStateForest {
 
     #[cfg(test)]
     pub fn roots_after(&self, entry: &JournalEntry) -> Result<Vec<BitcoinNodeHash>> {
-        self.roots_after_with_overlay(entry, self.leaves, &AHashMap::new())
+        self.roots_after_from(entry, self.leaves, &|position| {
+            self.forest.journal_state(position)
+        })
     }
 
-    pub(crate) fn roots_after_with_overlay(
+    fn roots_after_from(
         &self,
         entry: &JournalEntry,
         base_leaves: u64,
-        overlay: &AHashMap<u64, JournalNodeState>,
+        read_state: &impl Fn(u64) -> Result<JournalNodeState>,
     ) -> Result<Vec<BitcoinNodeHash>> {
         if entry.previous_num_leaves()? != base_leaves {
             bail!(
@@ -2193,20 +2136,18 @@ impl SteadyStateForest {
                 entry.previous_num_leaves()?
             );
         }
-        let changed: AHashMap<u64, JournalNodeState> = entry
-            .forest
-            .iter()
-            .map(|delta| (delta.position, delta.after))
-            .collect();
         let mut roots = Vec::with_capacity(entry.num_leaves.count_ones() as usize);
         for row in (0..=self.forest_rows).rev() {
             if entry.num_leaves & (1u64 << row) == 0 {
                 continue;
             }
             let position = root_position(entry.num_leaves, row, self.forest_rows);
-            let state = match changed.get(&position).or_else(|| overlay.get(&position)) {
-                Some(state) => *state,
-                None => self.forest.journal_state(position)?,
+            let state = match entry
+                .forest
+                .binary_search_by_key(&position, |delta| delta.position)
+            {
+                Ok(index) => entry.forest[index].after,
+                Err(_) => read_state(position)?,
             };
             if !state.ready {
                 bail!("planned root position {position} is uninitialized");
@@ -2250,8 +2191,8 @@ impl SteadyStateForest {
     /// Write each touched node once, then preserve block order for index changes.
     ///
     /// The one application worker retains the forest lock through all completions.
-    /// Shared access is permitted ONLY with ForestView reads whose producer overlay
-    /// covers all in-flight changed records/keys. Raw roots, scalar recovery,
+    /// Shared access is permitted ONLY with ForestView reads whose Pollard
+    /// retains all in-flight changed physical records. Raw roots, scalar recovery,
     /// rollback, repair, and resize must remain behind the application's barrier.
     pub(crate) fn apply_prepared_batch(
         &self,
@@ -3338,10 +3279,58 @@ pub(crate) mod tests {
     use hintsfile::EliasFano;
     use hintsfile::HintsfileBuilder;
 
-    use rustreexo::pollard::Pollard;
+    use rustreexo::pollard::PollardAddition;
     use rustreexo::stump::Stump;
 
     use super::*;
+
+    fn forest_pollard(forest: &SteadyStateForest) -> Pollard<BitcoinNodeHash> {
+        let mut roots = forest.roots().unwrap();
+        roots.reverse();
+        Pollard::from_roots(&roots, forest.leaves())
+    }
+
+    fn advance_pollard(
+        forest: &SteadyStateForest,
+        pollard: &mut Pollard<BitcoinNodeHash>,
+        entry: &JournalEntry,
+    ) {
+        let view = ForestView::new(forest, pollard, pollard.leaves());
+        let expected_roots = view.roots_after(entry).unwrap();
+        let bottoms: Vec<_> = entry.removed.iter().map(|delta| delta.position).collect();
+        let snapshot = view.read_proof(&bottoms).unwrap();
+        let hashes: Vec<_> = bottoms
+            .iter()
+            .map(|position| snapshot.leaf_hash(*position).unwrap())
+            .collect();
+        let loaded: Vec<_> = pollard
+            .missing_positions(&snapshot.targets)
+            .into_iter()
+            .map(|position| (position, snapshot.position_hash(position).unwrap()))
+            .collect();
+        let proof = pollard
+            .ingest_positions(&snapshot.targets, &loaded)
+            .unwrap();
+        let additions: Vec<_> = entry
+            .added
+            .iter()
+            .map(|delta| {
+                let index = entry
+                    .forest
+                    .binary_search_by_key(&delta.position, |node| node.position)
+                    .unwrap();
+                PollardAddition {
+                    hash: BitcoinNodeHash::from(entry.forest[index].after.hash),
+                    remember: true,
+                }
+            })
+            .collect();
+        pollard.modify_stump(&additions, &hashes, &proof).unwrap();
+        retain_pollard_update(pollard, entry);
+        let mut roots = pollard.roots();
+        roots.reverse();
+        assert_eq!(roots, expected_roots);
+    }
 
     fn assert_proof_read_matches_scalar(view: &ForestView<'_>, bottoms: &[u64]) {
         let batch = view.read_proof(bottoms).unwrap();
@@ -3384,11 +3373,7 @@ pub(crate) mod tests {
             .filter(|row| view.leaves & (1u64 << row) != 0)
             .map(|row| {
                 accumulator_hash(
-                    view.forest
-                        .read_with_overlay(
-                            root_position(view.leaves, row, view.forest.forest_rows),
-                            &view.overlay.nodes,
-                        )
+                    view.read_node(root_position(view.leaves, row, view.forest.forest_rows))
                         .unwrap(),
                 )
             })
@@ -3439,8 +3424,8 @@ pub(crate) mod tests {
             build_with_source(&source, &hints, config).unwrap();
             {
                 let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
-                let overlay = ForestOverlay::default();
-                let view = ForestView::new(&forest, &overlay, forest.leaves());
+                let pollard = forest_pollard(&forest);
+                let view = ForestView::new(&forest, &pollard, forest.leaves());
                 let mut bottoms: Vec<_> = live.iter().rev().map(|&p| u64::from(p)).collect();
                 bottoms.extend([bottoms[0], *bottoms.last().unwrap()]);
                 assert_proof_read_matches_scalar(&view, &bottoms);
@@ -3456,7 +3441,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn proof_read_tracks_overlay_updates_and_capacity_growth() {
+    fn proof_read_tracks_pollard_updates_and_capacity_growth() {
         let path = temp_forest_path();
         let block = mock_block(1, &[10, 20, 30]);
         let mut config = ParallelForestConfig::new(path.clone());
@@ -3467,14 +3452,14 @@ pub(crate) mod tests {
         bootstrap_fixture(block.clone(), config).unwrap();
         {
             let mut forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
-            let mut overlay = ForestOverlay::default();
+            let mut pollard = forest_pollard(&forest);
             assert_proof_read_matches_scalar(
-                &ForestView::new(&forest, &overlay, forest.leaves()),
+                &ForestView::new(&forest, &pollard, forest.leaves()),
                 &[2, 0, 1, 0],
             );
             assert!(forest.ensure_leaf_capacity(9).unwrap());
             assert_proof_read_matches_scalar(
-                &ForestView::new(&forest, &overlay, forest.leaves()),
+                &ForestView::new(&forest, &pollard, forest.leaves()),
                 &[1, 2, 0],
             );
             let additions: Vec<_> = (3u8..9)
@@ -3492,7 +3477,7 @@ pub(crate) mod tests {
                 txid: block.txdata[0].compute_txid(),
                 vout,
             };
-            let first = ForestView::new(&forest, &overlay, 3)
+            let first = ForestView::new(&forest, &pollard, 3)
                 .plan_update(
                     2,
                     BlockHash::from_byte_array([2; 32]),
@@ -3501,8 +3486,8 @@ pub(crate) mod tests {
                     &additions[..4],
                 )
                 .unwrap();
-            overlay.push(&first);
-            let first_view = ForestView::new(&forest, &overlay, first.num_leaves);
+            advance_pollard(&forest, &mut pollard, &first);
+            let first_view = ForestView::new(&forest, &pollard, first.num_leaves);
             assert_proof_read_matches_scalar(&first_view, &[6, 0, 3, 2, 5, 4, 0]);
             assert!(first_view
                 .read_proof(&[1])
@@ -3518,17 +3503,16 @@ pub(crate) mod tests {
                     &additions[4..],
                 )
                 .unwrap();
-            overlay.push(&second);
+            advance_pollard(&forest, &mut pollard, &second);
             let final_bottoms = [8, 2, 7, 4, 6, 5, 2];
-            let final_view = ForestView::new(&forest, &overlay, second.num_leaves);
+            let final_view = ForestView::new(&forest, &pollard, second.num_leaves);
             assert_proof_read_matches_scalar(&final_view, &final_bottoms);
             let snapshot = final_view.read_proof(&final_bottoms).unwrap();
             forest.apply_forward(&first).unwrap();
             forest.apply_forward(&second).unwrap();
-            overlay.retire(&first);
-            overlay.retire(&second);
-            assert!(overlay.nodes.is_empty());
-            let durable_view = ForestView::new(&forest, &overlay, forest.leaves());
+            forest.sync().unwrap();
+            pollard.clear_physical_nodes();
+            let durable_view = ForestView::new(&forest, &pollard, forest.leaves());
             assert_proof_read_matches_scalar(&durable_view, &final_bottoms);
             let durable = durable_view.read_proof(&final_bottoms).unwrap();
             assert_eq!(snapshot.targets, durable.targets);
@@ -3550,8 +3534,8 @@ pub(crate) mod tests {
         bootstrap_fixture(mock_block(1, &[10, 20, 30]), config).unwrap();
         {
             let forest = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
-            let mut overlay = ForestOverlay::default();
-            let view = ForestView::new(&forest, &overlay, forest.leaves());
+            let mut pollard = forest_pollard(&forest);
+            let view = ForestView::new(&forest, &pollard, forest.leaves());
             let snapshot = view.read_proof(&[0]).unwrap();
             let target_hash = snapshot.leaf_hash(0).unwrap();
             let sibling_hash = snapshot.position_hash(1).unwrap();
@@ -3571,21 +3555,31 @@ pub(crate) mod tests {
             for bottom in [forest.leaves(), root, u64::MAX] {
                 assert!(view.read_proof(&[bottom]).is_err());
             }
-            assert!(ForestView::new(&forest, &overlay, 9)
+            assert!(ForestView::new(&forest, &pollard, 9)
                 .read_proof(&[0])
                 .is_err());
-            let empty = ForestView::new(&forest, &overlay, 0)
+            let empty = ForestView::new(&forest, &pollard, 0)
                 .read_proof(&[])
                 .unwrap();
             assert!(empty.targets.is_empty());
             assert!(empty.leaf_hash(0).is_err());
             assert!(empty.position_hash(0).is_err());
-            overlay.nodes.insert(1, JournalNodeState::UNINITIALIZED);
-            assert!(ForestView::new(&forest, &overlay, forest.leaves())
+            pollard.retain_physical_nodes(
+                forest.forest_rows(),
+                [(
+                    1,
+                    PhysicalNodeState {
+                        ready: false,
+                        spent: false,
+                        hash: BitcoinNodeHash::from([0; 32]),
+                    },
+                )],
+            );
+            assert!(ForestView::new(&forest, &pollard, forest.leaves())
                 .read_proof(&[0])
                 .unwrap_err()
                 .to_string()
-                .contains("uninitialized in the overlay"));
+                .contains("uninitialized in Pollard"));
         }
         remove_bootstrap_files(&path, &leaf_map_path);
     }
@@ -4531,7 +4525,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn plans_against_an_unflushed_forest_overlay() {
+    fn plans_against_unflushed_pollard_state() {
         let path = temp_forest_path();
         let source = MockSource {
             blocks: vec![mock_block(1, &[10, 20, 30])],
@@ -4550,33 +4544,32 @@ pub(crate) mod tests {
 
         {
             let steady = SteadyStateForest::open(&path, &leaf_map_path, false).unwrap();
+            let mut pollard = forest_pollard(&steady);
             let first_outpoint = OutPoint {
                 txid: Txid::from_byte_array([9; 32]),
                 vout: 0,
             };
-            let first = steady
-                .plan_update_with_overlay(
+            let first = ForestView::new(&steady, &pollard, steady.leaves())
+                .plan_update(
                     2,
                     BlockHash::from_byte_array([2; 32]),
                     source.blocks[0].block_hash(),
-                    steady.leaves(),
-                    &AHashMap::new(),
                     &[],
                     &[(first_outpoint, BitcoinNodeHash::from([9; 32]))],
                 )
                 .unwrap();
-            let mut overlay = AHashMap::new();
-            for delta in &first.forest {
-                overlay.insert(delta.position, delta.after);
-            }
-            let first_added_state = overlay[&3];
-            let second = steady
-                .plan_update_with_overlay(
+            advance_pollard(&steady, &mut pollard, &first);
+            let first_added_state = first
+                .forest
+                .iter()
+                .find(|delta| delta.position == 3)
+                .unwrap()
+                .after;
+            let second = ForestView::new(&steady, &pollard, first.num_leaves)
+                .plan_update(
                     3,
                     BlockHash::from_byte_array([3; 32]),
                     BlockHash::from_byte_array([2; 32]),
-                    first.num_leaves,
-                    &overlay,
                     &[(first_outpoint, 3)],
                     &[],
                 )
@@ -4588,6 +4581,18 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(second_added_delta.before, first_added_state);
             assert!(second_added_delta.after.spent);
+            for delta in &second.forest {
+                if let Ok(index) = first
+                    .forest
+                    .binary_search_by_key(&delta.position, |node| node.position)
+                {
+                    assert_eq!(delta.before, first.forest[index].after);
+                }
+            }
+            advance_pollard(&steady, &mut pollard, &second);
+            assert!(ForestView::new(&steady, &pollard, second.num_leaves)
+                .read_proof(&[3])
+                .is_err());
         }
 
         remove_bootstrap_files(&path, &leaf_map_path);
@@ -4618,27 +4623,23 @@ pub(crate) mod tests {
         let mut position = 0;
         let mut leaves = forest.leaves();
         let mut hash = source.blocks[0].block_hash();
-        let mut overlay = AHashMap::new();
+        let mut pollard = forest_pollard(&forest);
         let mut entries = Vec::new();
         for height in 2..=101 {
             let added = OutPoint {
                 txid: Txid::from_byte_array([height as u8; 32]),
                 vout: 0,
             };
-            let entry = forest
-                .plan_update_with_overlay(
+            let entry = ForestView::new(&forest, &pollard, leaves)
+                .plan_update(
                     height,
                     BlockHash::from_byte_array([height as u8; 32]),
                     hash,
-                    leaves,
-                    &overlay,
                     &[(previous, position)],
                     &[(added, BitcoinNodeHash::from([height as u8; 32]))],
                 )
                 .unwrap();
-            for delta in &entry.forest {
-                overlay.insert(delta.position, delta.after);
-            }
+            advance_pollard(&forest, &mut pollard, &entry);
             position = leaves;
             leaves = entry.num_leaves;
             hash = entry.block_hash;
@@ -4654,9 +4655,14 @@ pub(crate) mod tests {
         let borrowed: Vec<_> = entries.iter().collect();
         let merged: Vec<_> = merged_forest_writes(&borrowed).collect();
         assert!(merged.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        assert_eq!(merged.len(), overlay.len());
+        let positions: AHashSet<_> = entries
+            .iter()
+            .flat_map(|entry| entry.forest.iter().map(|delta| delta.position))
+            .collect();
+        assert_eq!(merged.len(), positions.len());
+        let view = ForestView::new(&forest, &pollard, leaves);
         for (position, state) in &merged {
-            assert_eq!(*state, overlay[position]);
+            assert_eq!(*state, view.journal_state(*position).unwrap());
         }
         assert!(merged_forest_writes(&[]).next().is_none());
         let mut repeated = entries[0].clone();
@@ -4705,11 +4711,7 @@ pub(crate) mod tests {
         }
         assert_eq!(forest.roots().unwrap(), baseline);
         assert_eq!(std::fs::read(&path).unwrap(), baseline_bytes);
-        let mut producer_overlay = ForestOverlay::default();
-        for entry in &entries {
-            producer_overlay.push(entry);
-        }
-        let expected_proof = ForestView::new(&forest, &producer_overlay, leaves)
+        let expected_proof = ForestView::new(&forest, &pollard, leaves)
             .read_proof(&[position])
             .unwrap();
         let prepared = forest.prepare_forward_batch(&borrowed).unwrap();
@@ -4723,12 +4725,10 @@ pub(crate) mod tests {
             });
             gate.wait();
             for _ in 0..32 {
-                let view = ForestView::new(&forest, &producer_overlay, leaves);
+                let view = ForestView::new(&forest, &pollard, leaves);
                 assert_eq!(
-                    view.leaf_positions(&[previous]).unwrap().positions[0]
-                        .as_ref()
-                        .unwrap(),
-                    &position
+                    pollard.leaf_position(&BitcoinNodeHash::from([101; 32])),
+                    Some(position)
                 );
                 let proof = view.read_proof(&[position]).unwrap();
                 assert_eq!(proof.targets, expected_proof.targets);
@@ -4741,17 +4741,8 @@ pub(crate) mod tests {
         assert_eq!(forest.leaves(), entries[0].previous_num_leaves().unwrap());
         forest.commit_forward_batch(applied).unwrap();
         forest.sync().unwrap();
-        producer_overlay.retire_through(50);
-        assert!(producer_overlay
-            .node_heights
-            .values()
-            .all(|height| *height > 50));
-        assert!(producer_overlay.nodes.contains_key(&position));
-        producer_overlay.retire_through(entries.last().unwrap().height);
-        assert!(producer_overlay.nodes.is_empty());
-        assert!(producer_overlay.node_heights.is_empty());
-        assert!(producer_overlay.positions.is_empty());
-        let proof = ForestView::new(&forest, &producer_overlay, leaves)
+        pollard.clear_physical_nodes();
+        let proof = ForestView::new(&forest, &pollard, leaves)
             .read_proof(&[position])
             .unwrap();
         assert_eq!(proof.targets, expected_proof.targets);

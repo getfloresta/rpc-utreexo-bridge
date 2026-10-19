@@ -38,7 +38,7 @@ impl ForestWriter {
     /// Write packed records at sorted, unique positions without reading old bytes.
     ///
     /// The caller excludes overlapping record reads/mutations through completion;
-    /// overlay-isolated reads of disjoint records may continue under a shared lock.
+    /// Pollard-isolated reads of disjoint records may continue under a shared lock.
     /// Buffered writes update the same page cache as existing shared mappings;
     /// durability still requires the caller's subsequent file synchronization.
     /// Ownership avoids a second serialization copy and protects all unwind/error

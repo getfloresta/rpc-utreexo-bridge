@@ -18,7 +18,7 @@ It contains three components:
 - Because just keep things on RAM, you'll need a machine with at least 16GB of RAM.
 - At least 500GB of free disk space, 1TB recommended.
 - A trusted source of blocks to connect to. You can use Bitcoin Core.
-- `rustreexo` 0.8.0 from crates.io, including the position-addressed Pollard cache APIs.
+- `rustreexo` from <https://github.com/Davidson-Souza/rustreexo>, branch `bridge`, including the Pollard structural-node APIs.
 - `floresta-db` from <https://github.com/davidson-souza/floresta-db>, including the runtime
   batch, compaction, and online body-capacity APIs used by this bridge.
 
@@ -30,19 +30,8 @@ cd rpc-utreexo-bridge
 cargo build --release
 ```
 
-The final review was verified against local rustreexo revision
-`e6748e572cff55366982652bca3f3cae3f1922cf` and floresta-db revision
-`29397816fcd9fbef415820e4dbef18ab98104fe8`. The committed manifests use remote dependencies,
-not sibling checkout paths. Remote builds require publication of rustreexo 0.8.0 and the
-corresponding database changes; those publications were not available during this review.
-The old local-dependency lockfiles are intentionally removed rather than presented as valid
-remote resolutions. After publishing the dependencies, generate and commit both lockfiles:
-
-```bash
-cargo generate-lockfile
-cargo generate-lockfile --manifest-path fuzz/Cargo.toml
-cargo build --locked --release
-```
+Both workspaces use the remote `rustreexo` `bridge` branch, pinned by their lockfiles.
+No sibling checkout is required. Build reproducibly with `cargo build --locked --release`.
 
 CI and Docker generate a lockfile only when none exists, then build with `--locked`.
 
@@ -215,36 +204,45 @@ After bootstrap, continue from the hintsfile stop height with the same forest an
 Bitcoin Core must be running with `txindex=1`. Each height uses `getblock` verbosity 3, which
 returns the block transactions and every input's prevout in one RPC response. No additional
 previous-block request is made for median-time-past: it is not used in leaf commitments or proofs.
-Cache hits bypass prevout reconstruction. Creating block hashes are resolved exclusively from the in-memory cache
-and persistent header index; steady-state proving never calls `getblockhash` for prevouts. A
+Input leaf commitments are reconstructed from Core's prevout data for Pollard position lookups;
+there is no separate leaf-context cache or 144-block age cutoff. Creating block hashes are
+resolved exclusively from the in-memory block-hash cache and persistent header index;
+steady-state proving never calls `getblockhash` for prevouts. A
 missing height means the bootstrap header files do not match the forest. Providers without
 verbosity-three support retain the per-transaction compatibility fallback. After resolving leaf
 data, the prover verifies the batch proof, propagates deletions, appends eligible outputs, and
 verifies the resulting roots against a `rustreexo` stump update. Outputs created and spent in the
 same block never enter the forest.
 
-Mutation planning uses an `AHashMap` overlay with position-sorted journal output. Independent
-deletion parents are hashed by Rayon once a row has at least 128 parents; smaller rows stay local
+Mutation planning resolves physical states through Pollard, using block-local scratch storage
+and position-sorted journal output. Independent deletion parents are hashed by Rayon once a row has at least 128 parents; smaller rows stay local
 to avoid scheduling overhead. Eligible addition leaf hashes use the same 128-item parallel
 threshold. Addition positions no longer repeat leaf-map membership lookups already guaranteed by
 the serialized block update.
 The steady-state `Pollard` starts from the flat forest roots and keeps stable bottom positions for
 remembered leaves. Cached spends resolve through that internal index without querying the
-persistent leaf map or rereading the leaf hash. Cache misses resolve against pending outpoint
-updates first, then query the unchanged portion of the leaf map in one ordered `batch_fetch`.
-The Pollard reports uncached target and proof
-positions, and only those hashes are read from the flat forest and ingested. The Pollard is
-modified immediately and is the source of truth while journal records are pending.
-`--pollard-memory-mib` sets its cache quota and defaults to 250 MiB. Cache eviction does not wait
-for persistence: pending node and outpoint overlays keep subsequent cache misses current.
+persistent leaf map. All input hashes, including transaction-RPC fallbacks, are resolved before
+the position lookup so pending additions never fall back to an unpublished leaf-map entry.
+Uncached inputs query the unchanged portion of the leaf map in one ordered `batch_fetch`.
+Pollard supplies cached structural nodes and reports missing canonical proof positions for
+hydration. It is modified immediately and is the only producer accumulator state while journal
+records are pending. Physical flags and positions share Pollard's node storage, including exact
+spent-node hashes needed for journal rollback; there is no separate pending-node/outpoint cache.
+`--pollard-memory-mib` sets its quota and defaults to 250 MiB. Below the quota, proving remains
+asynchronous while the state flusher lags. When pruning is required, the prover first advances
+its height/tip, publishes the current partial journal window, and waits until the flusher has
+applied that entire producer tip. Only then can it release physical state and prune cached leaves.
+The quota is checked after each block, not on every allocation; one block's growth and
+block-local scratch storage can exceed it transiently. It is not a process-wide RSS limit.
 Steady-state proof reads first gather the complete physical target-to-root paths and their
 siblings, including nodes needed to resolve promotions. Positions are sorted and deduplicated;
 adjacent 33-byte nodes are coalesced into one read. A reusable `io_uring` submits these distinct
 file ranges in waves of at most 256 requests, rather than faulting forest mmap pages while
 chasing each target. `readv`/`preadv` cannot express these scattered offsets.
 
-Pending journal-overlay nodes take precedence and are omitted from disk reads. The forest read
-lock excludes concurrent mutation/remapping until the snapshot is complete. Target promotion,
+Pollard's retained physical nodes take precedence and are omitted from disk reads. They survive
+proof ingestion and accumulator mutation until a full durability barrier permits pruning.
+The forest read lock excludes remapping until the snapshot is complete. Target promotion,
 canonical proof-hash lookup, and deletion leaf-hash checks then use only the owned in-memory
 snapshot; target order and duplicates remain aligned with deletion hashes and leaf data.
 The file mapping remains for update planning, startup/recovery reads, bootstrap, and resize,
@@ -264,13 +262,15 @@ and EOF/read errors drain outstanding requests before returning.
 Per-block cache metrics, foreground timings, and completed `background-persistence` timings are written at
 debug level to `$DATA_DIR/debug.log`. Terminal logs report block height, hash, proof size, and
 important lifecycle events without timing noise.
+`position_cache_hits` and `position_cache_misses` report Pollard position lookup results.
+The former `leaf_cache_hits`, `leaf_cache_misses`, and `leaf_cache_entries` fields are removed.
 
 `steady-state-timings` retains the aggregate `positions` duration. The accompanying
 `steady-state-position-timings` line splits it into:
 
 - `cache`: leaf hashing, cached bottom-position lookup, and uncached-input collection.
 - `leaf_map`: key preparation and the database batch fetch.
-- `validation`: decoding index results, resolving overlay entries, and checking forest bounds.
+- `validation`: decoding index results and checking forest bounds.
   This does not read forest nodes to recheck spentness; Bitcoin Core already validated the spends.
 - `resolution`: assembling bottom positions, including explicit recovery for missing or invalid entries.
 - `traversal`: read-set planning, coalesced `io_uring` reads, and in-memory promotion to canonical targets.
@@ -282,12 +282,14 @@ all storage waits; explicit `io_uring` reads, database syscalls, and writeback s
 are taken at phase boundaries, not per input. Phase times exclude counter-sampling overhead
 and need not sum exactly to `positions`.
 
-The persistent leaf map continues to hold stable bottom positions. Pending forest-node and
-outpoint changes are overlaid in the foreground, including removals, so even a fully evicted
-Pollard can prove blocks while the durable forest lags. Overlay entries carry their producing
-height and are retired only when that height is acknowledged; retiring an earlier block cannot
-discard a later update to the same node or outpoint. The runtime map is given 1 GiB of append
-headroom; older bootstrap maps are extended in place before they are opened.
+The persistent leaf map continues to hold stable bottom positions. Remembered Pollard leaves
+resolve pending additions by their reconstructed leaf hashes; retained physical spent flags
+prevent stale forest reads after deletion. Recovery also uses Pollard-first physical reads,
+not potentially changing leaf-map keys for spent siblings. Repeated updates retain the exact
+previous logical physical state in each journal before-image. Ordinary worker acknowledgements
+never discard Pollard nodes: a newer application batch may already be writing those positions.
+The runtime map is given 1 GiB of append headroom; older bootstrap maps are extended in place
+before they are opened.
 
 Journal application and rollback use per-block, key-sorted `batch_delete` and `put_batch`.
 They remove the union of affected keys before reinsertion so replay remains idempotent even
@@ -301,9 +303,9 @@ or speculative mapping advice is enabled in steady state. Rollback/replay writes
 same writer; bootstrap and online relocation retain their separate mapping operations.
 
 Leaf-map changes and the every-1,000-block compaction retain block order. Application I/O
-holds shared forest access, allowing the prover to continue: its overlay covers every
-in-flight touched node and outpoint until durable acknowledgement. Only the final in-memory
-leaf-count commit needs brief exclusive access. Raw applied-state reads, repair, rollback,
+holds shared forest access, allowing the prover to continue: Pollard covers every in-flight
+changed physical node, and pending additions resolve without leaf-map reads. Only the final
+in-memory leaf-count commit needs brief exclusive access. Raw applied-state reads, repair, rollback,
 and resize remain behind explicit barriers. Errors stop persistence rather than certify a
 durable height.
 Header reads, bootstrap batches, synchronization, and steady-state index replacement/removal
@@ -333,8 +335,9 @@ blocks are fetched from Core and are not retained.
 The prover appends complete page-aligned records to `$DATA_DIR/forest.journal` without syncing.
 Each record contains the block identity, post-block `numleaves`, changed forest positions with
 before/after hashes and flags, added/removed outpoints with stable bottom positions, the block
-header, compact proof, and both physical and proof forest-row counts. Pending changes remain in the foreground
-overlay; no corresponding forest, leaf-map, header, proof, or proof-index writes occur yet.
+header, compact proof, and both physical and proof forest-row counts. Pending accumulator
+changes remain only in Pollard; no corresponding forest, leaf-map, header, proof, or proof-index
+writes occur yet.
 
 Every **100 new blocks**, the prover submits an immutable journal count/boundary to a
 dedicated publication thread, independently of the state flusher. Append never advances the
@@ -349,11 +352,12 @@ published edge, then sleeps until publication or an explicit operation wakes it.
 headers, indexes, and forest state are applied before the durable height and notifications
 advance. Pruning never removes unapplied records and retains 144 applied forward records.
 
-There is no 200-block application gate or decoded block-payload queue. A slow state flusher
-does not block subsequent 100-block publications or normal catch-up proving. The disk journal
-holds the backlog; RAM still tracks lightweight journal metadata and the latest pending
-node/outpoint overlay, so memory use can grow with the distinct pending changes. Completion
-uses a coalesced applied cursor rather than a queue requiring producer acknowledgement.
+There is no 200-block application gate or decoded block-payload queue. Below the Pollard quota,
+a slow state flusher does not block subsequent 100-block publications or normal catch-up proving.
+The disk journal holds the backlog; RAM tracks lightweight journal metadata and Pollard's
+current structural nodes. The quota-driven durability barrier bounds retention by stopping
+before pruning rather than introducing a second pending hash cache. Completion uses a coalesced
+applied cursor rather than a queue requiring producer acknowledgement.
 Shared storage contention and brief metadata locking remain; no filesystem promises
 unbounded throughput or disk capacity.
 
